@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {CuratioRebalancer} from "../../src/CuratioRebalancer.sol";
+
 // Minimal MockToken implementation inlined to avoid import path issues for Echidna tests
 contract MockToken {
     string public name;

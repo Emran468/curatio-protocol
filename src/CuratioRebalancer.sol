@@ -10,6 +10,7 @@ import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.so
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 /// @dev Read-only view into CuratioHook (Layer 1) — used purely as a volatility
 ///      signal to decide WHEN to rebalance. The hook is never called to execute
 ///      liquidity changes; this contract does that directly against PoolManager.
@@ -30,7 +31,6 @@ interface ICuratioHookView {
  */
 contract CuratioRebalancer is AccessControl, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
-  
 
     bytes32 public constant STRATEGIST_ROLE = keccak256("STRATEGIST_ROLE");
     bytes32 public constant VAULT_ROLE = keccak256("VAULT_ROLE");
@@ -50,7 +50,9 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback {
     uint256 public minBlocksBetweenRebalances = 10;
 
     // ── Unlock callback action encoding ──────────────────────────────────────
-    enum ActionType { REBALANCE }
+    enum ActionType {
+        REBALANCE
+    }
 
     struct RebalanceCallbackData {
         PoolKey key;
@@ -86,17 +88,11 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback {
         _;
     }
 
-    constructor(
-        address _poolManager,
-        address _hook,
-        address _vault,
-        address _admin,
-        uint256 _rebalanceThreshold
-    ) {
+    constructor(address _poolManager, address _hook, address _vault, address _admin, uint256 _rebalanceThreshold) {
         if (_poolManager == address(0) || _hook == address(0) || _vault == address(0) || _admin == address(0)) {
             revert ZeroAddress();
         }
-      require(_rebalanceThreshold > 0, "Invalid Threshold");
+        require(_rebalanceThreshold > 0, "Invalid Threshold");
 
         poolManager = IPoolManager(_poolManager);
         hook = ICuratioHookView(_hook);
@@ -182,63 +178,63 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback {
     }
 
     function _executeRebalance(RebalanceCallbackData memory data) internal {
-    // 1. পুরানো পজিশন থেকে লিকুইডিটি তুলে নেওয়া
-    BalanceDelta deltaRemove;
-    if (data.oldTickLower != data.oldTickUpper) {
-        (deltaRemove, ) = poolManager.modifyLiquidity(
+        // 1. পুরানো পজিশন থেকে লিকুইডিটি তুলে নেওয়া
+        BalanceDelta deltaRemove;
+        if (data.oldTickLower != data.oldTickUpper) {
+            (deltaRemove,) = poolManager.modifyLiquidity(
+                data.key,
+                ModifyLiquidityParams({
+                    tickLower: data.oldTickLower,
+                    tickUpper: data.oldTickUpper,
+                    liquidityDelta: -data.liquidityToMove,
+                    salt: bytes32(0)
+                }),
+                ""
+            );
+        }
+
+        // 2. নতুন রেঞ্জে লিকুইডিটি যোগ করা
+        (BalanceDelta deltaAdd,) = poolManager.modifyLiquidity(
             data.key,
             ModifyLiquidityParams({
-                tickLower: data.oldTickLower,
-                tickUpper: data.oldTickUpper,
-                liquidityDelta: -data.liquidityToMove,
+                tickLower: data.newTickLower,
+                tickUpper: data.newTickUpper,
+                liquidityDelta: data.liquidityToMove,
                 salt: bytes32(0)
             }),
             ""
         );
+
+        // 3. 🚨 TOTAL DELTA SETTLEMENT (Uniswap v4 Mandatory Step)
+        int128 delta0 = deltaRemove.amount0() + deltaAdd.amount0();
+        int128 delta1 = deltaRemove.amount1() + deltaAdd.amount1();
+
+        _settleCurrency(data.key.currency0, delta0);
+        _settleCurrency(data.key.currency1, delta1);
     }
 
-    // 2. নতুন রেঞ্জে লিকুইডিটি যোগ করা
-    (BalanceDelta deltaAdd, ) = poolManager.modifyLiquidity(
-        data.key,
-        ModifyLiquidityParams({
-            tickLower: data.newTickLower,
-            tickUpper: data.newTickUpper,
-            liquidityDelta: data.liquidityToMove,
-            salt: bytes32(0)
-        }),
-        ""
-    );
+    /// @dev Helper to settle positive or negative deltas with PoolManager
+    /// @dev Uniswap v4 Delta Settlement Logic
+    function _settleCurrency(Currency currency, int128 delta) internal {
+        if (delta < 0) {
+            uint256 amount = uint256(uint128(-delta));
 
-    // 3. 🚨 TOTAL DELTA SETTLEMENT (Uniswap v4 Mandatory Step)
-    int128 delta0 = deltaRemove.amount0() + deltaAdd.amount0();
-    int128 delta1 = deltaRemove.amount1() + deltaAdd.amount1();
+            // ১. PoolManager-এ মুদ্রা সিঙ্ক
+            poolManager.sync(currency);
 
-    _settleCurrency(data.key.currency0, delta0);
-    _settleCurrency(data.key.currency1, delta1);
-}
-
-/// @dev Helper to settle positive or negative deltas with PoolManager
-/// @dev Uniswap v4 Delta Settlement Logic
-function _settleCurrency(Currency currency, int128 delta) internal {
-    if (delta < 0) {
-        uint256 amount = uint256(uint128(-delta));
-        
-        // ১. PoolManager-এ মুদ্রা সিঙ্ক
-        poolManager.sync(currency);
-
-        // ২. Native ETH নাকি ERC20 টোকেন তা চেক করে পরিশোধ করা
-        if (Currency.unwrap(currency) == address(0)) {
-            poolManager.settle{value: amount}();
-        } else {
-            IERC20(Currency.unwrap(currency)).transfer(address(poolManager), amount);
-            poolManager.settle();
+            // ২. Native ETH নাকি ERC20 টোকেন তা চেক করে পরিশোধ করা
+            if (Currency.unwrap(currency) == address(0)) {
+                poolManager.settle{value: amount}();
+            } else {
+                IERC20(Currency.unwrap(currency)).transfer(address(poolManager), amount);
+                poolManager.settle();
+            }
+        } else if (delta > 0) {
+            uint256 amount = uint256(uint128(delta));
+            // PoolManager থেকে টোকেন তুলে নেওয়া
+            poolManager.take(currency, address(this), amount);
         }
-    } else if (delta > 0) {
-        uint256 amount = uint256(uint128(delta));
-        // PoolManager থেকে টোকেন তুলে নেওয়া
-        poolManager.take(currency, address(this), amount);
     }
-}
 
     // ─── Admin ────────────────────────────────────────────────────────────────
 

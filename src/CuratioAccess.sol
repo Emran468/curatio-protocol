@@ -30,10 +30,7 @@ contract CuratioAccess is AccessControl {
         emit UserWhitelisted(user, status);
     }
 
-    function setWhitelistedUsersBatch(address[] calldata users, bool status)
-        external
-        onlyRole(VAULT_MANAGER_ROLE)
-    {
+    function setWhitelistedUsersBatch(address[] calldata users, bool status) external onlyRole(VAULT_MANAGER_ROLE) {
         for (uint256 i = 0; i < users.length; i++) {
             require(users[i] != address(0), "CuratioAccess: zero user");
             _whitelistedUsers[users[i]] = status;

@@ -36,13 +36,10 @@ contract CuratioVault is ERC4626, AccessControl {
     error DepositsArePaused();
     error ZeroAddress();
 
-    constructor(
-        IERC20 asset_,
-        address _accessControl,
-        address _rebalancer,
-        address _admin,
-        uint256 _depositCap
-    ) ERC4626(asset_) ERC20("Curatio Vault Share", "cVAULT") {
+    constructor(IERC20 asset_, address _accessControl, address _rebalancer, address _admin, uint256 _depositCap)
+        ERC4626(asset_)
+        ERC20("Curatio Vault Share", "cVAULT")
+    {
         if (_accessControl == address(0) || _rebalancer == address(0) || _admin == address(0)) {
             revert ZeroAddress();
         }
@@ -79,11 +76,7 @@ contract CuratioVault is ERC4626, AccessControl {
 
     // ─── Withdraw / Redeem overrides ─────────────────────────────────────────
 
-    function withdraw(uint256 assets, address receiver, address owner_)
-        public
-        override
-        returns (uint256)
-    {
+    function withdraw(uint256 assets, address receiver, address owner_) public override returns (uint256) {
         _checkWhitelist(msg.sender);
 
         uint256 shares = super.withdraw(assets, receiver, owner_);
@@ -91,11 +84,7 @@ contract CuratioVault is ERC4626, AccessControl {
         return shares;
     }
 
-    function redeem(uint256 shares, address receiver, address owner_)
-        public
-        override
-        returns (uint256)
-    {
+    function redeem(uint256 shares, address receiver, address owner_) public override returns (uint256) {
         _checkWhitelist(msg.sender);
 
         uint256 assets = super.redeem(shares, receiver, owner_);

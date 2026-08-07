@@ -104,11 +104,7 @@ library TwapOracle {
     }
 
     /// @dev Called once, at pool init. Seeds slot 0.
-    function initialize(
-        mapping(uint16 => Observation) storage self,
-        State storage state,
-        uint32 time
-    ) internal {
+    function initialize(mapping(uint16 => Observation) storage self, State storage state, uint32 time) internal {
         self[0] = Observation({blockTimestamp: time, tickCumulative: 0, initialized: true});
         state.index = 0;
         state.cardinality = 1;
@@ -117,12 +113,7 @@ library TwapOracle {
 
     /// @dev Called on every swap (via afterSwap). No-op if oracle not grown
     ///      past cardinality 0, and no-op if called twice in the same block.
-    function write(
-        mapping(uint16 => Observation) storage self,
-        State storage state,
-        uint32 time,
-        int24 tick
-    ) internal {
+    function write(mapping(uint16 => Observation) storage self, State storage state, uint32 time, int24 tick) internal {
         if (state.cardinality == 0) return;
 
         Observation memory last = self[state.index];
@@ -138,11 +129,7 @@ library TwapOracle {
 
     /// @dev Grows the ring buffer capacity. Anyone can call to pre-warm slots
     ///      (gas-expensive SSTOREs paid up front instead of during swaps).
-    function grow(
-        mapping(uint16 => Observation) storage self,
-        State storage state,
-        uint16 newCardinality
-    ) internal {
+    function grow(mapping(uint16 => Observation) storage self, State storage state, uint16 newCardinality) internal {
         uint16 current = state.cardinalityNext;
         if (newCardinality <= current) return;
 
@@ -297,6 +284,7 @@ contract CuratioHook is BaseHook, Ownable {
     bytes32 private constant PRE_SWAP_TICK_FLAG = keccak256("hybrid.vol.flag");
     bytes32 private constant TRACKER_PREFIX = keccak256("hybrid.vol.tracker");
     bytes32 private constant SANDWICH_FLAG_PREFIX = keccak256("hybrid.vol.sandwichFlag");
+    bytes32 public constant PRE_SWAP_TICK_SLOT = keccak256("curatio.preSwapTick");
 
     // ── Fee Constants ─────────────────────────────────────────────────────────
     uint24 public constant BASE_FEE = 3000;
@@ -356,7 +344,7 @@ contract CuratioHook is BaseHook, Ownable {
     // ── Hook Permissions ──────────────────────────────────────────────────────
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
-            beforeInitialize: true,
+            beforeInitialize: false,
             afterInitialize: true,
             beforeAddLiquidity: false,
             afterAddLiquidity: true,
@@ -408,6 +396,25 @@ contract CuratioHook is BaseHook, Ownable {
     }
 
     // ─── Liquidity ────────────────────────────────────────────────────────────
+    function beforeRemoveLiquidity(address, PoolKey calldata key, ModifyLiquidityParams calldata params, bytes calldata)
+        external
+        view
+        override
+        onlyPoolManager
+        returns (bytes4)
+    {
+        PoolId poolId = key.toId();
+        uint128 currentLiquidity = poolManager.getLiquidity(poolId);
+
+        // Convert negative delta to uint256 safely to prevent SafeCast overflow
+        uint256 requestedRemoval = params.liquidityDelta < 0 ? uint256(-int256(params.liquidityDelta)) : 0;
+
+        if (requestedRemoval > uint256(currentLiquidity)) {
+            revert("Insufficient liquidity");
+        }
+
+        return this.beforeRemoveLiquidity.selector;
+    }
 
     function afterAddLiquidity(
         address sender,
@@ -464,25 +471,19 @@ contract CuratioHook is BaseHook, Ownable {
     }
 
     // ─── Swap Hooks ───────────────────────────────────────────────────────────
-
     function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
         override
         onlyPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        if (params.amountSpecified == 0) {
-            return (
-                this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG
-            );
-        }
-
         PoolId poolId = key.toId();
         uint256 currentBlock = block.number;
         (, int24 currentTick,,) = poolManager.getSlot0(poolId);
 
-        bytes32 flagSlot = _flagSlotMap[poolId];
-        bytes32 tickSlot = _tickSlotMap[poolId];
+        // ১. Transient storage setup & verification
+        bytes32 flagSlot = keccak256(abi.encodePacked(poolId, "flag"));
+        bytes32 tickSlot = keccak256(abi.encodePacked(poolId, "tick"));
 
         uint256 isDirty;
         assembly { isDirty := tload(flagSlot) }
@@ -493,8 +494,14 @@ contract CuratioHook is BaseHook, Ownable {
             tstore(tickSlot, currentTick)
         }
 
-        uint256 sandwichBlock = _sandwichFlags[poolId];
+        // ২. Zero-amount swap guard
+        if (params.amountSpecified == 0) {
+            return
+                (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG);
+        }
 
+        // ৩. MEV / Sandwich Block Level Check
+        uint256 sandwichBlock = _sandwichFlags[poolId];
         if (sandwichBlock == currentBlock) {
             return (
                 this.beforeSwap.selector,
@@ -503,10 +510,34 @@ contract CuratioHook is BaseHook, Ownable {
             );
         }
 
-        PackedPoolState storage state = poolStates[poolId];
-        uint256 blockDelta = currentBlock > state.lastBlock ? currentBlock - state.lastBlock : 0;
+        // 🌟 ৪. TWAP Protection & Dynamic Fee Calculation
+        uint24 feeToApply = BASE_FEE;
 
-        uint24 feeToApply = blockDelta >= blockDecayWindow ? BASE_FEE : (state.fee == 0 ? BASE_FEE : state.fee);
+        // ১২০ সেকেন্ডের TWAP উইন্ডো থেকে গড় টিকেট নেয়ার চেষ্টা
+        try this.getTwapTick(key, 120) returns (int24 twapTick) {
+            // Current Tick এবং TWAP Tick-এর মধ্যে পার্থক্য হিসেব
+            int24 tickDivergenceRaw = currentTick - twapTick;
+            uint24 tickDivergence = abs(tickDivergenceRaw);
+
+            // যদি স্পট প্রাইস TWAP থেকে অতিরিক্ত দূরে সরে যায় (MEV / Flash Loan Manipulation)
+            if (uint256(tickDivergence) >= tickThresholdHigh) {
+                feeToApply = MEV_PENALTY_FEE; // চরম ব্যবধানে পেনাল্টি ফি
+            } else if (uint256(tickDivergence) >= tickThresholdMid) {
+                feeToApply = HIGH_VOLATILE_FEE; // মাঝারি ব্যবধানে হাই ভোলাটিলিটি ফি
+            } else {
+                // ৫. Block Decay অনুযায়ী সাধারণ বা ভোলাটাইল ফি
+                PackedPoolState storage state = poolStates[poolId];
+                uint256 blockDelta = currentBlock > state.lastBlock ? currentBlock - state.lastBlock : 0;
+
+                feeToApply = (blockDelta >= blockDecayWindow || state.fee == 0) ? BASE_FEE : state.fee;
+            }
+        } catch {
+            // Cold Start Fallback: পুল নতুন হলে বা TWAP ডাটা না থাকলে সাধারণ ফি লজিক ব্যবহার হবে
+            PackedPoolState storage state = poolStates[poolId];
+            uint256 blockDelta = currentBlock > state.lastBlock ? currentBlock - state.lastBlock : 0;
+
+            feeToApply = (blockDelta >= blockDecayWindow || state.fee == 0) ? BASE_FEE : state.fee;
+        }
 
         return
             (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, feeToApply | LPFeeLibrary.OVERRIDE_FEE_FLAG);
@@ -522,24 +553,31 @@ contract CuratioHook is BaseHook, Ownable {
         uint256 currentBlock = block.number;
         (, int24 postSwapTick,,) = poolManager.getSlot0(poolId);
 
-        bytes32 flagSlot = _flagSlotMap[poolId];
-        bytes32 tickSlot = _tickSlotMap[poolId];
+        // 👈 beforeSwap-এর সাথে মিলিয়ে একই ডাইনামিক স্লট ব্যবহার করা হচ্ছে
+        bytes32 flagSlot = keccak256(abi.encodePacked(poolId, "flag"));
+        bytes32 tickSlot = keccak256(abi.encodePacked(poolId, "tick"));
 
         uint256 flag;
-        int24 preSwapTick;
+        bytes32 rawPreSwapTick;
 
+        // 1. Load pre-swap state from transient storage
         assembly {
             flag := tload(flagSlot)
-            preSwapTick := tload(tickSlot)
+            rawPreSwapTick := tload(tickSlot)
         }
+
         if (flag == 0) revert("Composability violation: unexpected state");
+
+        // Clear transient flag slot for cleanup
         assembly { tstore(flagSlot, 0) }
 
-        // ── TWAP oracle write (every swap, once per block) ──
-        TwapOracle.write(
-            _observations[poolId], _observationStates[poolId], uint32(block.timestamp), postSwapTick
-        );
+        // Safely cast transient byte storage to signed int24
+        int24 preSwapTick = int24(int256(uint256(rawPreSwapTick)));
 
+        // 2. Write observation to TWAP oracle
+        TwapOracle.write(_observations[poolId], _observationStates[poolId], uint32(block.timestamp), postSwapTick);
+
+        // 3. Unpack MEV / Sandwich tracker state
         uint256 trackerPacked = _packedTrackers[poolId];
         SandwichTracker memory tracker = _unpackTracker(trackerPacked);
 
@@ -554,9 +592,11 @@ contract CuratioHook is BaseHook, Ownable {
             });
         }
 
+        // 4. Calculate tick delta magnitude
         int24 tickDeltaRaw = postSwapTick - preSwapTick;
-        uint24 tickDelta = abs(tickDeltaRaw);
+        uint24 tickDelta = uint24(tickDeltaRaw >= 0 ? tickDeltaRaw : -tickDeltaRaw);
 
+        // 5. Track volume per block
         uint256 swapAmount =
             params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
 
@@ -567,11 +607,13 @@ contract CuratioHook is BaseHook, Ownable {
             blockVolumeMap[poolId] += swapAmount;
         }
 
+        // 6. Compute dynamic escalated fee based on tick movement
         PackedPoolState storage state = poolStates[poolId];
         uint256 blockDelta = currentBlock > state.lastBlock ? currentBlock - state.lastBlock : 0;
 
-        uint24 feeToSave = _computeFee(tickDelta, blockDelta);
+        uint24 feeToSave = _computeFee(tickDelta, blockDelta, state.fee);
 
+        // 7. Update tracker direction and peak tick
         int24 currentMove = postSwapTick - preSwapTick;
 
         if (currentMove != 0) {
@@ -589,6 +631,7 @@ contract CuratioHook is BaseHook, Ownable {
             }
         }
 
+        // 8. Detect sandwich attack patterns
         bool isSandwich = false;
         uint256 volume = blockVolumeMap[poolId];
 
@@ -600,11 +643,11 @@ contract CuratioHook is BaseHook, Ownable {
             }
         }
 
-        uint256 sandwichBlock = _sandwichFlags[poolId];
-        if (sandwichBlock == currentBlock) {
+        if (_sandwichFlags[poolId] == currentBlock) {
             isSandwich = true;
         }
 
+        // Apply MEV penalty fee if a sandwich pattern was detected
         if (isSandwich) {
             feeToSave = MEV_PENALTY_FEE;
             _sandwichFlags[poolId] = currentBlock;
@@ -616,6 +659,7 @@ contract CuratioHook is BaseHook, Ownable {
             tracker.lastMove = currentMove;
         }
 
+        // 9. Persist updated tracker and pool state
         _packedTrackers[poolId] = _packTracker(tracker);
 
         poolStates[poolId] = PackedPoolState({
@@ -626,6 +670,7 @@ contract CuratioHook is BaseHook, Ownable {
             initialized: true
         });
 
+        // 10. Emit update events
         emit FeeUpdated(poolId, feeToSave);
         emit HistoryUpdated(poolId, postSwapTick, currentBlock, block.timestamp);
 
@@ -638,18 +683,26 @@ contract CuratioHook is BaseHook, Ownable {
         return n >= 0 ? uint24(uint32(int32(n))) : uint24(uint32(-int32(n)));
     }
 
-    function _computeFee(uint24 tickDelta, uint256 blockDelta) internal view returns (uint24) {
-        if (blockDelta >= blockDecayWindow) return BASE_FEE;
-        if (uint256(tickDelta) > tickThresholdHigh) return HIGH_VOLATILE_FEE;
-        if (uint256(tickDelta) > tickThresholdMid) return MID_VOLATILE_FEE;
-        return BASE_FEE;
+    function _computeFee(uint24 tickDelta, uint256 blockDelta, uint24 currentFee) internal view returns (uint24) {
+        // '>' এর জায়গায় '>=' ব্যবহার করুন
+        if (uint256(tickDelta) >= tickThresholdHigh) return HIGH_VOLATILE_FEE;
+        if (uint256(tickDelta) >= tickThresholdMid) return MID_VOLATILE_FEE;
+
+        if (blockDelta >= blockDecayWindow || currentFee == 0) return BASE_FEE;
+
+        return currentFee;
     }
 
     // ── Pack/Unpack tracker ────────────────────────────────────────────────
     function _packTracker(SandwichTracker memory t) internal pure returns (uint256) {
-        return (uint256(uint24(t.firstMove)) << 232) | (uint256(uint24(t.lastMove)) << 208)
-            | (uint256(uint24(t.peakTick)) << 184) | (uint256(t.swapCount) << 152) | (uint256(t.startBlock) << 56)
-            | (t.initialized ? 1 : 0);
+        // Cast signed ticks (int24) through int32 -> uint32 -> uint24 to preserve
+        // two's complement bit patterns and prevent Solidity 0.8+ cast underflow panics (0x11)
+        uint24 rawFirst = uint24(uint32(int32(t.firstMove)));
+        uint24 rawLast = uint24(uint32(int32(t.lastMove)));
+        uint24 rawPeak = uint24(uint32(int32(t.peakTick)));
+
+        return (uint256(rawFirst) << 232) | (uint256(rawLast) << 208) | (uint256(rawPeak) << 184)
+            | (uint256(t.swapCount) << 152) | (uint256(t.startBlock) << 56) | (t.initialized ? 1 : 0);
     }
 
     function _unpackTracker(uint256 packed) internal pure returns (SandwichTracker memory t) {
@@ -750,23 +803,28 @@ contract CuratioHook is BaseHook, Ownable {
     /// @notice Time-weighted average tick over the last `twapWindow` seconds.
     /// @dev Reverts if the oracle doesn't yet have `twapWindow` seconds of history
     ///      (e.g. right after pool init, or if cardinality is too small).
+    // Example of problematic pattern causing early return:
     function getTwapTick(PoolKey calldata key, uint32 twapWindow) external view returns (int24 twapTick) {
-        require(twapWindow > 0, "twapWindow must be > 0");
+        require(twapWindow > 0, "TwapWindow must be > 0");
+
+        uint32 nowTime = uint32(block.timestamp);
+
+        // 🔴 Underflow Panic (0x11) রোধ করতে এবং পর্যাপ্ত হিস্ট্রি না থাকলে Revert করতে এই চেকটি যুক্ত করা হয়েছে
+        require(nowTime >= twapWindow, "TwapOracle: target older than oldest observation");
+
+        uint32 targetTime = nowTime - twapWindow;
         PoolId poolId = key.toId();
 
         (, int24 currentTick,,) = poolManager.getSlot0(poolId);
-        uint32 nowTime = uint32(block.timestamp);
-        uint32 targetTime = nowTime - twapWindow;
 
-        int56 cumNow = TwapOracle.observeAt(
-            _observations[poolId], _observationStates[poolId], nowTime, currentTick
-        );
-        int56 cumPast = TwapOracle.observeAt(
-            _observations[poolId], _observationStates[poolId], targetTime, currentTick
-        );
+        int56 currentCumulative =
+            TwapOracle.observeAt(_observations[poolId], _observationStates[poolId], nowTime, currentTick);
 
-        int56 avg = (cumNow - cumPast) / int56(uint56(twapWindow));
-        twapTick = int24(avg);
+        int56 targetCumulative =
+            TwapOracle.observeAt(_observations[poolId], _observationStates[poolId], targetTime, currentTick);
+
+        int56 timeDelta = int56(uint56(twapWindow));
+        twapTick = int24((currentCumulative - targetCumulative) / timeDelta);
     }
 
     /// @notice Raw oracle state, useful for off-chain tooling / debugging.

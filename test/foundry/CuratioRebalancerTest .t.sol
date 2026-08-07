@@ -155,15 +155,11 @@ contract CuratioRebalancerTest is Test, Deployers {
         assertEq(rebalancer.currentTickLower(), 0);
         assertEq(rebalancer.currentTickUpper(), 0);
 
-        (Currency c0,,,, ) = rebalancer.managedPool();
+        (Currency c0,,,,) = rebalancer.managedPool();
         assertEq(Currency.unwrap(c0), Currency.unwrap(testKey.currency0));
     }
 
-    function _unpackKey(PoolKey memory key)
-        internal
-        pure
-        returns (Currency, Currency, uint24, int24, IHooks)
-    {
+    function _unpackKey(PoolKey memory key) internal pure returns (Currency, Currency, uint24, int24, IHooks) {
         return (key.currency0, key.currency1, key.fee, key.tickSpacing, key.hooks);
     }
 
