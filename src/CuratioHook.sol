@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Hybrid Volatility Hook v3 — Multi-Chain Edition (Test Suite Compatible)
+// + TWAP Oracle Module (v3-style tickCumulative ring buffer)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import {BaseHook} from "@openzeppelin/uniswap-hooks/src/base/BaseHook.sol";
@@ -85,10 +86,162 @@ library ChainRegistry {
     }
 }
 
+// ─── TWAP Oracle Library ──────────────────────────────────────────────────────
+// v3-style tickCumulative ring buffer. Kept as an internal library so the main
+// contract stays readable; all storage lives in CuratioHook itself (structs
+// are value types passed by storage pointer).
+library TwapOracle {
+    struct Observation {
+        uint32 blockTimestamp;
+        int56 tickCumulative;
+        bool initialized;
+    }
+
+    struct State {
+        uint16 index;
+        uint16 cardinality;
+        uint16 cardinalityNext;
+    }
+
+    /// @dev Called once, at pool init. Seeds slot 0.
+    function initialize(
+        mapping(uint16 => Observation) storage self,
+        State storage state,
+        uint32 time
+    ) internal {
+        self[0] = Observation({blockTimestamp: time, tickCumulative: 0, initialized: true});
+        state.index = 0;
+        state.cardinality = 1;
+        state.cardinalityNext = 1;
+    }
+
+    /// @dev Called on every swap (via afterSwap). No-op if oracle not grown
+    ///      past cardinality 0, and no-op if called twice in the same block.
+    function write(
+        mapping(uint16 => Observation) storage self,
+        State storage state,
+        uint32 time,
+        int24 tick
+    ) internal {
+        if (state.cardinality == 0) return;
+
+        Observation memory last = self[state.index];
+        if (last.blockTimestamp == time) return; // already recorded this block
+
+        uint32 delta = time - last.blockTimestamp;
+        int56 tickCumulative = last.tickCumulative + int56(tick) * int56(uint56(delta));
+
+        uint16 indexUpdated = uint16((uint256(state.index) + 1) % state.cardinality);
+        self[indexUpdated] = Observation({blockTimestamp: time, tickCumulative: tickCumulative, initialized: true});
+        state.index = indexUpdated;
+    }
+
+    /// @dev Grows the ring buffer capacity. Anyone can call to pre-warm slots
+    ///      (gas-expensive SSTOREs paid up front instead of during swaps).
+    function grow(
+        mapping(uint16 => Observation) storage self,
+        State storage state,
+        uint16 newCardinality
+    ) internal {
+        uint16 current = state.cardinalityNext;
+        if (newCardinality <= current) return;
+
+        for (uint16 i = current; i < newCardinality; i++) {
+            self[i].blockTimestamp = 1; // touch slot to make later SSTORE cheaper
+        }
+        state.cardinalityNext = newCardinality;
+        // Note: state.cardinality (the ACTIVE size used by write()) only grows
+        // once write() observes cardinalityNext > cardinality at the wraparound
+        // point. For simplicity/predictability in this hook, we bump both
+        // together — see bumpCardinality() below, called from admin function.
+    }
+
+    /// @dev Finds the two observations surrounding `target` and returns the
+    ///      tickCumulative at exactly `target` via linear interpolation.
+    function observeAt(
+        mapping(uint16 => Observation) storage self,
+        State storage state,
+        uint32 target,
+        int24 currentTick
+    ) internal view returns (int56 tickCumulative) {
+        Observation memory latest = self[state.index];
+
+        if (latest.blockTimestamp == target) {
+            return latest.tickCumulative;
+        }
+
+        if (latest.blockTimestamp < target) {
+            // Extrapolate forward to `target` using the current (post-swap) tick.
+            uint32 delta = target - latest.blockTimestamp;
+            return latest.tickCumulative + int56(currentTick) * int56(uint56(delta));
+        }
+
+        // target is in the past relative to the latest observation — binary search.
+        (Observation memory before, Observation memory afterObs) = binarySearch(self, state, target);
+
+        if (before.blockTimestamp == target) {
+            return before.tickCumulative;
+        }
+        if (afterObs.blockTimestamp == target) {
+            return afterObs.tickCumulative;
+        }
+
+        uint32 timeDelta = afterObs.blockTimestamp - before.blockTimestamp;
+        uint32 targetDelta = target - before.blockTimestamp;
+        int56 cumDelta = afterObs.tickCumulative - before.tickCumulative;
+
+        tickCumulative = before.tickCumulative + (cumDelta * int56(uint56(targetDelta))) / int56(uint56(timeDelta));
+    }
+
+    /// @dev Binary search over the ring buffer for the observations bracketing `target`.
+    ///      Reverts if `target` is older than the oldest stored observation.
+    function binarySearch(mapping(uint16 => Observation) storage self, State storage state, uint32 target)
+        internal
+        view
+        returns (Observation memory before, Observation memory afterObs)
+    {
+        uint16 oldestIndex = uint16((uint256(state.index) + 1) % state.cardinality);
+        Observation memory oldest = self[oldestIndex];
+        if (!oldest.initialized) {
+            oldest = self[0];
+            oldestIndex = 0;
+        }
+        require(target >= oldest.blockTimestamp, "TwapOracle: target older than oldest observation");
+
+        uint256 l = 0;
+        uint256 r = state.cardinality - 1;
+        while (l <= r) {
+            uint256 mid = (l + r) / 2;
+            uint16 idx = uint16((uint256(oldestIndex) + mid) % state.cardinality);
+            Observation memory obs = self[idx];
+
+            if (!obs.initialized) {
+                // Uninitialized slot — treat as "too far forward", search left half.
+                if (mid == 0) break;
+                r = mid - 1;
+                continue;
+            }
+
+            if (obs.blockTimestamp <= target) {
+                before = obs;
+                if (mid + 1 > r) break;
+                l = mid + 1;
+            } else {
+                afterObs = obs;
+                if (mid == 0) break;
+                r = mid - 1;
+            }
+        }
+
+        require(before.initialized && afterObs.initialized, "TwapOracle: insufficient observation history");
+    }
+}
+
 // ─── Main Hook ────────────────────────────────────────────────────────────────
 contract CuratioHook is BaseHook, Ownable {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
+    using TwapOracle for mapping(uint16 => TwapOracle.Observation);
 
     // ── Structs ───────────────────────────────────────────────────────────────
 
@@ -135,6 +288,10 @@ contract CuratioHook is BaseHook, Ownable {
     mapping(PoolId => uint256) public blockVolumeMap;
     mapping(PoolId => uint256) public lastVolumeBlockMap;
 
+    // ── TWAP Oracle Storage ───────────────────────────────────────────────────
+    mapping(PoolId => mapping(uint16 => TwapOracle.Observation)) private _observations;
+    mapping(PoolId => TwapOracle.State) private _observationStates;
+
     // ── Transient/Storage Prefix Keys ─────────────────────────────────────────
     bytes32 private constant PRE_SWAP_TICK_PREFIX = keccak256("hybrid.vol.preSwapTick");
     bytes32 private constant PRE_SWAP_TICK_FLAG = keccak256("hybrid.vol.flag");
@@ -171,6 +328,7 @@ contract CuratioHook is BaseHook, Ownable {
         PoolId indexed poolId, int24 firstMove, int24 lastMove, uint256 blockVolume, uint24 feeApplied
     );
     event DeployedOnChain(uint256 indexed chainId, string chainName, uint64 blockDecayWindow);
+    event OracleCardinalityIncreased(PoolId indexed poolId, uint16 oldCardinality, uint16 newCardinality);
 
     // ── Reentrancy Guard ──────────────────────────────────────────────────────
     modifier nonReentrant() {
@@ -242,6 +400,9 @@ contract CuratioHook is BaseHook, Ownable {
         _flagSlotMap[poolId] = keccak256(abi.encodePacked(PRE_SWAP_TICK_FLAG, poolId));
         _trackerSlotMap[poolId] = keccak256(abi.encodePacked(TRACKER_PREFIX, poolId));
         _sandwichFlagSlotMap[poolId] = keccak256(abi.encodePacked(SANDWICH_FLAG_PREFIX, poolId));
+
+        // Seed TWAP oracle at slot 0
+        TwapOracle.initialize(_observations[poolId], _observationStates[poolId], uint32(block.timestamp));
 
         return this.afterInitialize.selector;
     }
@@ -373,6 +534,11 @@ contract CuratioHook is BaseHook, Ownable {
         }
         if (flag == 0) revert("Composability violation: unexpected state");
         assembly { tstore(flagSlot, 0) }
+
+        // ── TWAP oracle write (every swap, once per block) ──
+        TwapOracle.write(
+            _observations[poolId], _observationStates[poolId], uint32(block.timestamp), postSwapTick
+        );
 
         uint256 trackerPacked = _packedTrackers[poolId];
         SandwichTracker memory tracker = _unpackTracker(trackerPacked);
@@ -577,6 +743,60 @@ contract CuratioHook is BaseHook, Ownable {
             blockDecayWindow,
             deployedChainId == ChainRegistry.UNICHAIN || deployedChainId == ChainRegistry.UNICHAIN_SEPOLIA
         );
+    }
+
+    // ─── TWAP Oracle — public API ─────────────────────────────────────────────
+
+    /// @notice Time-weighted average tick over the last `twapWindow` seconds.
+    /// @dev Reverts if the oracle doesn't yet have `twapWindow` seconds of history
+    ///      (e.g. right after pool init, or if cardinality is too small).
+    function getTwapTick(PoolKey calldata key, uint32 twapWindow) external view returns (int24 twapTick) {
+        require(twapWindow > 0, "twapWindow must be > 0");
+        PoolId poolId = key.toId();
+
+        (, int24 currentTick,,) = poolManager.getSlot0(poolId);
+        uint32 nowTime = uint32(block.timestamp);
+        uint32 targetTime = nowTime - twapWindow;
+
+        int56 cumNow = TwapOracle.observeAt(
+            _observations[poolId], _observationStates[poolId], nowTime, currentTick
+        );
+        int56 cumPast = TwapOracle.observeAt(
+            _observations[poolId], _observationStates[poolId], targetTime, currentTick
+        );
+
+        int56 avg = (cumNow - cumPast) / int56(uint56(twapWindow));
+        twapTick = int24(avg);
+    }
+
+    /// @notice Raw oracle state, useful for off-chain tooling / debugging.
+    function getOracleState(PoolKey calldata key)
+        external
+        view
+        returns (uint16 index, uint16 cardinality, uint16 cardinalityNext)
+    {
+        TwapOracle.State memory s = _observationStates[key.toId()];
+        return (s.index, s.cardinality, s.cardinalityNext);
+    }
+
+    /// @notice Grows the oracle's ring-buffer capacity so a longer TWAP window
+    ///         can eventually be supported. Anyone may call and pay the gas
+    ///         to pre-warm slots (same pattern as Uniswap v3 pools).
+    function increaseObservationCardinality(PoolKey calldata key, uint16 newCardinality) external {
+        PoolId poolId = key.toId();
+        TwapOracle.State storage state = _observationStates[poolId];
+        require(state.cardinality > 0, "Pool not initialized");
+
+        uint16 old = state.cardinality;
+        TwapOracle.grow(_observations[poolId], state, newCardinality);
+
+        // Bump the active cardinality immediately (simpler + more predictable
+        // than v3's lazy wraparound bump — acceptable tradeoff for this hook).
+        if (newCardinality > state.cardinality) {
+            state.cardinality = newCardinality;
+        }
+
+        emit OracleCardinalityIncreased(poolId, old, state.cardinality);
     }
 
     // ─── Admin ────────────────────────────────────────────────────────────────
