@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Hybrid Volatility Hook v3 — Multi-Chain Edition (Test Suite Compatible)
-// + TWAP Oracle Module (v3-style tickCumulative ring buffer)
-// ═══════════════════════════════════════════════════════════════════════════════
-
 import {BaseHook} from "@openzeppelin/uniswap-hooks/src/base/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -137,10 +132,6 @@ library TwapOracle {
             self[i].blockTimestamp = 1; // touch slot to make later SSTORE cheaper
         }
         state.cardinalityNext = newCardinality;
-        // Note: state.cardinality (the ACTIVE size used by write()) only grows
-        // once write() observes cardinalityNext > cardinality at the wraparound
-        // point. For simplicity/predictability in this hook, we bump both
-        // together — see bumpCardinality() below, called from admin function.
     }
 
     /// @dev Finds the two observations surrounding `target` and returns the
@@ -203,7 +194,6 @@ library TwapOracle {
             Observation memory obs = self[idx];
 
             if (!obs.initialized) {
-                // Uninitialized slot — treat as "too far forward", search left half.
                 if (mid == 0) break;
                 r = mid - 1;
                 continue;
@@ -221,6 +211,28 @@ library TwapOracle {
         }
 
         require(before.initialized && afterObs.initialized, "TwapOracle: insufficient observation history");
+    }
+
+    /// @dev [FIX-2 helper] Returns true iff the oracle has at least `window`
+    ///      seconds of continuous history behind its oldest observation.
+    ///      Callers should treat `false` as "cannot verify price integrity"
+    ///      and apply a conservative fee, not a permissive one.
+    function isWarm(mapping(uint16 => Observation) storage self, State storage state, uint32 window)
+        internal
+        view
+        returns (bool)
+    {
+        if (state.cardinality == 0) return false;
+
+        uint16 oldestIndex = uint16((uint256(state.index) + 1) % state.cardinality);
+        Observation memory oldest = self[oldestIndex];
+        if (!oldest.initialized) {
+            oldest = self[0];
+        }
+        if (!oldest.initialized) return false;
+        if (block.timestamp < oldest.blockTimestamp) return false;
+
+        return (uint32(block.timestamp) - oldest.blockTimestamp) >= window;
     }
 }
 
@@ -253,22 +265,41 @@ contract CuratioHook is BaseHook, Ownable {
         uint128 liquidity;
     }
 
+    struct PendingThresholds {
+        uint256 high;
+        uint256 mid;
+        uint256 volumeThreshold;
+        uint256 sandwichThreshold;
+        uint256 eta; // earliest execution timestamp
+        bool exists;
+    }
+
     // ── Chain Info ────────────────────────────────────────────────────────────
     uint256 public immutable deployedChainId;
     uint64 public immutable blockDecayWindow;
     string public chainName;
 
+    // ── TWAP warm-up config [FIX-1] ───────────────────────────────────────────
+    // Cardinality pre-warmed at pool init so TWAP protection is live from the
+    // pool's first swaps instead of requiring a manual bootstrap call.
+    // 100 slots is a starting default — tune per deployment (gas cost at init
+    // scales linearly with this number, paid once by whoever initializes the pool).
+    uint16 public initialCardinality = 100;
+    uint32 public constant DEFAULT_TWAP_WINDOW = 120;
+
+    // ── Timelock config [FIX-3] ───────────────────────────────────────────────
+    uint256 public constant THRESHOLD_TIMELOCK_DELAY = 2 days;
+    PendingThresholds public pendingThresholds;
+
     // ── Storage ───────────────────────────────────────────────────────────────
     mapping(PoolId => PackedPoolState) public poolStates;
     mapping(bytes32 => PositionInfo) public storedPositions;
 
-    // 🔒 Internal Slot Mappings for strict type resolution
     mapping(PoolId => bytes32) private _tickSlotMap;
     mapping(PoolId => bytes32) private _flagSlotMap;
     mapping(PoolId => bytes32) private _trackerSlotMap;
     mapping(PoolId => bytes32) private _sandwichFlagSlotMap;
 
-    // Secure Internal Persistent Mappings
     mapping(PoolId => uint256) private _packedTrackers;
     mapping(PoolId => uint256) private _sandwichFlags;
 
@@ -312,11 +343,16 @@ contract CuratioHook is BaseHook, Ownable {
     event FeeUpdated(PoolId indexed poolId, uint24 newFee);
     event HistoryUpdated(PoolId indexed poolId, int24 newTick, uint256 blockNumber, uint256 timestamp);
     event ThresholdsUpdated(uint256 high, uint256 mid, uint256 sandwichThreshold);
+    event ThresholdsProposed(
+        uint256 high, uint256 mid, uint256 volumeThreshold, uint256 sandwichThreshold, uint256 eta
+    );
+    event ThresholdsProposalCancelled();
     event SandwichDetected(
         PoolId indexed poolId, int24 firstMove, int24 lastMove, uint256 blockVolume, uint24 feeApplied
     );
     event DeployedOnChain(uint256 indexed chainId, string chainName, uint64 blockDecayWindow);
     event OracleCardinalityIncreased(PoolId indexed poolId, uint16 oldCardinality, uint16 newCardinality);
+    event InitialCardinalityUpdated(uint16 oldValue, uint16 newValue);
 
     // ── Reentrancy Guard ──────────────────────────────────────────────────────
     modifier nonReentrant() {
@@ -383,14 +419,24 @@ contract CuratioHook is BaseHook, Ownable {
             initialized: true
         });
 
-        // Compute slots securely
         _tickSlotMap[poolId] = keccak256(abi.encodePacked(PRE_SWAP_TICK_PREFIX, poolId));
         _flagSlotMap[poolId] = keccak256(abi.encodePacked(PRE_SWAP_TICK_FLAG, poolId));
         _trackerSlotMap[poolId] = keccak256(abi.encodePacked(TRACKER_PREFIX, poolId));
         _sandwichFlagSlotMap[poolId] = keccak256(abi.encodePacked(SANDWICH_FLAG_PREFIX, poolId));
 
-        // Seed TWAP oracle at slot 0
-        TwapOracle.initialize(_observations[poolId], _observationStates[poolId], uint32(block.timestamp));
+        // [FIX-1] Seed the oracle AND immediately pre-warm cardinality in the
+        // same transaction, so write() no longer overwrites a single slot
+        // forever. Gas cost of the pre-warm SSTOREs is paid once, here, by
+        // whoever initializes the pool — not amortized silently later.
+        TwapOracle.State storage state = _observationStates[poolId];
+        TwapOracle.initialize(_observations[poolId], state, uint32(block.timestamp));
+
+        uint16 oldCardinality = state.cardinality;
+        if (initialCardinality > oldCardinality) {
+            TwapOracle.grow(_observations[poolId], state, initialCardinality);
+            state.cardinality = initialCardinality;
+            emit OracleCardinalityIncreased(poolId, oldCardinality, state.cardinality);
+        }
 
         return this.afterInitialize.selector;
     }
@@ -406,7 +452,6 @@ contract CuratioHook is BaseHook, Ownable {
         PoolId poolId = key.toId();
         uint128 currentLiquidity = poolManager.getLiquidity(poolId);
 
-        // Convert negative delta to uint256 safely to prevent SafeCast overflow
         uint256 requestedRemoval = params.liquidityDelta < 0 ? uint256(-int256(params.liquidityDelta)) : 0;
 
         if (requestedRemoval > uint256(currentLiquidity)) {
@@ -481,7 +526,14 @@ contract CuratioHook is BaseHook, Ownable {
         uint256 currentBlock = block.number;
         (, int24 currentTick,,) = poolManager.getSlot0(poolId);
 
-        // ১. Transient storage setup & verification
+        // ── Transient storage setup & verification ──────────────────────────
+        // NOTE: this flag assumes PoolManager always pairs beforeSwap with a
+        // matching afterSwap for the same pool before any other beforeSwap on
+        // that pool can run within the same unlock — this holds under v4's
+        // lock/settle model, including multicall-batched swaps, since the
+        // pool manager processes swap operations sequentially. If this
+        // invariant is ever violated (e.g. a future PoolManager change),
+        // this flag would need re-auditing.
         bytes32 flagSlot = keccak256(abi.encodePacked(poolId, "flag"));
         bytes32 tickSlot = keccak256(abi.encodePacked(poolId, "tick"));
 
@@ -494,13 +546,13 @@ contract CuratioHook is BaseHook, Ownable {
             tstore(tickSlot, currentTick)
         }
 
-        // ২. Zero-amount swap guard
+        // ── Zero-amount swap guard ───────────────────────────────────────────
         if (params.amountSpecified == 0) {
             return
                 (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG);
         }
 
-        // ৩. MEV / Sandwich Block Level Check
+        // ── MEV / Sandwich Block Level Check ─────────────────────────────────
         uint256 sandwichBlock = _sandwichFlags[poolId];
         if (sandwichBlock == currentBlock) {
             return (
@@ -510,33 +562,30 @@ contract CuratioHook is BaseHook, Ownable {
             );
         }
 
-        // 🌟 ৪. TWAP Protection & Dynamic Fee Calculation
-        uint24 feeToApply = BASE_FEE;
+        // ── [FIX-2] TWAP Protection & Dynamic Fee Calculation ────────────────
+        // Explicit warm check replaces try/catch-on-revert: cheaper (no
+        // external call + catch overhead) and cold start now defaults to a
+        // conservative fee rather than silently falling back to BASE_FEE.
+        uint24 feeToApply;
 
-        // ১২০ সেকেন্ডের TWAP উইন্ডো থেকে গড় টিকেট নেয়ার চেষ্টা
-        try this.getTwapTick(key, 120) returns (int24 twapTick) {
-            // Current Tick এবং TWAP Tick-এর মধ্যে পার্থক্য হিসেব
+        if (TwapOracle.isWarm(_observations[poolId], _observationStates[poolId], DEFAULT_TWAP_WINDOW)) {
+            int24 twapTick = _getTwapTick(poolId, currentTick, DEFAULT_TWAP_WINDOW);
             int24 tickDivergenceRaw = currentTick - twapTick;
             uint24 tickDivergence = abs(tickDivergenceRaw);
 
-            // যদি স্পট প্রাইস TWAP থেকে অতিরিক্ত দূরে সরে যায় (MEV / Flash Loan Manipulation)
             if (uint256(tickDivergence) >= tickThresholdHigh) {
-                feeToApply = MEV_PENALTY_FEE; // চরম ব্যবধানে পেনাল্টি ফি
+                feeToApply = MEV_PENALTY_FEE;
             } else if (uint256(tickDivergence) >= tickThresholdMid) {
-                feeToApply = HIGH_VOLATILE_FEE; // মাঝারি ব্যবধানে হাই ভোলাটিলিটি ফি
+                feeToApply = HIGH_VOLATILE_FEE;
             } else {
-                // ৫. Block Decay অনুযায়ী সাধারণ বা ভোলাটাইল ফি
                 PackedPoolState storage state = poolStates[poolId];
                 uint256 blockDelta = currentBlock > state.lastBlock ? currentBlock - state.lastBlock : 0;
-
                 feeToApply = (blockDelta >= blockDecayWindow || state.fee == 0) ? BASE_FEE : state.fee;
             }
-        } catch {
-            // Cold Start Fallback: পুল নতুন হলে বা TWAP ডাটা না থাকলে সাধারণ ফি লজিক ব্যবহার হবে
-            PackedPoolState storage state = poolStates[poolId];
-            uint256 blockDelta = currentBlock > state.lastBlock ? currentBlock - state.lastBlock : 0;
-
-            feeToApply = (blockDelta >= blockDecayWindow || state.fee == 0) ? BASE_FEE : state.fee;
+        } else {
+            // Cold start: we cannot verify spot price against a TWAP yet, so
+            // we assume elevated risk rather than assuming safety.
+            feeToApply = MID_VOLATILE_FEE;
         }
 
         return
@@ -553,14 +602,12 @@ contract CuratioHook is BaseHook, Ownable {
         uint256 currentBlock = block.number;
         (, int24 postSwapTick,,) = poolManager.getSlot0(poolId);
 
-        // 👈 beforeSwap-এর সাথে মিলিয়ে একই ডাইনামিক স্লট ব্যবহার করা হচ্ছে
         bytes32 flagSlot = keccak256(abi.encodePacked(poolId, "flag"));
         bytes32 tickSlot = keccak256(abi.encodePacked(poolId, "tick"));
 
         uint256 flag;
         bytes32 rawPreSwapTick;
 
-        // 1. Load pre-swap state from transient storage
         assembly {
             flag := tload(flagSlot)
             rawPreSwapTick := tload(tickSlot)
@@ -568,16 +615,12 @@ contract CuratioHook is BaseHook, Ownable {
 
         if (flag == 0) revert("Composability violation: unexpected state");
 
-        // Clear transient flag slot for cleanup
         assembly { tstore(flagSlot, 0) }
 
-        // Safely cast transient byte storage to signed int24
         int24 preSwapTick = int24(int256(uint256(rawPreSwapTick)));
 
-        // 2. Write observation to TWAP oracle
-        TwapOracle.write(_observations[poolId], _observationStates[poolId], uint32(block.timestamp), postSwapTick);
+        TwapOracle.write(_observations[poolId], _observationStates[poolId], uint32(block.timestamp), preSwapTick);
 
-        // 3. Unpack MEV / Sandwich tracker state
         uint256 trackerPacked = _packedTrackers[poolId];
         SandwichTracker memory tracker = _unpackTracker(trackerPacked);
 
@@ -592,11 +635,9 @@ contract CuratioHook is BaseHook, Ownable {
             });
         }
 
-        // 4. Calculate tick delta magnitude
         int24 tickDeltaRaw = postSwapTick - preSwapTick;
         uint24 tickDelta = uint24(tickDeltaRaw >= 0 ? tickDeltaRaw : -tickDeltaRaw);
 
-        // 5. Track volume per block
         uint256 swapAmount =
             params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
 
@@ -607,13 +648,11 @@ contract CuratioHook is BaseHook, Ownable {
             blockVolumeMap[poolId] += swapAmount;
         }
 
-        // 6. Compute dynamic escalated fee based on tick movement
         PackedPoolState storage state = poolStates[poolId];
         uint256 blockDelta = currentBlock > state.lastBlock ? currentBlock - state.lastBlock : 0;
 
         uint24 feeToSave = _computeFee(tickDelta, blockDelta, state.fee);
 
-        // 7. Update tracker direction and peak tick
         int24 currentMove = postSwapTick - preSwapTick;
 
         if (currentMove != 0) {
@@ -631,7 +670,12 @@ contract CuratioHook is BaseHook, Ownable {
             }
         }
 
-        // 8. Detect sandwich attack patterns
+        // NOTE: sandwich detection below is a heuristic (direction-reversal +
+        // per-block volume threshold), not a guaranteed classifier. It can
+        // produce false positives on legitimate opposing-direction trades or
+        // arbitrage correction in the same block. Tune thresholds carefully
+        // and treat MEV_PENALTY_FEE application here as "elevated suspicion",
+        // not "proven attack".
         bool isSandwich = false;
         uint256 volume = blockVolumeMap[poolId];
 
@@ -647,7 +691,6 @@ contract CuratioHook is BaseHook, Ownable {
             isSandwich = true;
         }
 
-        // Apply MEV penalty fee if a sandwich pattern was detected
         if (isSandwich) {
             feeToSave = MEV_PENALTY_FEE;
             _sandwichFlags[poolId] = currentBlock;
@@ -659,7 +702,6 @@ contract CuratioHook is BaseHook, Ownable {
             tracker.lastMove = currentMove;
         }
 
-        // 9. Persist updated tracker and pool state
         _packedTrackers[poolId] = _packTracker(tracker);
 
         poolStates[poolId] = PackedPoolState({
@@ -670,7 +712,6 @@ contract CuratioHook is BaseHook, Ownable {
             initialized: true
         });
 
-        // 10. Emit update events
         emit FeeUpdated(poolId, feeToSave);
         emit HistoryUpdated(poolId, postSwapTick, currentBlock, block.timestamp);
 
@@ -680,11 +721,10 @@ contract CuratioHook is BaseHook, Ownable {
     // ─── Internal helpers ─────────────────────────────────────────────────────
 
     function abs(int24 n) internal pure returns (uint24) {
-        return n >= 0 ? uint24(uint32(int32(n))) : uint24(uint32(-int32(n)));
+        return uint24(n >= 0 ? n : -n);
     }
 
     function _computeFee(uint24 tickDelta, uint256 blockDelta, uint24 currentFee) internal view returns (uint24) {
-        // '>' এর জায়গায় '>=' ব্যবহার করুন
         if (uint256(tickDelta) >= tickThresholdHigh) return HIGH_VOLATILE_FEE;
         if (uint256(tickDelta) >= tickThresholdMid) return MID_VOLATILE_FEE;
 
@@ -693,10 +733,24 @@ contract CuratioHook is BaseHook, Ownable {
         return currentFee;
     }
 
+    /// @dev Internal TWAP computation, used only after isWarm() has already
+    ///      confirmed sufficient history — avoids the external call + revert
+    ///      path that the old try/catch pattern relied on.
+    function _getTwapTick(PoolId poolId, int24 currentTick, uint32 twapWindow) internal view returns (int24) {
+        uint32 nowTime = uint32(block.timestamp);
+        uint32 targetTime = nowTime - twapWindow;
+
+        int56 currentCumulative =
+            TwapOracle.observeAt(_observations[poolId], _observationStates[poolId], nowTime, currentTick);
+        int56 targetCumulative =
+            TwapOracle.observeAt(_observations[poolId], _observationStates[poolId], targetTime, currentTick);
+
+        int56 timeDelta = int56(uint56(twapWindow));
+        return int24((currentCumulative - targetCumulative) / timeDelta);
+    }
+
     // ── Pack/Unpack tracker ────────────────────────────────────────────────
     function _packTracker(SandwichTracker memory t) internal pure returns (uint256) {
-        // Cast signed ticks (int24) through int32 -> uint32 -> uint24 to preserve
-        // two's complement bit patterns and prevent Solidity 0.8+ cast underflow panics (0x11)
         uint24 rawFirst = uint24(uint32(int32(t.firstMove)));
         uint24 rawLast = uint24(uint32(int32(t.lastMove)));
         uint24 rawPeak = uint24(uint32(int32(t.peakTick)));
@@ -721,7 +775,6 @@ contract CuratioHook is BaseHook, Ownable {
 
     // ─── View/Getter functions ───────────────────────────────────────────────
 
-    // ✅ Explicit Getters to bypass custom value type mapping quirks in tests
     function tickSlotMap(PoolId poolId) external view returns (bytes32) {
         return _tickSlotMap[poolId];
     }
@@ -801,33 +854,35 @@ contract CuratioHook is BaseHook, Ownable {
     // ─── TWAP Oracle — public API ─────────────────────────────────────────────
 
     /// @notice Time-weighted average tick over the last `twapWindow` seconds.
-    /// @dev Reverts if the oracle doesn't yet have `twapWindow` seconds of history
-    ///      (e.g. right after pool init, or if cardinality is too small).
-    // Example of problematic pattern causing early return:
+    /// @dev Reverts if the oracle doesn't yet have `twapWindow` seconds of history.
+    ///      Kept as public API for off-chain callers / integrators; the hook's
+    ///      own beforeSwap no longer depends on this reverting path (see FIX-2).
+
     function getTwapTick(PoolKey calldata key, uint32 twapWindow) external view returns (int24 twapTick) {
         require(twapWindow > 0, "TwapWindow must be > 0");
 
-        uint32 nowTime = uint32(block.timestamp);
-
-        // 🔴 Underflow Panic (0x11) রোধ করতে এবং পর্যাপ্ত হিস্ট্রি না থাকলে Revert করতে এই চেকটি যুক্ত করা হয়েছে
-        require(nowTime >= twapWindow, "TwapOracle: target older than oldest observation");
-
-        uint32 targetTime = nowTime - twapWindow;
         PoolId poolId = key.toId();
-
         (, int24 currentTick,,) = poolManager.getSlot0(poolId);
 
-        int56 currentCumulative =
-            TwapOracle.observeAt(_observations[poolId], _observationStates[poolId], nowTime, currentTick);
+        // ভুল check-টা সরিয়ে দিন। history পর্যাপ্ত কিনা সেটা যাচাই করার
+        // দায়িত্ব এমনিতেই TwapOracle.binarySearch-এর require-এর উপর ছেড়ে দিন,
+        // অথবা explicit ভাবে isWarm() ব্যবহার করুন:
+        require(
+            TwapOracle.isWarm(_observations[poolId], _observationStates[poolId], twapWindow),
+            "TwapOracle: insufficient history for requested window"
+        );
 
-        int56 targetCumulative =
-            TwapOracle.observeAt(_observations[poolId], _observationStates[poolId], targetTime, currentTick);
-
-        int56 timeDelta = int56(uint56(twapWindow));
-        twapTick = int24((currentCumulative - targetCumulative) / timeDelta);
+        return _getTwapTick(poolId, currentTick, twapWindow);
     }
 
-    /// @notice Raw oracle state, useful for off-chain tooling / debugging.
+    /// @notice Whether the oracle has at least `twapWindow` seconds of history.
+    ///         Integrators/UIs should check this before calling getTwapTick
+    ///         to avoid an unnecessary revert.
+    function isOracleWarm(PoolKey calldata key, uint32 twapWindow) external view returns (bool) {
+        PoolId poolId = key.toId();
+        return TwapOracle.isWarm(_observations[poolId], _observationStates[poolId], twapWindow);
+    }
+
     function getOracleState(PoolKey calldata key)
         external
         view
@@ -837,37 +892,94 @@ contract CuratioHook is BaseHook, Ownable {
         return (s.index, s.cardinality, s.cardinalityNext);
     }
 
-    /// @notice Grows the oracle's ring-buffer capacity so a longer TWAP window
-    ///         can eventually be supported. Anyone may call and pay the gas
-    ///         to pre-warm slots (same pattern as Uniswap v3 pools).
-    function increaseObservationCardinality(PoolKey calldata key, uint16 newCardinality) external {
+    /// @notice Increases the oracle observation cardinality for a pool
+    /// @dev Only emits event if actual growth occurs (prevents no-op event emissions)
+
+    function increaseObservationCardinality(PoolKey calldata key, uint16 targetCardinality)
+        external
+        returns (uint16 cardinalityNextOld, uint16 cardinalityNextNew)
+    {
         PoolId poolId = key.toId();
+
+        // 1. পুল ইনিশিয়ালাইজড কি না চেক করুন (ফেইল-২ ফিক্স)
+        require(poolStates[poolId].initialized, "Pool not initialized");
+
         TwapOracle.State storage state = _observationStates[poolId];
-        require(state.cardinality > 0, "Pool not initialized");
+        cardinalityNextOld = state.cardinalityNext;
 
-        uint16 old = state.cardinality;
-        TwapOracle.grow(_observations[poolId], state, newCardinality);
-
-        // Bump the active cardinality immediately (simpler + more predictable
-        // than v3's lazy wraparound bump — acceptable tradeoff for this hook).
-        if (newCardinality > state.cardinality) {
-            state.cardinality = newCardinality;
+        // 2. No-op চেক
+        if (targetCardinality <= cardinalityNextOld) {
+            return (cardinalityNextOld, cardinalityNextOld);
         }
 
-        emit OracleCardinalityIncreased(poolId, old, state.cardinality);
+        // 3. অরাকেল বাফার গ্রো করা
+        _observations[poolId].grow(state, targetCardinality);
+
+        // 4. cardinality ও cardinalityNext দুটোকেই আপডেট রাখা (ফেইল-১ ফিক্স)
+        state.cardinality = state.cardinalityNext;
+        cardinalityNextNew = state.cardinalityNext;
+
+        // 5. ইভেন্ট ফায়ার
+        if (cardinalityNextNew > cardinalityNextOld) {
+            emit OracleCardinalityIncreased(poolId, cardinalityNextOld, cardinalityNextNew);
+        }
+
+        return (cardinalityNextOld, cardinalityNextNew);
     }
 
     // ─── Admin ────────────────────────────────────────────────────────────────
 
-    function setTickThresholds(uint256 high, uint256 mid, uint256 volumeThreshold, uint256 sandwichThreshold)
+    /// @notice Sets the default oracle cardinality pre-warmed at pool init.
+    ///         Only affects pools initialized after this call.
+    function setInitialCardinality(uint16 newCardinality) external onlyOwner {
+        require(newCardinality > 0, "Must be > 0");
+        emit InitialCardinalityUpdated(initialCardinality, newCardinality);
+        initialCardinality = newCardinality;
+    }
+
+    /// @notice [FIX-3] Step 1 of 2: propose new fee thresholds. Takes effect
+    ///         no earlier than THRESHOLD_TIMELOCK_DELAY from now, giving LPs
+    ///         and integrators visibility/reaction time before parameters change.
+    function proposeTickThresholds(uint256 high, uint256 mid, uint256 volumeThreshold, uint256 sandwichThreshold)
         external
         onlyOwner
     {
         require(high > mid, "High threshold must be greater than mid");
-        tickThresholdHigh = high;
-        tickThresholdMid = mid;
-        mevVolumeThreshold = volumeThreshold;
-        sandwichTickThreshold = sandwichThreshold;
-        emit ThresholdsUpdated(high, mid, sandwichThreshold);
+        uint256 eta = block.timestamp + THRESHOLD_TIMELOCK_DELAY;
+
+        pendingThresholds = PendingThresholds({
+            high: high,
+            mid: mid,
+            volumeThreshold: volumeThreshold,
+            sandwichThreshold: sandwichThreshold,
+            eta: eta,
+            exists: true
+        });
+
+        emit ThresholdsProposed(high, mid, volumeThreshold, sandwichThreshold, eta);
+    }
+
+    /// @notice [FIX-3] Step 2 of 2: execute a previously proposed threshold
+    ///         change once its timelock has elapsed.
+    function executeTickThresholds() external onlyOwner {
+        PendingThresholds memory p = pendingThresholds;
+        require(p.exists, "No pending proposal");
+        require(block.timestamp >= p.eta, "Timelock not elapsed");
+
+        tickThresholdHigh = p.high;
+        tickThresholdMid = p.mid;
+        mevVolumeThreshold = p.volumeThreshold;
+        sandwichTickThreshold = p.sandwichThreshold;
+
+        delete pendingThresholds;
+
+        emit ThresholdsUpdated(p.high, p.mid, p.sandwichThreshold);
+    }
+
+    /// @notice Cancels a pending threshold proposal without applying it.
+    function cancelTickThresholdsProposal() external onlyOwner {
+        require(pendingThresholds.exists, "No pending proposal");
+        delete pendingThresholds;
+        emit ThresholdsProposalCancelled();
     }
 }
