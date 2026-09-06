@@ -1,4 +1,5 @@
 [profile.default]
+test = "test/foundry" 
 auto_detect_solc = true
 offline = false
 evm_version = "cancun"
@@ -11,6 +12,7 @@ src = "src"
 via_ir = true
 optimizer = true
 optimizer_runs = 1000000
+
 
 [profile.default.optimizer_details]
 yul = true
@@ -39,3 +41,4 @@ unichain         = { key = "${UNISCAN_API_KEY}",     url = "https://api.uniscan.
 unichain_sepolia = { key = "${UNISCAN_API_KEY}",     url = "https://api-sepolia.uniscan.xyz/api", chain = 1301 }
 base             = { key = "${BASESCAN_API_KEY}",    url = "https://api.basescan.org/api"                 }
 sepolia          = { key = "${ETHERSCAN_API_KEY}",   url = "https://api-sepolia.etherscan.io/api"         }
+

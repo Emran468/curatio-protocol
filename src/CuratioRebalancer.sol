@@ -10,6 +10,7 @@ import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.so
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
 
 /// @dev Read-only view into CuratioHook (Layer 1) — used purely as a volatility
 ///      signal to decide WHEN to rebalance. The hook is never called to execute
@@ -20,6 +21,8 @@ interface ICuratioHookView {
         external
         view
         returns (int24 lastTick, uint24 fee, uint64 lastBlock, uint64 lastTimestamp, bool initialized);
+    // NEW: needed for TWAP-based range calculation in performUpkeep
+    function getTwapTick(PoolKey calldata key, uint32 twapWindow) external view returns (int24 twapTick);
 }
 
 /**
@@ -29,11 +32,26 @@ interface ICuratioHookView {
  *      and executes liquidity rebalancing directly against Uniswap v4's PoolManager
  *      via the unlock/callback pattern.
  */
-contract CuratioRebalancer is AccessControl, IUnlockCallback {
+contract CuratioRebalancer is AccessControl, IUnlockCallback, AutomationCompatibleInterface {
     using PoolIdLibrary for PoolKey;
 
     bytes32 public constant STRATEGIST_ROLE = keccak256("STRATEGIST_ROLE");
     bytes32 public constant VAULT_ROLE = keccak256("VAULT_ROLE");
+
+    // ── Chainlink Automation config ────────────────────────────────────────
+    uint32 public constant TWAP_WINDOW = 120;
+    uint24 public constant FEE_ESCALATION_THRESHOLD = 6000; // MID_VOLATILE_FEE, not BASE_FEE
+    uint256 public constant TICK_DIVERGENCE_THRESHOLD = 200;
+
+    address public automationRegistry;
+    uint256 public defaultRebalanceAmount;
+
+    error NotAutomationRegistry(address caller);
+
+    modifier onlyAutomationRegistry() {
+        if (msg.sender != automationRegistry) revert NotAutomationRegistry(msg.sender);
+        _;
+    }
 
     IPoolManager public immutable poolManager;
     ICuratioHookView public hook;
@@ -88,16 +106,30 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback {
         _;
     }
 
-    constructor(address _poolManager, address _hook, address _vault, address _admin, uint256 _rebalanceThreshold) {
-        if (_poolManager == address(0) || _hook == address(0) || _vault == address(0) || _admin == address(0)) {
+    constructor(
+        address _poolManager,
+        address _hook,
+        address _vault,
+        address _admin,
+        uint256 _rebalanceThreshold,
+        address _automationRegistry, // NEW
+        uint256 _defaultRebalanceAmount // NEW
+    ) {
+        if (
+            _poolManager == address(0) || _hook == address(0) || _vault == address(0) || _admin == address(0)
+                || _automationRegistry == address(0)
+        ) {
             revert ZeroAddress();
         }
         require(_rebalanceThreshold > 0, "Invalid Threshold");
+        require(_defaultRebalanceAmount > 0, "Invalid default amount");
 
         poolManager = IPoolManager(_poolManager);
         hook = ICuratioHookView(_hook);
         vault = _vault;
         rebalanceThreshold = _rebalanceThreshold;
+        automationRegistry = _automationRegistry;
+        defaultRebalanceAmount = _defaultRebalanceAmount;
 
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
         _grantRole(STRATEGIST_ROLE, _admin);
@@ -143,6 +175,12 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback {
         external
         onlyRole(STRATEGIST_ROLE)
     {
+        _executeRebalanceLogic(newTickLower, newTickUpper, liquidityToMove);
+    }
+
+    /// @dev Shared core logic used by both the manual strategist path
+    ///      (rebalanceLiquidity) and the automated keeper path (performUpkeep).
+    function _executeRebalanceLogic(int24 newTickLower, int24 newTickUpper, int256 liquidityToMove) internal {
         if (!poolConfigured) revert PoolNotConfigured();
         if (newTickLower >= newTickUpper) revert InvalidTickRange();
 
@@ -155,7 +193,7 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback {
             liquidityToMove: liquidityToMove
         });
 
-        poolManager.unlock(abi.encode(ActionType.REBALANCE, data));
+        poolManager.unlock(abi.encode(ActionType.REBALANCE, abi.encode(data)));
 
         currentTickLower = newTickLower;
         currentTickUpper = newTickUpper;
@@ -269,4 +307,81 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback {
     function setMinBlocksBetweenRebalances(uint256 blocks_) external onlyRole(DEFAULT_ADMIN_ROLE) {
         minBlocksBetweenRebalances = blocks_;
     }
+
+    // ─── Chainlink Automation ───────────────────────────────────────────────
+
+    function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory performData) {
+        if (!poolConfigured) return (false, "");
+        if (block.number < lastRebalanceBlock + minBlocksBetweenRebalances) return (false, "");
+
+        (bool stateSuccess, int24 lastTick, uint24 fee, bool initialized) = _tryGetPoolState();
+        if (!stateSuccess || !initialized) return (false, "");
+
+        bool feeHigh = fee >= FEE_ESCALATION_THRESHOLD;
+
+        (bool twapSuccess, int24 twapTick) = _tryGetTwapTick();
+        bool twapDiverged = false;
+        if (twapSuccess) {
+            int24 divergence = lastTick - twapTick;
+            if (divergence < 0) divergence = -divergence;
+            twapDiverged = uint256(uint24(divergence)) > TICK_DIVERGENCE_THRESHOLD;
+        }
+
+        if (feeHigh || twapDiverged) {
+            return (true, abi.encode(twapSuccess ? twapTick : lastTick, twapDiverged));
+        }
+        return (false, "");
+    }
+
+    function performUpkeep(bytes calldata performData) external override onlyAutomationRegistry {
+        if (!poolConfigured) revert PoolNotConfigured();
+        if (block.number < lastRebalanceBlock + minBlocksBetweenRebalances) {
+            emit RebalanceSkipped("Too soon since last rebalance");
+            return;
+        }
+
+        (int24 referenceTick, bool twapDiverged) = abi.decode(performData, (int24, bool));
+
+        int24 tickSpacing = managedPool.tickSpacing;
+        int24 baseTick = (referenceTick / tickSpacing) * tickSpacing;
+
+        int24 rangeWidthInSpacings = twapDiverged ? int24(3) : int24(2);
+        int24 newLower = baseTick - (tickSpacing * rangeWidthInSpacings);
+        int24 newUpper = baseTick + (tickSpacing * rangeWidthInSpacings);
+
+        if (newLower >= newUpper) revert InvalidTickRange();
+
+        _executeRebalanceLogic(newLower, newUpper, int256(defaultRebalanceAmount));
+    }
+
+    // ─── Internal try/catch helpers (avoids try/catch verbosity inline) ────
+
+    function _tryGetPoolState() internal view returns (bool success, int24 lastTick, uint24 fee, bool initialized) {
+        try hook.getPoolState(managedPool) returns (int24 _tick, uint24 _fee, uint64, uint64, bool _init) {
+            return (true, _tick, _fee, _init);
+        } catch {
+            return (false, 0, 0, false);
+        }
+    }
+
+    function _tryGetTwapTick() internal view returns (bool success, int24 twapTick) {
+        try hook.getTwapTick(managedPool, TWAP_WINDOW) returns (int24 _twap) {
+            return (true, _twap);
+        } catch {
+            return (false, 0);
+        }
+    }
+
+    // ─── Admin: automation config ────────────────────────────────────────────
+
+    function setAutomationRegistry(address _newRegistry) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_newRegistry == address(0)) revert ZeroAddress();
+        automationRegistry = _newRegistry;
+    }
+
+    function setDefaultRebalanceAmount(uint256 _newAmount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_newAmount > 0, "Invalid default amount");
+        defaultRebalanceAmount = _newAmount;
+    }
 }
+

@@ -114,8 +114,26 @@ library TwapOracle {
         Observation memory last = self[state.index];
         if (last.blockTimestamp == time) return; // already recorded this block
 
-        uint32 delta = time - last.blockTimestamp;
-        int56 tickCumulative = last.tickCumulative + int56(tick) * int56(uint56(delta));
+        // uint32 timestamp subtraction: intentionally unchecked. `time` and
+        // `blockTimestamp` are both truncated uint32 representations of
+        // block.timestamp, which will themselves wrap around ~year 2106.
+        // The difference computed this way remains correct across that wrap
+        // (standard mod-2^32 arithmetic), matching the original V3 design.
+        uint32 delta;
+        unchecked {
+            delta = time - last.blockTimestamp;
+        }
+
+        // int56 tickCumulative accumulation: intentionally unchecked. This
+        // value is DESIGNED to overflow/wrap over long enough time horizons
+        // (max tick * max delta accumulates past int56 range eventually).
+        // Correctness relies on later consumers only ever taking a DIFFERENCE
+        // of two tickCumulative values, which is wrap-safe under two's
+        // complement arithmetic — never on the raw accumulated value itself.
+        int56 tickCumulative;
+        unchecked {
+            tickCumulative = last.tickCumulative + int56(tick) * int56(uint56(delta));
+        }
 
         uint16 indexUpdated = uint16((uint256(state.index) + 1) % state.cardinality);
         self[indexUpdated] = Observation({blockTimestamp: time, tickCumulative: tickCumulative, initialized: true});
@@ -150,8 +168,15 @@ library TwapOracle {
 
         if (latest.blockTimestamp < target) {
             // Extrapolate forward to `target` using the current (post-swap) tick.
-            uint32 delta = target - latest.blockTimestamp;
-            return latest.tickCumulative + int56(currentTick) * int56(uint56(delta));
+            // unchecked: same reasoning as write() — accumulation is designed
+            // to wrap, differences taken elsewhere remain correct.
+            uint32 delta;
+            unchecked {
+                delta = target - latest.blockTimestamp;
+            }
+            unchecked {
+                return latest.tickCumulative + int56(currentTick) * int56(uint56(delta));
+            }
         }
 
         // target is in the past relative to the latest observation — binary search.
@@ -164,11 +189,25 @@ library TwapOracle {
             return afterObs.tickCumulative;
         }
 
-        uint32 timeDelta = afterObs.blockTimestamp - before.blockTimestamp;
-        uint32 targetDelta = target - before.blockTimestamp;
-        int56 cumDelta = afterObs.tickCumulative - before.tickCumulative;
+        // unchecked: timeDelta/targetDelta are uint32 timestamp differences
+        // (wrap-safe by design, see write()); cumDelta is a difference of two
+        // possibly-wrapped int56 accumulators, which is exactly the safe
+        // operation the wraparound design relies on — the raw values may have
+        // individually overflowed int56's range at accumulation time, but
+        // their difference, computed mod 2^56, still yields the correct
+        // average tick over the interval.
+        uint32 timeDelta;
+        uint32 targetDelta;
+        int56 cumDelta;
+        unchecked {
+            timeDelta = afterObs.blockTimestamp - before.blockTimestamp;
+            targetDelta = target - before.blockTimestamp;
+            cumDelta = afterObs.tickCumulative - before.tickCumulative;
+        }
 
-        tickCumulative = before.tickCumulative + (cumDelta * int56(uint56(targetDelta))) / int56(uint56(timeDelta));
+        unchecked {
+            tickCumulative = before.tickCumulative + (cumDelta * int56(uint56(targetDelta))) / int56(uint56(timeDelta));
+        }
     }
 
     /// @dev Binary search over the ring buffer for the observations bracketing `target`.
@@ -217,12 +256,33 @@ library TwapOracle {
     ///      seconds of continuous history behind its oldest observation.
     ///      Callers should treat `false` as "cannot verify price integrity"
     ///      and apply a conservative fee, not a permissive one.
+    // function isWarm(mapping(uint16 => Observation) storage self, State storage state, uint32 window)
+    //     internal
+    //     view
+    //     returns (bool)
+    // {
+    //     if (state.cardinality == 0) return false;
+
+    //     uint16 oldestIndex = uint16((uint256(state.index) + 1) % state.cardinality);
+    //     Observation memory oldest = self[oldestIndex];
+    //     if (!oldest.initialized) {
+    //         oldest = self[0];
+    //     }
+    //     if (!oldest.initialized) return false;
+    //     if (block.timestamp < oldest.blockTimestamp) return false;
+
+    //     return (uint32(block.timestamp) - oldest.blockTimestamp) >= window;
+    // }
+
     function isWarm(mapping(uint16 => Observation) storage self, State storage state, uint32 window)
         internal
         view
         returns (bool)
     {
-        if (state.cardinality == 0) return false;
+        if (state.cardinality == 0 || window == 0) return false;
+
+        // window যদি বর্তমান block.timestamp-এর চেয়ে বড় হয়, তবে underflow এড়াতে false
+        if (window > block.timestamp) return false;
 
         uint16 oldestIndex = uint16((uint256(state.index) + 1) % state.cardinality);
         Observation memory oldest = self[oldestIndex];
@@ -230,9 +290,12 @@ library TwapOracle {
             oldest = self[0];
         }
         if (!oldest.initialized) return false;
+
+        // timestamp underflow এড়ানোর চেক
         if (block.timestamp < oldest.blockTimestamp) return false;
 
-        return (uint32(block.timestamp) - oldest.blockTimestamp) >= window;
+        uint32 target = uint32(block.timestamp) - window;
+        return target >= oldest.blockTimestamp;
     }
 }
 
@@ -331,6 +394,9 @@ contract CuratioHook is BaseHook, Ownable {
 
     bool private _entered;
 
+    uint16 public constant HARD_MAX_CARDINALITY_PER_CALL = 1000;
+    uint16 public maxCardinalityPerCall = 500;
+
     // ── Events ────────────────────────────────────────────────────────────────
     event LiquidityUpdated(
         address indexed sender,
@@ -353,6 +419,7 @@ contract CuratioHook is BaseHook, Ownable {
     event DeployedOnChain(uint256 indexed chainId, string chainName, uint64 blockDecayWindow);
     event OracleCardinalityIncreased(PoolId indexed poolId, uint16 oldCardinality, uint16 newCardinality);
     event InitialCardinalityUpdated(uint16 oldValue, uint16 newValue);
+    event MaxCardinalityPerCallUpdated(uint16 oldValue, uint16 newValue);
 
     // ── Reentrancy Guard ──────────────────────────────────────────────────────
     modifier nonReentrant() {
@@ -362,12 +429,21 @@ contract CuratioHook is BaseHook, Ownable {
         _entered = false;
     }
 
+    /// @dev Testing-only escape hatch for the chain/PoolManager-address
+    ///      guard below. Always false here; a test harness that is NEVER
+    ///      deployed to a real network can override it to true. This does
+    ///      not weaken production security — this branch is dead code on
+    ///      every real deployment of CuratioHook itself.
+    function _skipChainCheck() internal view virtual returns (bool) {
+        return false;
+    }
+
     constructor(IPoolManager _poolManager, address _owner) BaseHook(_poolManager) Ownable() {
         deployedChainId = block.chainid;
         blockDecayWindow = ChainRegistry.getBlockDecayWindow(block.chainid);
         chainName = ChainRegistry.getChainName(block.chainid);
 
-        if (block.chainid != 31337) {
+        if (block.chainid != 31337 && !_skipChainCheck()) {
             address expected = ChainRegistry.getPoolManager(block.chainid);
             require(address(_poolManager) == expected, "Wrong PoolManager for this chain");
         }
@@ -376,6 +452,21 @@ contract CuratioHook is BaseHook, Ownable {
         emit OwnershipTransferred(msg.sender, _owner);
         emit DeployedOnChain(deployedChainId, chainName, blockDecayWindow);
     }
+
+    // constructor(IPoolManager _poolManager, address _owner) BaseHook(_poolManager) Ownable() {
+    //     deployedChainId = block.chainid;
+    //     blockDecayWindow = ChainRegistry.getBlockDecayWindow(block.chainid);
+    //     chainName = ChainRegistry.getChainName(block.chainid);
+
+    //     if (block.chainid != 31337) {
+    //         address expected = ChainRegistry.getPoolManager(block.chainid);
+    //         require(address(_poolManager) == expected, "Wrong PoolManager for this chain");
+    //     }
+
+    //     owner = _owner;
+    //     emit OwnershipTransferred(msg.sender, _owner);
+    //     emit DeployedOnChain(deployedChainId, chainName, blockDecayWindow);
+    // }
 
     // ── Hook Permissions ──────────────────────────────────────────────────────
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -901,25 +992,32 @@ contract CuratioHook is BaseHook, Ownable {
     {
         PoolId poolId = key.toId();
 
-        // 1. পুল ইনিশিয়ালাইজড কি না চেক করুন (ফেইল-২ ফিক্স)
         require(poolStates[poolId].initialized, "Pool not initialized");
 
         TwapOracle.State storage state = _observationStates[poolId];
         cardinalityNextOld = state.cardinalityNext;
 
-        // 2. No-op চেক
         if (targetCardinality <= cardinalityNextOld) {
             return (cardinalityNextOld, cardinalityNextOld);
         }
 
-        // 3. অরাকেল বাফার গ্রো করা
-        _observations[poolId].grow(state, targetCardinality);
+        // Compute the clamp in uint32 to avoid any risk of the addition itself
+        // overflowing uint16 near type(uint16).max — an overflow here would
+        // revert (Solidity 0.8 default), which is exactly the silent-DoS
+        // surface this fix exists to remove. Widening first makes the clamp
+        // itself unconditionally safe.
+        uint32 maxAllowed32 = uint32(cardinalityNextOld) + uint32(maxCardinalityPerCall);
+        uint32 target32 = uint32(targetCardinality);
 
-        // 4. cardinality ও cardinalityNext দুটোকেই আপডেট রাখা (ফেইল-১ ফিক্স)
+        uint16 cappedTarget = target32 > maxAllowed32
+            ? (maxAllowed32 > type(uint16).max ? type(uint16).max : uint16(maxAllowed32))
+            : targetCardinality;
+
+        _observations[poolId].grow(state, cappedTarget);
+
         state.cardinality = state.cardinalityNext;
         cardinalityNextNew = state.cardinalityNext;
 
-        // 5. ইভেন্ট ফায়ার
         if (cardinalityNextNew > cardinalityNextOld) {
             emit OracleCardinalityIncreased(poolId, cardinalityNextOld, cardinalityNextNew);
         }
@@ -933,8 +1031,19 @@ contract CuratioHook is BaseHook, Ownable {
     ///         Only affects pools initialized after this call.
     function setInitialCardinality(uint16 newCardinality) external onlyOwner {
         require(newCardinality > 0, "Must be > 0");
+        require(newCardinality <= maxCardinalityPerCall, "Exceeds max cardinality per call");
         emit InitialCardinalityUpdated(initialCardinality, newCardinality);
         initialCardinality = newCardinality;
+    }
+
+    // @notice Adjusts the soft per-call cardinality-growth cap.
+    /// @dev Always bounded by HARD_MAX_CARDINALITY_PER_CALL — this function
+    ///      can never weaken the physical safety ceiling, only tune within it.
+    function setMaxCardinalityPerCall(uint16 newCap) external onlyOwner {
+        require(newCap > 0, "Must be > 0");
+        require(newCap <= HARD_MAX_CARDINALITY_PER_CALL, "Exceeds hard ceiling");
+        emit MaxCardinalityPerCallUpdated(maxCardinalityPerCall, newCap);
+        maxCardinalityPerCall = newCap;
     }
 
     /// @notice [FIX-3] Step 1 of 2: propose new fee thresholds. Takes effect

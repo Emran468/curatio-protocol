@@ -1,5 +1,20 @@
-testMode: "property"
+# test/Echidna/echidna.yaml
+#
+# CuratioHook's constructor skips the PoolManager-address equality check
+# only when block.chainid == 31337, and CuratioHookEchidnaTest's HookMiner
+# assumes a deterministic CREATE2 deployer/address space consistent with
+# that chain id. Keep chainId: 31337 for this whole campaign.
+
+testMode: "assertion"     # checks assert()/require() reverts in every test function, plus
+                            # still runs any echidna_-prefixed bool invariants
+# NOTE: this Echidna build reported "unused option: chainId" / "unused option:
+# checkAsserts" — those keys aren't supported here. chainid=31337 is now
+# forced directly inside CuratioHookEchidnaTest's constructor via the hevm
+# cheatcode instead (see IHevm.chainId call in the .sol file).
 sender: ["0x10000", "0x20000", "0x30000"]
-seqLen: 100
-testLimit: 5000 
+seqLen: 200
+testLimit: 500000
+workers: 2
 corpusDir: "echidna-corpus"
+coverage: true
+codeSize: 0xffffff        # hook + BaseHook + libraries can exceed default size caps

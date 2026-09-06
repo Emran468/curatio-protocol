@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test, console2} from "forge-std/Test.sol";
+import {Test, console2, Vm} from "forge-std/Test.sol";
 
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
@@ -15,6 +15,7 @@ import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/Pool
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
+import {BalanceDelta, BalanceDeltaLibrary} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 
 import {CuratioHook, Ownable} from "../../src/CuratioHook.sol";
 import {MultiSwapRouter} from "./MultiSwapRouter.sol";
@@ -828,4 +829,449 @@ contract CuratioHookTest is Test, Deployers {
 
         assertApproxEqAbs(actualTwap, expectedTwap, 1, "TWAP failed exact mathematical weighted average check");
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // setMaxCardinalityPerCall — completely untested in existing suite
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_setMaxCardinalityPerCall_onlyOwner() public {
+        vm.prank(randomUser);
+        vm.expectRevert(Ownable.NotOwner.selector);
+        hook.setMaxCardinalityPerCall(200);
+    }
+
+    function test_setMaxCardinalityPerCall_revertsOnZero() public {
+        vm.prank(owner);
+        vm.expectRevert("Must be > 0");
+        hook.setMaxCardinalityPerCall(0);
+    }
+
+    function test_setMaxCardinalityPerCall_revertsAboveHardCeiling() public {
+        uint16 hardCeiling = hook.HARD_MAX_CARDINALITY_PER_CALL();
+
+        vm.prank(owner);
+        vm.expectRevert("Exceeds hard ceiling");
+        hook.setMaxCardinalityPerCall(hardCeiling + 1);
+    }
+
+    function test_setMaxCardinalityPerCall_succeedsAtExactHardCeiling() public {
+        uint16 hardCeiling = hook.HARD_MAX_CARDINALITY_PER_CALL();
+
+        vm.prank(owner);
+        hook.setMaxCardinalityPerCall(hardCeiling);
+
+        assertEq(hook.maxCardinalityPerCall(), hardCeiling);
+    }
+
+    function test_setMaxCardinalityPerCall_updatesStateAndEmits() public {
+        vm.expectEmit(false, false, false, true);
+        emit CuratioHook.MaxCardinalityPerCallUpdated(500, 300);
+
+        vm.prank(owner);
+        hook.setMaxCardinalityPerCall(300);
+
+        assertEq(hook.maxCardinalityPerCall(), 300);
+    }
+
+    /// @notice A lowered maxCardinalityPerCall must retroactively clamp
+    ///         future increaseObservationCardinality requests.
+    function test_setMaxCardinalityPerCall_affectsFutureGrowthClamp() public {
+        vm.prank(owner);
+        hook.setMaxCardinalityPerCall(20);
+
+        (, uint16 cardinalityBefore,) = hook.getOracleState(poolKey);
+
+        (, uint16 newCardinalityNext) = hook.increaseObservationCardinality(poolKey, type(uint16).max);
+
+        assertEq(newCardinalityNext, cardinalityBefore + 20, "growth should clamp to the newly lowered cap");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // increaseObservationCardinality — untested branches
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// @notice Requesting a target at or below the current cardinalityNext
+    ///         must be a true no-op (early-return branch), not just a
+    ///         gas-cheap growth.
+    function test_increaseObservationCardinality_noOpBelowCurrent() public {
+        (,, uint16 cardinalityNextBefore) = hook.getOracleState(poolKey);
+
+        (uint16 oldVal, uint16 newVal) = hook.increaseObservationCardinality(poolKey, cardinalityNextBefore - 1);
+
+        assertEq(oldVal, cardinalityNextBefore, "old value should reflect actual current state");
+        assertEq(newVal, cardinalityNextBefore, "no-op growth must not change cardinalityNext");
+    }
+
+    /// @notice Requesting exactly the current cardinalityNext is also a no-op.
+    function test_increaseObservationCardinality_noOpAtExactCurrent() public {
+        (,, uint16 cardinalityNextBefore) = hook.getOracleState(poolKey);
+
+        (, uint16 newVal) = hook.increaseObservationCardinality(poolKey, cardinalityNextBefore);
+
+        assertEq(newVal, cardinalityNextBefore);
+    }
+
+    /// @notice No event should be emitted for the no-op growth path.
+    function test_increaseObservationCardinality_noOpEmitsNoEvent() public {
+        (,, uint16 cardinalityNextBefore) = hook.getOracleState(poolKey);
+
+        vm.recordLogs();
+        hook.increaseObservationCardinality(poolKey, cardinalityNextBefore);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        bytes32 eventSig = keccak256("OracleCardinalityIncreased(bytes32,uint16,uint16)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(logs[i].topics.length == 0 || logs[i].topics[0] != eventSig, "no-op growth must not emit");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // isOracleWarm — untested edge-case branches
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_isOracleWarm_falseWhenWindowIsZero() public view {
+        assertFalse(hook.isOracleWarm(poolKey, 0), "zero window must be treated as never warm");
+    }
+
+    function test_isOracleWarm_falseWhenWindowExceedsCurrentTimestamp() public view {
+        // block.timestamp is small early in the test run; a huge window
+        // must exercise the `window > block.timestamp` early-return guard.
+        assertFalse(hook.isOracleWarm(poolKey, type(uint32).max), "window exceeding block.timestamp must be cold");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // View/getter functions — untested in existing suite
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_tickSlotMap_returnsNonZeroAfterInit() public view {
+        assertNotEq(hook.tickSlotMap(poolId), bytes32(0));
+    }
+
+    function test_flagSlotMap_returnsNonZeroAfterInit() public view {
+        assertNotEq(hook.flagSlotMap(poolId), bytes32(0));
+    }
+
+    function test_trackerSlotMap_returnsNonZeroAfterInit() public view {
+        assertNotEq(hook.trackerSlotMap(poolId), bytes32(0));
+    }
+
+    function test_sandwichFlagSlotMap_returnsNonZeroAfterInit() public view {
+        assertNotEq(hook.sandwichFlagSlotMap(poolId), bytes32(0));
+    }
+
+    function test_isInitialized_trueForConfiguredPool() public view {
+        assertTrue(hook.isInitialized(poolKey));
+    }
+
+    function test_isInitialized_falseForUnconfiguredPool() public view {
+        PoolKey memory uninitKey = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            tickSpacing: 120,
+            hooks: hook
+        });
+        assertFalse(hook.isInitialized(uninitKey));
+    }
+
+    function test_getCurrentFee_returnsBaseFeeForUninitializedPool() public view {
+        PoolKey memory uninitKey = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            tickSpacing: 120,
+            hooks: hook
+        });
+        assertEq(hook.getCurrentFee(uninitKey), BASE_FEE, "uninitialized pool must report BASE_FEE, not revert");
+    }
+
+    function test_getCurrentBlockVolume_zeroBeforeAnySwapThisBlock() public view {
+        assertEq(hook.getCurrentBlockVolume(poolKey), 0);
+    }
+
+    function test_getCurrentBlockVolume_nonZeroImmediatelyAfterSwap() public {
+        _swap(true, 5 ether);
+        assertEq(hook.getCurrentBlockVolume(poolKey), 5 ether);
+    }
+
+    function test_getCurrentBlockVolume_zeroInNextBlock() public {
+        _swap(true, 5 ether);
+        vm.roll(block.number + 1);
+        assertEq(hook.getCurrentBlockVolume(poolKey), 0, "volume must reset once we move to a new block");
+    }
+
+    function test_getChainInfo_returnsExpectedTestChainValues() public view {
+        (uint256 chainId, string memory name, uint64 decayWindow, bool isUnichain) = hook.getChainInfo();
+        assertEq(chainId, block.chainid);
+        assertFalse(isUnichain, "Foundry's default test chainid is not Unichain");
+        assertGt(decayWindow, 0);
+        assertTrue(bytes(name).length > 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // abs() — direct branch coverage for both signs
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// @notice Drives the tick negative and confirms downstream tick-delta
+    ///         math (which relies on abs()) still produces a sane, bounded
+    ///         fee — exercising the negative-input branch of abs().
+    function test_negativeTickDelta_producesValidFeeTier() public {
+        (int24 tickBefore,,,,) = hook.getPoolState(poolKey);
+        _swap(false, 200 ether);
+        (int24 tickAfter,,,,) = hook.getPoolState(poolKey);
+
+        assertTrue(tickAfter != tickBefore, "swap must actually move the tick to exercise delta math");
+
+        uint24 fee = hook.getCurrentFee(poolKey);
+        assertTrue(
+            fee == MID_VOLATILE_FEE || fee == HIGH_VOLATILE_FEE, "large swap should escalate fee, not stay at base"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // afterRemoveLiquidity — success path (only the revert path was tested before)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_removeLiquidity_succeedsAndEmitsEvent() public {
+        int24 tickLower = TickMath.minUsableTick(60);
+        int24 tickUpper = TickMath.maxUsableTick(60);
+
+        vm.expectEmit(false, true, false, false);
+        emit CuratioHook.LiquidityUpdated(address(this), poolId, tickLower, tickUpper, 0, false);
+
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: -10 ether, salt: bytes32(0)
+            }),
+            ""
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Sandwich tracker — negative-direction peak tracking (only positive
+    // direction was implicitly exercised before)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_sandwichTracker_tracksNegativeDirectionPeak() public {
+        _swap(true, 3 ether);
+        (int24 tickAfterFirst,,,,) = hook.getPoolState(poolKey);
+
+        _swap(true, 3 ether);
+        (int24 tickAfterSecond,,,,) = hook.getPoolState(poolKey);
+
+        (,, int24 peakTick,,, bool initialized) = hook.getSandwichTracker(poolKey);
+        assertTrue(initialized, "tracker should be initialized");
+
+        assertTrue(
+            tickAfterSecond < tickAfterFirst, "both swaps must move tick further negative to exercise this branch"
+        );
+        assertEq(peakTick, tickAfterSecond, "peak should track the more negative (lower) tick");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // beforeSwap / afterSwap — transient-storage reentrancy guard branches
+    // These guards protect against a hypothetical future PoolManager change
+    // and cannot be reached through the real PoolManager's normal atomic
+    // beforeSwap -> core swap -> afterSwap flow. We exercise them directly
+    // by pranking as the PoolManager (the only allowed caller) and driving
+    // the hook's callback functions out of their expected sequence.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_beforeSwap_onlyPoolManager() public {
+        SwapParams memory params = SwapParams({
+            zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        vm.prank(randomUser);
+        vm.expectRevert(); // onlyPoolManager modifier, from BaseHook
+        hook.beforeSwap(randomUser, poolKey, params, "");
+    }
+
+    function test_afterSwap_onlyPoolManager() public {
+        SwapParams memory params = SwapParams({
+            zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        vm.prank(randomUser);
+        vm.expectRevert(); // onlyPoolManager modifier, from BaseHook
+        hook.afterSwap(randomUser, poolKey, params, BalanceDeltaLibrary.ZERO_DELTA, "");
+    }
+
+    /// @notice Calling beforeSwap twice in a row (as the PoolManager) without
+    ///         an intervening afterSwap must revert on the second call — this
+    ///         is the transient-storage dirty guard that protects against a
+    ///         hypothetical PoolManager change that no longer pairs every
+    ///         beforeSwap with a matching afterSwap before the next beforeSwap.
+    function test_beforeSwap_revertsOnDirtyTransientStorage() public {
+        SwapParams memory params = SwapParams({
+            zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        vm.startPrank(address(manager));
+
+        // First call succeeds and sets the transient "in progress" flag.
+        hook.beforeSwap(address(this), poolKey, params, "");
+
+        // Second call, still within the same (simulated) unlock context,
+        // with no afterSwap in between — must hit the dirty-flag guard.
+        vm.expectRevert("Transient storage dirty: composability violation");
+        hook.beforeSwap(address(this), poolKey, params, "");
+
+        vm.stopPrank();
+    }
+
+    /// @notice Calling afterSwap (as the PoolManager) without a preceding
+    ///         beforeSwap for the same pool must revert — the flag was never
+    ///         set, so afterSwap sees flag == 0 and rejects the call as an
+    ///         unexpected/out-of-sequence composability violation.
+    function test_afterSwap_revertsOnComposabilityViolationWithoutPriorBeforeSwap() public {
+        SwapParams memory params = SwapParams({
+            zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        vm.prank(address(manager));
+        vm.expectRevert("Composability violation: unexpected state");
+        hook.afterSwap(address(this), poolKey, params, BalanceDeltaLibrary.ZERO_DELTA, "");
+    }
+
+    /// @notice A properly-sequenced beforeSwap followed by afterSwap for the
+    ///         same call must clear the flag, so a subsequent independent
+    ///         beforeSwap call is NOT treated as dirty. This is the
+    ///         complementary "happy path" for the guard, confirming the flag
+    ///         is actually reset rather than only ever being set.
+    function test_beforeSwap_thenAfterSwap_clearsFlagForNextCall() public {
+        SwapParams memory params = SwapParams({
+            zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        vm.startPrank(address(manager));
+
+        hook.beforeSwap(address(this), poolKey, params, "");
+        hook.afterSwap(address(this), poolKey, params, BalanceDeltaLibrary.ZERO_DELTA, "");
+
+        // Flag should be clear now — this must NOT revert.
+        hook.beforeSwap(address(this), poolKey, params, "");
+
+        vm.stopPrank();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // _packTracker / _unpackTracker — negative-value sign-extension branches
+    // These are internal, so we verify them indirectly through
+    // getSandwichTracker(), which round-trips through pack/unpack on every
+    // read. Driving firstMove, lastMove, and peakTick all negative exercises
+    // the `rawX & 0x800000 != 0` sign-extension branch for each field,
+    // instead of only ever hitting the positive/non-negative branch.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// @notice All three signed tracker fields (firstMove, lastMove, peakTick)
+    ///         must round-trip correctly through pack/unpack when negative.
+    function test_sandwichTracker_packUnpack_allFieldsNegative() public {
+        // Swap 1: establishes firstMove (negative, tick moving down).
+        (int24 tickStart,,,,) = hook.getPoolState(poolKey);
+        _swap(true, 3 ether);
+        (int24 tickAfterFirst,,,,) = hook.getPoolState(poolKey);
+        int24 expectedFirstMove = tickAfterFirst - tickStart;
+        assertLt(expectedFirstMove, 0, "setup invalid: first move must be negative");
+
+        // Swap 2: same direction, extends the negative peak and updates lastMove.
+        _swap(true, 3 ether);
+        (int24 tickAfterSecond,,,,) = hook.getPoolState(poolKey);
+        int24 expectedLastMove = tickAfterSecond - tickAfterFirst;
+        assertLt(expectedLastMove, 0, "setup invalid: second move must also be negative");
+
+        (int24 firstMove, int24 lastMove, int24 peakTick,,, bool initialized) = hook.getSandwichTracker(poolKey);
+
+        assertTrue(initialized);
+        assertEq(firstMove, expectedFirstMove, "firstMove failed negative round-trip through pack/unpack");
+        assertEq(lastMove, expectedLastMove, "lastMove failed negative round-trip through pack/unpack");
+        assertEq(peakTick, tickAfterSecond, "peakTick failed negative round-trip through pack/unpack");
+
+        // Sanity: confirm all three are actually negative, so we know we
+        // exercised the sign-extension branch and not the positive path.
+        assertLt(firstMove, 0);
+        assertLt(lastMove, 0);
+        assertLt(peakTick, 0);
+    }
+
+    /// @notice Confirms positive and negative tracker values are each
+    ///         unpacked correctly within the SAME tracker lifecycle (a
+    ///         direction reversal). The first swap produces a positive
+    ///         firstMove; the reversing second swap triggers sandwich
+    ///         detection, which resets firstMove to the (negative)
+    ///         currentMove per afterSwap's isSandwich branch. This exercises
+    ///         both the positive-value and negative-value sign-extension
+    ///         branches of pack/unpack within one sequence.
+    function test_sandwichTracker_packUnpack_mixedSignsAcrossReversal() public {
+        (int24 tickStart,,,,) = hook.getPoolState(poolKey);
+        _swap(false, 3 ether);
+        (int24 tickAfterFirst,,,,) = hook.getPoolState(poolKey);
+        int24 expectedFirstMove = tickAfterFirst - tickStart;
+        assertGt(expectedFirstMove, 0, "setup invalid: first move must be positive");
+
+        _swap(true, 1 ether);
+        (int24 tickAfterSecond,,,,) = hook.getPoolState(poolKey);
+        int24 expectedLastMove = tickAfterSecond - tickAfterFirst;
+        assertLt(expectedLastMove, 0, "setup invalid: second move must be negative (reversal)");
+
+        (int24 firstMove, int24 lastMove,,,, bool initialized) = hook.getSandwichTracker(poolKey);
+        uint24 currentFee = hook.getCurrentFee(poolKey);
+
+        assertTrue(initialized, "tracker must be initialized");
+
+        // The reversal must have triggered sandwich detection (confirmed
+        // empirically: fee escalates to MEV_PENALTY_FEE). Once triggered,
+        // afterSwap resets firstMove = currentMove, so firstMove now equals
+        // the negative lastMove rather than the original positive move.
+        assertEq(
+            currentFee,
+            MEV_PENALTY_FEE,
+            "setup invalid: reversal must trigger MEV penalty for this test to be meaningful"
+        );
+
+        assertEq(lastMove, expectedLastMove, "lastMove failed negative round-trip after reversal");
+        assertEq(
+            firstMove,
+            expectedLastMove,
+            "firstMove must be reset to currentMove (negative) after sandwich detection resets it"
+        );
+
+        // Sanity: confirm we actually exercised the negative sign-extension
+        // branch on both fields, not the positive path.
+        assertLt(firstMove, 0);
+        assertLt(lastMove, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // _computeFee — "fee persists" branch (neither escalate nor reset)
+    // Exercises: tickDelta < mid threshold AND blockDelta < decayWindow AND
+    // currentFee != 0 -> feeToSave = currentFee (the final `return currentFee`
+    // branch in _computeFee, distinct from the BASE_FEE-reset branch already
+    // covered by test_fee_decaysBackToBaseAfterDecayWindow).
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_computeFee_feePersists_withinDecayWindowAndBelowThreshold() public {
+        // 1. First swap: large enough to escalate fee off BASE_FEE.
+        _swap(true, 500 ether);
+        uint24 feeAfterEscalation = hook.getCurrentFee(poolKey);
+        assertGt(feeAfterEscalation, BASE_FEE, "setup invalid: first swap must escalate fee");
+
+        // 2. Move forward a FEW blocks only (well within blockDecayWindow,
+        //    which defaults to 25 for the test chain per ChainRegistry).
+        vm.roll(block.number + 2);
+        vm.warp(block.timestamp + 24); // ~2 blocks at 12s/block
+
+        // 3. Second swap: tiny amount, so tickDelta stays below both
+        //    tickThresholdMid/High -> falls through to the persistence branch.
+        _swap(true, 0.001 ether);
+        uint24 feeAfterTinySwap = hook.getCurrentFee(poolKey);
+
+        assertEq(
+            feeAfterTinySwap,
+            feeAfterEscalation,
+            "fee should persist (neither reset to BASE_FEE nor re-escalate) for a tiny swap within the decay window"
+        );
+    }
 }
+
