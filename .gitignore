@@ -15,3 +15,7 @@ docs/
 # Security Tools Auto-generated Files
 crytic-export/
 echidna-corpus*/
+
+lcov.info
+lcov-run-output.txt
+coverage/

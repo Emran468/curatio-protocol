@@ -333,7 +333,7 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback, AutomationCompatib
         return (false, "");
     }
 
-    function performUpkeep(bytes calldata performData) external override onlyAutomationRegistry {
+   function performUpkeep(bytes calldata performData) external override onlyAutomationRegistry {
         if (!poolConfigured) revert PoolNotConfigured();
         if (block.number < lastRebalanceBlock + minBlocksBetweenRebalances) {
             emit RebalanceSkipped("Too soon since last rebalance");
@@ -343,7 +343,11 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback, AutomationCompatib
         (int24 referenceTick, bool twapDiverged) = abi.decode(performData, (int24, bool));
 
         int24 tickSpacing = managedPool.tickSpacing;
-        int24 baseTick = (referenceTick / tickSpacing) * tickSpacing;
+        
+        // নেতিবাচক টিকের জন্য সঠিক ফ্লোর ডিভিশন লজিক 
+        int24 baseTick = (referenceTick >= 0) 
+            ? (referenceTick / tickSpacing) * tickSpacing 
+            : ((referenceTick - tickSpacing + 1) / tickSpacing) * tickSpacing;
 
         int24 rangeWidthInSpacings = twapDiverged ? int24(3) : int24(2);
         int24 newLower = baseTick - (tickSpacing * rangeWidthInSpacings);
@@ -353,7 +357,6 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback, AutomationCompatib
 
         _executeRebalanceLogic(newLower, newUpper, int256(defaultRebalanceAmount));
     }
-
     // ─── Internal try/catch helpers (avoids try/catch verbosity inline) ────
 
     function _tryGetPoolState() internal view returns (bool success, int24 lastTick, uint24 fee, bool initialized) {

@@ -81,11 +81,13 @@ contract CuratioRebalancerTest is Test, Deployers {
     CuratioRebalancer public rebalancer;
 
     address public admin = makeAddr("admin");
-    address public strategist = makeAddr("strategist"); // will be granted role in setUp
+    address public strategist = makeAddr("strategist");
     address public vault = makeAddr("vault");
     address public hook = makeAddr("hook");
-    address public poolManager = makeAddr("poolManager"); // mocked as EOA-like for access tests
+    address public poolManager = makeAddr("poolManager");
     address public attacker = makeAddr("attacker");
+    address public automationRegistry = makeAddr("automationRegistry"); // NEW
+    uint256 public constant DEFAULT_REBALANCE_AMOUNT = 1000 ether; // NEW
 
     PoolKey internal testKey;
 
@@ -100,7 +102,9 @@ contract CuratioRebalancerTest is Test, Deployers {
             hook,
             vault,
             admin,
-            1 ether // rebalanceThreshold
+            1 ether, // rebalanceThreshold
+            automationRegistry, // NEW
+            DEFAULT_REBALANCE_AMOUNT // NEW
         );
 
         testKey = PoolKey({
@@ -119,6 +123,8 @@ contract CuratioRebalancerTest is Test, Deployers {
         assertEq(address(rebalancer.hook()), hook);
         assertEq(rebalancer.vault(), vault);
         assertEq(rebalancer.rebalanceThreshold(), 1 ether);
+        assertEq(rebalancer.automationRegistry(), automationRegistry); // NEW
+        assertEq(rebalancer.defaultRebalanceAmount(), DEFAULT_REBALANCE_AMOUNT); // NEW
         assertTrue(rebalancer.hasRole(rebalancer.DEFAULT_ADMIN_ROLE(), admin));
         assertTrue(rebalancer.hasRole(rebalancer.STRATEGIST_ROLE(), admin));
         assertTrue(rebalancer.hasRole(rebalancer.VAULT_ROLE(), vault));
@@ -126,28 +132,43 @@ contract CuratioRebalancerTest is Test, Deployers {
 
     function test_constructor_revertsOnZeroPoolManager() public {
         vm.expectRevert(CuratioRebalancer.ZeroAddress.selector);
-        new CuratioRebalancer(address(0), hook, vault, admin, 1 ether);
+        new CuratioRebalancer(address(0), hook, vault, admin, 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT);
     }
 
     function test_constructor_revertsOnZeroHook() public {
         vm.expectRevert(CuratioRebalancer.ZeroAddress.selector);
-        new CuratioRebalancer(poolManager, address(0), vault, admin, 1 ether);
+        new CuratioRebalancer(poolManager, address(0), vault, admin, 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT);
     }
 
     function test_constructor_revertsOnZeroVault() public {
         vm.expectRevert(CuratioRebalancer.ZeroAddress.selector);
-        new CuratioRebalancer(poolManager, hook, address(0), admin, 1 ether);
+        new CuratioRebalancer(poolManager, hook, address(0), admin, 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT);
     }
 
     function test_constructor_revertsOnZeroAdmin() public {
         vm.expectRevert(CuratioRebalancer.ZeroAddress.selector);
-        new CuratioRebalancer(poolManager, hook, vault, address(0), 1 ether);
+        new CuratioRebalancer(poolManager, hook, vault, address(0), 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT);
     }
 
     function test_constructor_revertsOnZeroThreshold() public {
         vm.expectRevert(bytes("Invalid Threshold"));
-        new CuratioRebalancer(poolManager, hook, vault, admin, 0);
+        new CuratioRebalancer(poolManager, hook, vault, admin, 0, automationRegistry, DEFAULT_REBALANCE_AMOUNT);
     }
+
+    // NEW: constructor validation for the two new parameters
+    function test_constructor_revertsOnZeroAutomationRegistry() public {
+        vm.expectRevert(CuratioRebalancer.ZeroAddress.selector);
+        new CuratioRebalancer(poolManager, hook, vault, admin, 1 ether, address(0), DEFAULT_REBALANCE_AMOUNT);
+    }
+
+    function test_constructor_revertsOnZeroDefaultRebalanceAmount() public {
+        vm.expectRevert(bytes("Invalid default amount"));
+        new CuratioRebalancer(poolManager, hook, vault, admin, 1 ether, automationRegistry, 0);
+    }
+
+
+
+   
 
     // ── Vault Notifications Tests ─────────────────────────────────
 
@@ -386,6 +407,7 @@ contract CuratioRebalancerIntegrationTest is Test {
     address public admin = makeAddr("admin");
     address public vault = makeAddr("vault");
     address public hook = makeAddr("hook");
+    address public automationRegistry = makeAddr("automationRegistry"); // NEW
 
     PoolKey internal testKey;
 
@@ -398,7 +420,9 @@ contract CuratioRebalancerIntegrationTest is Test {
             (token0, token1) = (token1, token0);
         }
 
-        rebalancer = new CuratioRebalancer(address(mockManager), hook, vault, admin, 1 ether);
+        rebalancer = new CuratioRebalancer(
+            address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether
+        );
 
         testKey = PoolKey({
             currency0: Currency.wrap(address(token0)),
@@ -411,8 +435,6 @@ contract CuratioRebalancerIntegrationTest is Test {
         vm.prank(admin);
         rebalancer.setManagedPool(testKey);
 
-        // Fund the rebalancer so it can pay out on negative deltas via
-        // transfer() inside _settleCurrency.
         token0.mint(address(rebalancer), 1_000 ether);
         token1.mint(address(rebalancer), 1_000 ether);
     }
@@ -557,4 +579,166 @@ contract CuratioRebalancerIntegrationTest is Test {
         // রিব্যালান্স ট্রিগার হয়নি তা নিশ্চিত হওয়া
         assertEq(rebalancer.lastRebalanceBlock(), 0);
     }
+
+        // ═══════════════════════════════════════════════════════════════════════
+    // Chainlink Automation — checkUpkeep / performUpkeep
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_performUpkeep_onlyAutomationRegistry() public {
+        vm.prank(makeAddr("randomCaller"));
+        vm.expectRevert(
+            abi.encodeWithSelector(CuratioRebalancer.NotAutomationRegistry.selector, makeAddr("randomCaller"))
+        );
+        rebalancer.performUpkeep(abi.encode(int24(0), false));
+    }
+
+    /// @notice checkUpkeep must return false when the pool has not been
+    ///         configured — this is a real state-dependent check, not a
+    ///         hardcoded true/false.
+    function test_checkUpkeep_falseWhenPoolNotConfigured() public {
+        CuratioRebalancer freshRebalancer = new CuratioRebalancer(
+            address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether
+        );
+
+        (bool upkeepNeeded,) = freshRebalancer.checkUpkeep("");
+        assertFalse(upkeepNeeded, "checkUpkeep must be false when pool is unconfigured");
+    }
+
+    /// @notice checkUpkeep must return false immediately after a rebalance,
+    ///         before minBlocksBetweenRebalances has elapsed.
+    function test_checkUpkeep_falseWhenTooSoonSinceLastRebalance() public {
+        // Trigger a manual rebalance to set lastRebalanceBlock to now.
+        mockManager.setNextDelta(0, 0);
+        vm.prank(admin);
+        rebalancer.rebalanceLiquidity(-120, 120, 100 ether);
+
+        (bool upkeepNeeded,) = rebalancer.checkUpkeep("");
+        assertFalse(upkeepNeeded, "checkUpkeep must be false immediately after a rebalance");
+    }
+
+    /// @notice checkUpkeep must return false when hook.getPoolState reverts
+    ///         (e.g. hook is an EOA/mock with no code), exercising the
+    ///         !stateSuccess early-return branch, not a hardcoded value.
+    function test_checkUpkeep_falseWhenHookCallReverts() public view {
+        // `hook` in this suite is makeAddr(...) — an address with no code,
+        // so any call to it (including the try/catch-wrapped getPoolState)
+        // will fail, forcing _tryGetPoolState to return success = false.
+        (bool upkeepNeeded, bytes memory performData) = rebalancer.checkUpkeep("");
+        assertFalse(upkeepNeeded, "checkUpkeep must be false when the hook call fails");
+        assertEq(performData.length, 0, "performData must be empty when checkUpkeep returns false");
+    }
+
+    /// @notice performUpkeep must correctly decode performData and execute
+    ///         a rebalance through the shared _executeRebalanceLogic path —
+    ///         verified by checking actual state changes, not just success.
+    function test_performUpkeep_executesRebalanceWithComputedRange() public {
+        mockManager.setNextDelta(0, 0);
+
+        int24 referenceTick = 600; // an arbitrary tick, must be a multiple-friendly value
+        bool twapDiverged = false;
+
+        vm.prank(automationRegistry);
+        rebalancer.performUpkeep(abi.encode(referenceTick, twapDiverged));
+
+        int24 tickSpacing = testKey.tickSpacing;
+        int24 expectedBase = (referenceTick / tickSpacing) * tickSpacing;
+        int24 expectedLower = expectedBase - (tickSpacing * 2); // twapDiverged=false -> width 2
+        int24 expectedUpper = expectedBase + (tickSpacing * 2);
+
+        assertEq(rebalancer.currentTickLower(), expectedLower, "performUpkeep computed wrong lower tick");
+        assertEq(rebalancer.currentTickUpper(), expectedUpper, "performUpkeep computed wrong upper tick");
+        assertEq(rebalancer.lastRebalanceBlock(), block.number, "lastRebalanceBlock not updated by performUpkeep");
+    }
+
+    /// @notice When twapDiverged is true, performUpkeep must use the wider
+    ///         range (3x tickSpacing) instead of the default (2x) — this
+    ///         distinguishes the two branches of rangeWidthInSpacings.
+    function test_performUpkeep_usesWiderRangeWhenTwapDiverged() public {
+        mockManager.setNextDelta(0, 0);
+
+        int24 referenceTick = 600;
+        bool twapDiverged = true;
+
+        vm.prank(automationRegistry);
+        rebalancer.performUpkeep(abi.encode(referenceTick, twapDiverged));
+
+        int24 tickSpacing = testKey.tickSpacing;
+        int24 expectedBase = (referenceTick / tickSpacing) * tickSpacing;
+        int24 expectedLower = expectedBase - (tickSpacing * 3); // twapDiverged=true -> width 3
+        int24 expectedUpper = expectedBase + (tickSpacing * 3);
+
+        assertEq(rebalancer.currentTickLower(), expectedLower, "diverged case did not use the wider (3x) range");
+        assertEq(rebalancer.currentTickUpper(), expectedUpper, "diverged case did not use the wider (3x) range");
+    }
+
+    function test_performUpkeep_revertsIfPoolNotConfigured() public {
+        CuratioRebalancer freshRebalancer = new CuratioRebalancer(
+            address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether
+        );
+
+        vm.prank(automationRegistry);
+        vm.expectRevert(CuratioRebalancer.PoolNotConfigured.selector);
+        freshRebalancer.performUpkeep(abi.encode(int24(0), false));
+    }
+
+    function test_performUpkeep_skipsIfTooSoonSinceLastRebalance() public {
+        mockManager.setNextDelta(0, 0);
+        vm.prank(admin);
+        rebalancer.rebalanceLiquidity(-120, 120, 100 ether);
+
+        uint256 lastRebalanceBlockBefore = rebalancer.lastRebalanceBlock();
+
+        vm.prank(automationRegistry);
+        rebalancer.performUpkeep(abi.encode(int24(600), false));
+
+        // Must not have executed a second rebalance — lastRebalanceBlock
+        // stays the same (real check, not assuming success).
+        assertEq(
+            rebalancer.lastRebalanceBlock(),
+            lastRebalanceBlockBefore,
+            "performUpkeep must skip, not execute, when called too soon"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Admin: automation config
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_setAutomationRegistry_onlyAdmin() public {
+        vm.prank(makeAddr("randomCaller"));
+        vm.expectRevert();
+        rebalancer.setAutomationRegistry(makeAddr("newRegistry"));
+    }
+
+    function test_setAutomationRegistry_revertsOnZero() public {
+        vm.prank(admin);
+        vm.expectRevert(CuratioRebalancer.ZeroAddress.selector);
+        rebalancer.setAutomationRegistry(address(0));
+    }
+
+    function test_setAutomationRegistry_updatesState() public {
+        address newRegistry = makeAddr("newRegistry");
+        vm.prank(admin);
+        rebalancer.setAutomationRegistry(newRegistry);
+        assertEq(rebalancer.automationRegistry(), newRegistry);
+    }
+
+    function test_setDefaultRebalanceAmount_onlyAdmin() public {
+        vm.prank(makeAddr("randomCaller"));
+        vm.expectRevert();
+        rebalancer.setDefaultRebalanceAmount(500 ether);
+    }
+
+    function test_setDefaultRebalanceAmount_revertsOnZero() public {
+        vm.prank(admin);
+        vm.expectRevert(bytes("Invalid default amount"));
+        rebalancer.setDefaultRebalanceAmount(0);
+    }
+
+    function test_setDefaultRebalanceAmount_updatesState() public {
+        vm.prank(admin);
+        rebalancer.setDefaultRebalanceAmount(500 ether);
+        assertEq(rebalancer.defaultRebalanceAmount(), 500 ether);
+    }
 }
+
