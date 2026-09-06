@@ -12,3 +12,6 @@ docs/
 
 # Dotenv file
 .env
+# Security Tools Auto-generated Files
+crytic-export/
+echidna-corpus*/
