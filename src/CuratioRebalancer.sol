@@ -11,6 +11,7 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
+import {CuratioStrategistRegistry} from "./CuratioStrategistRegistry.sol";
 
 /// @dev Read-only view into CuratioHook (Layer 1) — used purely as a volatility
 ///      signal to decide WHEN to rebalance. The hook is never called to execute
@@ -45,6 +46,7 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback, AutomationCompatib
 
     address public automationRegistry;
     uint256 public defaultRebalanceAmount;
+    CuratioStrategistRegistry public strategistRegistry;
 
     error NotAutomationRegistry(address caller);
 
@@ -200,8 +202,25 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback, AutomationCompatib
         lastRebalanceBlock = block.number;
 
         emit RebalanceExecuted(data.oldTickLower, data.oldTickUpper, newTickLower, newTickUpper);
+
+        // NEW: report performance to the registry, if configured. This is
+        // deliberately non-blocking (wrapped so a registry failure never
+        // reverts an otherwise-successful rebalance) and records msg.sender
+        // as the strategist — meaningful whether the caller was the manual
+        // strategist path (rebalanceLiquidity) or the automation path
+        // (performUpkeep, where onlyAutomationRegistry already gates the
+        // real caller).
+        _reportToRegistry();
     }
 
+    /// @dev Isolated in its own function with try/catch so a misconfigured
+    ///      or reverting registry can never brick the core rebalance path —
+    ///      this mirrors the same defensive pattern already used in
+    ///      CuratioVault's _notifyRebalancerDeposit/_notifyRebalancerWithdraw.
+    function _reportToRegistry() internal {
+        if (address(strategistRegistry) == address(0)) return;
+        try strategistRegistry.recordRebalanceExecuted(msg.sender) {} catch {}
+    }
     // ─── IUnlockCallback ──────────────────────────────────────────────────────
 
     function unlockCallback(bytes calldata rawData) external override onlyPoolManager returns (bytes memory) {
@@ -333,7 +352,7 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback, AutomationCompatib
         return (false, "");
     }
 
-   function performUpkeep(bytes calldata performData) external override onlyAutomationRegistry {
+    function performUpkeep(bytes calldata performData) external override onlyAutomationRegistry {
         if (!poolConfigured) revert PoolNotConfigured();
         if (block.number < lastRebalanceBlock + minBlocksBetweenRebalances) {
             emit RebalanceSkipped("Too soon since last rebalance");
@@ -343,10 +362,10 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback, AutomationCompatib
         (int24 referenceTick, bool twapDiverged) = abi.decode(performData, (int24, bool));
 
         int24 tickSpacing = managedPool.tickSpacing;
-        
-        // নেতিবাচক টিকের জন্য সঠিক ফ্লোর ডিভিশন লজিক 
-        int24 baseTick = (referenceTick >= 0) 
-            ? (referenceTick / tickSpacing) * tickSpacing 
+
+        // নেতিবাচক টিকের জন্য সঠিক ফ্লোর ডিভিশন লজিক
+        int24 baseTick = (referenceTick >= 0)
+            ? (referenceTick / tickSpacing) * tickSpacing
             : ((referenceTick - tickSpacing + 1) / tickSpacing) * tickSpacing;
 
         int24 rangeWidthInSpacings = twapDiverged ? int24(3) : int24(2);
@@ -385,6 +404,12 @@ contract CuratioRebalancer is AccessControl, IUnlockCallback, AutomationCompatib
     function setDefaultRebalanceAmount(uint256 _newAmount) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_newAmount > 0, "Invalid default amount");
         defaultRebalanceAmount = _newAmount;
+    }
+
+    function setStrategistRegistry(address _registry) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        // address(0) is explicitly allowed here — it's how you disable
+        // registry integration without redeploying the rebalancer.
+        strategistRegistry = CuratioStrategistRegistry(_registry);
     }
 }
 

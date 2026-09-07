@@ -137,17 +137,23 @@ contract CuratioRebalancerTest is Test, Deployers {
 
     function test_constructor_revertsOnZeroHook() public {
         vm.expectRevert(CuratioRebalancer.ZeroAddress.selector);
-        new CuratioRebalancer(poolManager, address(0), vault, admin, 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT);
+        new CuratioRebalancer(
+            poolManager, address(0), vault, admin, 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT
+        );
     }
 
     function test_constructor_revertsOnZeroVault() public {
         vm.expectRevert(CuratioRebalancer.ZeroAddress.selector);
-        new CuratioRebalancer(poolManager, hook, address(0), admin, 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT);
+        new CuratioRebalancer(
+            poolManager, hook, address(0), admin, 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT
+        );
     }
 
     function test_constructor_revertsOnZeroAdmin() public {
         vm.expectRevert(CuratioRebalancer.ZeroAddress.selector);
-        new CuratioRebalancer(poolManager, hook, vault, address(0), 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT);
+        new CuratioRebalancer(
+            poolManager, hook, vault, address(0), 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT
+        );
     }
 
     function test_constructor_revertsOnZeroThreshold() public {
@@ -165,10 +171,6 @@ contract CuratioRebalancerTest is Test, Deployers {
         vm.expectRevert(bytes("Invalid default amount"));
         new CuratioRebalancer(poolManager, hook, vault, admin, 1 ether, automationRegistry, 0);
     }
-
-
-
-   
 
     // ── Vault Notifications Tests ─────────────────────────────────
 
@@ -420,9 +422,8 @@ contract CuratioRebalancerIntegrationTest is Test {
             (token0, token1) = (token1, token0);
         }
 
-        rebalancer = new CuratioRebalancer(
-            address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether
-        );
+        rebalancer =
+            new CuratioRebalancer(address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether);
 
         testKey = PoolKey({
             currency0: Currency.wrap(address(token0)),
@@ -580,7 +581,7 @@ contract CuratioRebalancerIntegrationTest is Test {
         assertEq(rebalancer.lastRebalanceBlock(), 0);
     }
 
-        // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     // Chainlink Automation — checkUpkeep / performUpkeep
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -596,9 +597,8 @@ contract CuratioRebalancerIntegrationTest is Test {
     ///         configured — this is a real state-dependent check, not a
     ///         hardcoded true/false.
     function test_checkUpkeep_falseWhenPoolNotConfigured() public {
-        CuratioRebalancer freshRebalancer = new CuratioRebalancer(
-            address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether
-        );
+        CuratioRebalancer freshRebalancer =
+            new CuratioRebalancer(address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether);
 
         (bool upkeepNeeded,) = freshRebalancer.checkUpkeep("");
         assertFalse(upkeepNeeded, "checkUpkeep must be false when pool is unconfigured");
@@ -634,7 +634,12 @@ contract CuratioRebalancerIntegrationTest is Test {
     function test_performUpkeep_executesRebalanceWithComputedRange() public {
         mockManager.setNextDelta(0, 0);
 
-        int24 referenceTick = 600; // an arbitrary tick, must be a multiple-friendly value
+        // Advance past the initial minBlocksBetweenRebalances window so this
+        // call isn't treated as "too soon" (lastRebalanceBlock defaults to 0,
+        // and Foundry starts at block 1, which is < 0 + 10).
+        vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
+
+        int24 referenceTick = 600;
         bool twapDiverged = false;
 
         vm.prank(automationRegistry);
@@ -642,7 +647,7 @@ contract CuratioRebalancerIntegrationTest is Test {
 
         int24 tickSpacing = testKey.tickSpacing;
         int24 expectedBase = (referenceTick / tickSpacing) * tickSpacing;
-        int24 expectedLower = expectedBase - (tickSpacing * 2); // twapDiverged=false -> width 2
+        int24 expectedLower = expectedBase - (tickSpacing * 2);
         int24 expectedUpper = expectedBase + (tickSpacing * 2);
 
         assertEq(rebalancer.currentTickLower(), expectedLower, "performUpkeep computed wrong lower tick");
@@ -656,6 +661,8 @@ contract CuratioRebalancerIntegrationTest is Test {
     function test_performUpkeep_usesWiderRangeWhenTwapDiverged() public {
         mockManager.setNextDelta(0, 0);
 
+        vm.roll(block.number + rebalancer.minBlocksBetweenRebalances()); // NEW
+
         int24 referenceTick = 600;
         bool twapDiverged = true;
 
@@ -664,7 +671,7 @@ contract CuratioRebalancerIntegrationTest is Test {
 
         int24 tickSpacing = testKey.tickSpacing;
         int24 expectedBase = (referenceTick / tickSpacing) * tickSpacing;
-        int24 expectedLower = expectedBase - (tickSpacing * 3); // twapDiverged=true -> width 3
+        int24 expectedLower = expectedBase - (tickSpacing * 3);
         int24 expectedUpper = expectedBase + (tickSpacing * 3);
 
         assertEq(rebalancer.currentTickLower(), expectedLower, "diverged case did not use the wider (3x) range");
@@ -672,9 +679,8 @@ contract CuratioRebalancerIntegrationTest is Test {
     }
 
     function test_performUpkeep_revertsIfPoolNotConfigured() public {
-        CuratioRebalancer freshRebalancer = new CuratioRebalancer(
-            address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether
-        );
+        CuratioRebalancer freshRebalancer =
+            new CuratioRebalancer(address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether);
 
         vm.prank(automationRegistry);
         vm.expectRevert(CuratioRebalancer.PoolNotConfigured.selector);
