@@ -13,8 +13,6 @@ via_ir = true
 optimizer = true
 optimizer_runs = 1000000
 
-# Nested forge-std duplicate conflict 
-ignored_paths = ["lib/uniswap-hooks/lib/v4-core/lib/forge-std"]
 
 [profile.default.optimizer_details]
 yul = true
@@ -35,11 +33,12 @@ unichain          = "${UNICHAIN_RPC}"
 unichain_sepolia  = "${UNICHAIN_SEPOLIA_RPC}"
 ethereum          = "${ETHEREUM_RPC}"
 base              = "${BASE_RPC}"
-sepolia            = "${SEPOLIA_RPC}"
+sepolia           = "${SEPOLIA_RPC}"
 
 # ── Etherscan/Explorer API keys ────────────────────────────────────────────
 [etherscan]
-unichain         = { key = "${UNISCAN_API_KEY}",     url = "https://api.uniscan.xyz/api"                   }
+unichain         = { key = "${UNISCAN_API_KEY}",     url = "https://api.uniscan.xyz/api"                  }
 unichain_sepolia = { key = "${UNISCAN_API_KEY}",     url = "https://api-sepolia.uniscan.xyz/api", chain = 1301 }
-base             = { key = "${BASESCAN_API_KEY}",    url = "https://api.basescan.org/api"                  }
-sepolia          = { key = "${ETHERSCAN_API_KEY}",   url = "https://api-sepolia.etherscan.io/api"          }
+base             = { key = "${BASESCAN_API_KEY}",    url = "https://api.basescan.org/api"                 }
+sepolia          = { key = "${ETHERSCAN_API_KEY}",   url = "https://api-sepolia.etherscan.io/api"         }
+

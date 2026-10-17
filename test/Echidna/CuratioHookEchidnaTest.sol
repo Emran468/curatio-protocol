@@ -598,6 +598,40 @@ contract CuratioHookEchidnaTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
+// Property: Transient storage flag is always cleanly zeroed out 
+// after afterSwap completes across any fuzzed swap context.
+// ════════════════════════════════════════════════════════════════════
+function testTransientStorageAlwaysCleared(int256 amountSpecified, bool zeroForOne, int24 preTick, int24 postTick) public {
+    if (amountSpecified == 0) return;
+    if (preTick < -887272 || preTick > 887272) return;
+    if (postTick < -887272 || postTick > 887272) return;
+
+    poolManager.setSlot0(poolId, 79228162514264337593543950336, preTick);
+
+    SwapParams memory params = SwapParams({
+        zeroForOne: zeroForOne,
+        amountSpecified: amountSpecified,
+        sqrtPriceLimitX96: zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341
+    });
+
+    // 1. Execute full swap (beforeSwap -> afterSwap)
+    (bool success, ) = address(poolManager).call(
+        abi.encodeWithSelector(poolManager.driveFullSwap.selector, address(hook), poolKey, params, postTick)
+    );
+
+    // 2. If swap succeeded, strictly verify the transient slot was cleared
+    if (success) {
+        bytes32 slot = hook.sandwichFlagSlotMap(poolId);
+        uint256 flagValue;
+        assembly {
+            flagValue := tload(slot)
+        }
+        assert(flagValue == 0);
+    }
+}
+
+
+    // ════════════════════════════════════════════════════════════════════
     // TODO: properties not yet implemented. Restore these with real bodies
     // when ready — empty stubs were removed from this file because they
     // compiled but asserted nothing:

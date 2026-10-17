@@ -36,12 +36,58 @@ abstract contract Ownable {
 }
 
 // ─── Chain Registry ───────────────────────────────────────────────────────────
+// library ChainRegistry {
+//     uint256 constant UNICHAIN = 130;
+//     uint256 constant ETHEREUM = 1;
+//     uint256 constant BASE = 8453;
+//     uint256 constant OPTIMISM = 10;
+//     uint256 constant ARBITRUM = 42161;
+//     uint256 constant SEPOLIA = 11155111;
+//     uint256 constant UNICHAIN_SEPOLIA = 1301;
+//     uint256 constant BASE_SEPOLIA = 84532;
+
+//     function getPoolManager(uint256 chainId) internal pure returns (address) {
+//         if (chainId == UNICHAIN) return 0x1F98400000000000000000000000000000000004;
+//         if (chainId == ETHEREUM) return 0x000000000004444c5dc75cB358380D2e3dE08A90;
+//         if (chainId == BASE) return 0x498581fF718922c3f8e6A244956aF099B2652b2b;
+//         if (chainId == OPTIMISM) return 0x9a13F98Cb987694C9F086b1F5eB990EeA8264Ec3;
+//         if (chainId == ARBITRUM) return 0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32;
+//         if (chainId == SEPOLIA) return 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
+//         if (chainId == UNICHAIN_SEPOLIA) return 0x00B036B58a818B1BC34d502D3fE730Db729e62AC;
+//         if (chainId == BASE_SEPOLIA) return 0x00B036B58a818B1BC34d502D3fE730Db729e62AC;
+//         revert("ChainRegistry: unsupported chain");
+//     }
+
+//     function getChainName(uint256 chainId) internal pure returns (string memory) {
+//         if (chainId == UNICHAIN) return "Unichain Mainnet";
+//         if (chainId == ETHEREUM) return "Ethereum Mainnet";
+//         if (chainId == BASE) return "Base Mainnet";
+//         if (chainId == OPTIMISM) return "Optimism Mainnet";
+//         if (chainId == ARBITRUM) return "Arbitrum One";
+//         if (chainId == SEPOLIA) return "Sepolia Testnet";
+//         if (chainId == UNICHAIN_SEPOLIA) return "Unichain Sepolia";
+//         if (chainId == BASE_SEPOLIA) return "Base Sepolia";
+//         return "Unknown Chain";
+//     }
+
+//     function getBlockDecayWindow(uint256 chainId) internal pure returns (uint64) {
+//         if (chainId == UNICHAIN) return 300;
+//         if (chainId == UNICHAIN_SEPOLIA) return 300;
+//         if (chainId == BASE) return 150;
+//         if (chainId == BASE_SEPOLIA) return 150;
+//         if (chainId == OPTIMISM) return 150;
+//         if (chainId == ARBITRUM) return 1000;
+//         return 25;
+//     }
+// }
+
 library ChainRegistry {
     uint256 constant UNICHAIN = 130;
     uint256 constant ETHEREUM = 1;
     uint256 constant BASE = 8453;
     uint256 constant OPTIMISM = 10;
     uint256 constant ARBITRUM = 42161;
+    uint256 constant ARBITRUM_SEPOLIA = 421614;
     uint256 constant SEPOLIA = 11155111;
     uint256 constant UNICHAIN_SEPOLIA = 1301;
     uint256 constant BASE_SEPOLIA = 84532;
@@ -52,6 +98,7 @@ library ChainRegistry {
         if (chainId == BASE) return 0x498581fF718922c3f8e6A244956aF099B2652b2b;
         if (chainId == OPTIMISM) return 0x9a13F98Cb987694C9F086b1F5eB990EeA8264Ec3;
         if (chainId == ARBITRUM) return 0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32;
+        if (chainId == ARBITRUM_SEPOLIA) return 0xFB3e0C6F74eB1a21CC1Da29aeC80D2Dfe6C9a317;
         if (chainId == SEPOLIA) return 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
         if (chainId == UNICHAIN_SEPOLIA) return 0x00B036B58a818B1BC34d502D3fE730Db729e62AC;
         if (chainId == BASE_SEPOLIA) return 0x00B036B58a818B1BC34d502D3fE730Db729e62AC;
@@ -64,6 +111,7 @@ library ChainRegistry {
         if (chainId == BASE) return "Base Mainnet";
         if (chainId == OPTIMISM) return "Optimism Mainnet";
         if (chainId == ARBITRUM) return "Arbitrum One";
+        if (chainId == ARBITRUM_SEPOLIA) return "Arbitrum Sepolia";
         if (chainId == SEPOLIA) return "Sepolia Testnet";
         if (chainId == UNICHAIN_SEPOLIA) return "Unichain Sepolia";
         if (chainId == BASE_SEPOLIA) return "Base Sepolia";
@@ -77,6 +125,7 @@ library ChainRegistry {
         if (chainId == BASE_SEPOLIA) return 150;
         if (chainId == OPTIMISM) return 150;
         if (chainId == ARBITRUM) return 1000;
+        if (chainId == ARBITRUM_SEPOLIA) return 1000;
         return 25;
     }
 }
@@ -533,22 +582,40 @@ contract CuratioHook is BaseHook, Ownable {
     }
 
     // ─── Liquidity ────────────────────────────────────────────────────────────
-    function beforeRemoveLiquidity(address, PoolKey calldata key, ModifyLiquidityParams calldata params, bytes calldata)
+    // function beforeRemoveLiquidity(address, PoolKey calldata key, ModifyLiquidityParams calldata params, bytes calldata)
+    //     external
+    //     view
+    //     override
+    //     onlyPoolManager
+    //     returns (bytes4)
+    // {
+    //     PoolId poolId = key.toId();
+    //     uint128 currentLiquidity = poolManager.getLiquidity(poolId);
+
+    //     uint256 requestedRemoval = params.liquidityDelta < 0 ? uint256(-int256(params.liquidityDelta)) : 0;
+
+    //     if (requestedRemoval > uint256(currentLiquidity)) {
+    //         revert("Insufficient liquidity");
+    //     }
+
+    //     return this.beforeRemoveLiquidity.selector;
+    // }
+
+        /// @dev This hook is disabled in getHookPermissions() (beforeRemoveLiquidity:
+    ///      false), so PoolManager never actually calls it — kept only to
+    ///      satisfy the BaseHook interface. Real per-position liquidity
+    ///      validation happens in afterRemoveLiquidity -> _updatePositionLiquidity(),
+    ///      which checks the caller's own stored position, not the pool's
+    ///      total liquidity (the two are not equivalent, and a pool-total
+    ///      check here would be both redundant with PoolManager's own
+    ///      accounting invariants and wrongly scoped as a security check).
+    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         external
         view
         override
         onlyPoolManager
         returns (bytes4)
     {
-        PoolId poolId = key.toId();
-        uint128 currentLiquidity = poolManager.getLiquidity(poolId);
-
-        uint256 requestedRemoval = params.liquidityDelta < 0 ? uint256(-int256(params.liquidityDelta)) : 0;
-
-        if (requestedRemoval > uint256(currentLiquidity)) {
-            revert("Insufficient liquidity");
-        }
-
         return this.beforeRemoveLiquidity.selector;
     }
 

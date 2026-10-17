@@ -11,7 +11,7 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta, BalanceDeltaLibrary, toBalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
-import {CuratioRebalancer} from "../../src/CuratioRebalancer.sol";
+import {CuratioRebalancer, ICuratioHookView} from "../../src/CuratioRebalancer.sol";
 import {MockERC20} from "@uniswap/v4-core/lib/solmate/src/test/utils/mocks/MockERC20.sol";
 
 // Uniswap v4 official Test ERC20 token import
@@ -22,11 +22,11 @@ import {TestERC20} from "@uniswap/v4-core/src/test/TestERC20.sol";
 ///      integration testing against the real PoolManager before mainnet.
 ///      Used for pure access-control tests where the manager is never actually
 ///      invoked with a real unlock/callback flow.
-contract MockPoolManager {
-    function unlock(bytes calldata data) external returns (bytes memory) {
-        return CuratioRebalancer(msg.sender == address(this) ? address(0) : payable(msg.sender)).unlockCallback(data);
-    }
-}
+// contract MockPoolManager {
+//     function unlock(bytes calldata data) external returns (bytes memory) {
+//         return CuratioRebalancer(msg.sender == address(this) ? address(0) : payable(msg.sender)).unlockCallback(data);
+//     }
+// }
 
 /// @dev Fuller mock PoolManager that actually drives the unlock -> callback ->
 ///      modifyLiquidity -> sync/settle/take flow, letting us exercise
@@ -71,6 +71,63 @@ contract MockPoolManagerFull {
     function take(Currency currency, address to, uint256 amount) external {
         // Simulate the manager paying out ERC20 tokens it is assumed to hold.
         MockERC20(Currency.unwrap(currency)).mint(to, amount);
+    }
+}
+
+/// @dev Configurable mock implementing ICuratioHookView, used to exercise
+///      checkUpkeep()'s success paths (feeHigh, twapDiverged) which the
+///      EOA-based `hook` in the other test contracts can never reach —
+///      every call to an EOA reverts, so those tests only ever see the
+///      !stateSuccess early-return branch.
+contract MockHookView is ICuratioHookView {
+    uint24 public mockFee;
+    int24 public mockLastTick;
+    uint64 public mockLastBlock;
+    uint64 public mockLastTimestamp;
+    bool public mockInitialized;
+
+    int24 public mockTwapTick;
+    bool public shouldRevertOnTwap;
+    bool public shouldRevertOnPoolState;
+
+    function setPoolState(int24 lastTick, uint24 fee, uint64 lastBlock, uint64 lastTimestamp, bool initialized)
+        external
+    {
+        mockLastTick = lastTick;
+        mockFee = fee;
+        mockLastBlock = lastBlock;
+        mockLastTimestamp = lastTimestamp;
+        mockInitialized = initialized;
+    }
+
+    function setTwapTick(int24 tick) external {
+        mockTwapTick = tick;
+    }
+
+    function setShouldRevertOnTwap(bool val) external {
+        shouldRevertOnTwap = val;
+    }
+
+    function setShouldRevertOnPoolState(bool val) external {
+        shouldRevertOnPoolState = val;
+    }
+
+    function getCurrentFee(PoolKey calldata) external view returns (uint24) {
+        return mockFee;
+    }
+
+    function getPoolState(PoolKey calldata)
+        external
+        view
+        returns (int24, uint24, uint64, uint64, bool)
+    {
+        if (shouldRevertOnPoolState) revert("mock: pool state revert");
+        return (mockLastTick, mockFee, mockLastBlock, mockLastTimestamp, mockInitialized);
+    }
+
+    function getTwapTick(PoolKey calldata, uint32) external view returns (int24) {
+        if (shouldRevertOnTwap) revert("mock: twap revert");
+        return mockTwapTick;
     }
 }
 
@@ -366,13 +423,13 @@ contract CuratioRebalancerTest is Test, Deployers {
 
         vm.prank(attacker);
         vm.expectRevert();
-        rebalancer.rebalanceLiquidity(-120, 120, 1000);
+        rebalancer.rebalanceLiquidity(-120, 120, 1000, type(uint256).max, type(uint256).max);
     }
 
     function test_rebalanceLiquidity_revertsIfPoolNotConfigured() public {
         vm.prank(admin);
         vm.expectRevert(CuratioRebalancer.PoolNotConfigured.selector);
-        rebalancer.rebalanceLiquidity(-120, 120, 1000);
+        rebalancer.rebalanceLiquidity(-120, 120, 1000, type(uint256).max, type(uint256).max);
     }
 
     function test_rebalanceLiquidity_revertsOnInvalidTickRange() public {
@@ -381,7 +438,7 @@ contract CuratioRebalancerTest is Test, Deployers {
 
         vm.prank(admin);
         vm.expectRevert(CuratioRebalancer.InvalidTickRange.selector);
-        rebalancer.rebalanceLiquidity(120, -120, 1000);
+        rebalancer.rebalanceLiquidity(120, -120, 1000, type(uint256).max, type(uint256).max);
     }
 
     // ── Access Control Tests ──────────────────────────────────────
@@ -450,7 +507,7 @@ contract CuratioRebalancerIntegrationTest is Test {
         mockManager.setNextDelta(5 ether, 3 ether);
 
         vm.prank(admin);
-        rebalancer.rebalanceLiquidity(-120, 120, 1000 ether);
+        rebalancer.rebalanceLiquidity(-120, 120, 1000 ether, type(uint256).max, type(uint256).max);
 
         assertEq(rebalancer.currentTickLower(), -120);
         assertEq(rebalancer.currentTickUpper(), 120);
@@ -470,7 +527,7 @@ contract CuratioRebalancerIntegrationTest is Test {
         // First rebalance to establish a non-zero current range.
         mockManager.setNextDelta(0, 0);
         vm.prank(admin);
-        rebalancer.rebalanceLiquidity(-120, 120, 1000 ether);
+        rebalancer.rebalanceLiquidity(-120, 120, 1000 ether, type(uint256).max, type(uint256).max);
 
         uint256 balBefore0 = token0.balanceOf(address(rebalancer));
         uint256 balBefore1 = token1.balanceOf(address(rebalancer));
@@ -481,7 +538,7 @@ contract CuratioRebalancerIntegrationTest is Test {
         mockManager.setNextDelta(-1 ether, -2 ether);
 
         vm.prank(admin);
-        rebalancer.rebalanceLiquidity(-240, 240, 500 ether);
+        rebalancer.rebalanceLiquidity(-240, 240, 500 ether, type(uint256).max, type(uint256).max);
 
         assertEq(rebalancer.currentTickLower(), -240);
         assertEq(rebalancer.currentTickUpper(), 240);
@@ -537,7 +594,7 @@ contract CuratioRebalancerIntegrationTest is Test {
         uint256 managerEthBefore = address(mockManager).balance;
 
         vm.prank(admin);
-        rebalancer.rebalanceLiquidity(-120, 120, 1000 ether);
+        rebalancer.rebalanceLiquidity(-120, 120, 1000 ether, type(uint256).max, type(uint256).max);
 
         // If settle{value: amount}() was correctly invoked with native ETH,
         // the mock manager's balance must have increased by the settled amount.
@@ -553,7 +610,7 @@ contract CuratioRebalancerIntegrationTest is Test {
         uint256 rebalancerBalance1Before = token1.balanceOf(address(rebalancer));
 
         vm.prank(admin);
-        rebalancer.rebalanceLiquidity(-120, 120, 1000 ether);
+        rebalancer.rebalanceLiquidity(-120, 120, 1000 ether, type(uint256).max, type(uint256).max);
 
         // Zero delta means neither settle() nor take() should have moved
         // any balance for either currency.
@@ -610,7 +667,7 @@ contract CuratioRebalancerIntegrationTest is Test {
         // Trigger a manual rebalance to set lastRebalanceBlock to now.
         mockManager.setNextDelta(0, 0);
         vm.prank(admin);
-        rebalancer.rebalanceLiquidity(-120, 120, 100 ether);
+        rebalancer.rebalanceLiquidity(-120, 120, 100 ether, type(uint256).max, type(uint256).max);
 
         (bool upkeepNeeded,) = rebalancer.checkUpkeep("");
         assertFalse(upkeepNeeded, "checkUpkeep must be false immediately after a rebalance");
@@ -690,7 +747,7 @@ contract CuratioRebalancerIntegrationTest is Test {
     function test_performUpkeep_skipsIfTooSoonSinceLastRebalance() public {
         mockManager.setNextDelta(0, 0);
         vm.prank(admin);
-        rebalancer.rebalanceLiquidity(-120, 120, 100 ether);
+        rebalancer.rebalanceLiquidity(-120, 120, 100 ether, type(uint256).max, type(uint256).max);
 
         uint256 lastRebalanceBlockBefore = rebalancer.lastRebalanceBlock();
 
@@ -745,6 +802,96 @@ contract CuratioRebalancerIntegrationTest is Test {
         vm.prank(admin);
         rebalancer.setDefaultRebalanceAmount(500 ether);
         assertEq(rebalancer.defaultRebalanceAmount(), 500 ether);
+    }
+}
+
+/// @notice Separate test contract using MockHookView so checkUpkeep()'s
+///         success paths (feeHigh, twapDiverged, and the twap-call-fails-
+///         but-fee-is-high fallback) can actually be exercised — the other
+///         test contracts' EOA-based `hook` can never reach these branches.
+contract CuratioRebalancerCheckUpkeepTest is Test {
+    using PoolIdLibrary for PoolKey;
+
+    CuratioRebalancer public rebalancer;
+    MockPoolManagerFull public mockManager;
+    MockHookView public mockHook;
+
+    address public admin = makeAddr("admin");
+    address public vault = makeAddr("vault");
+    address public automationRegistry = makeAddr("automationRegistry");
+
+    PoolKey internal testKey;
+
+    function setUp() public {
+        mockManager = new MockPoolManagerFull();
+        mockHook = new MockHookView();
+
+        rebalancer = new CuratioRebalancer(
+            address(mockManager), address(mockHook), vault, admin, 1 ether, automationRegistry, 1000 ether
+        );
+
+        testKey = PoolKey({
+            currency0: Currency.wrap(address(0x1111)),
+            currency1: Currency.wrap(address(0x2222)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(mockHook))
+        });
+
+        vm.prank(admin);
+        rebalancer.setManagedPool(testKey);
+
+        vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
+    }
+
+    function test_checkUpkeep_trueWhenFeeHigh() public {
+        mockHook.setPoolState(100, 6000, uint64(block.number), uint64(block.timestamp), true);
+        mockHook.setTwapTick(100);
+
+        (bool upkeepNeeded, bytes memory performData) = rebalancer.checkUpkeep("");
+
+        assertTrue(upkeepNeeded, "high fee alone must trigger upkeep");
+        (int24 refTick,) = abi.decode(performData, (int24, bool));
+        assertEq(refTick, 100);
+    }
+
+   function test_checkUpkeep_trueWhenTwapDiverged() public {
+    mockHook.setPoolState(500, 3000, uint64(block.number), uint64(block.timestamp), true);
+    mockHook.setTwapTick(100);
+
+    (bool upkeepNeeded, bytes memory performData) = rebalancer.checkUpkeep("");
+
+    assertTrue(upkeepNeeded, "twap divergence alone must trigger upkeep");
+    (int24 refTick, bool twapDiverged) = abi.decode(performData, (int24, bool));
+    assertEq(refTick, 100);   // ← 500 থেকে 100 করুন (TWAP tick, spot tick নয়)
+    assertTrue(twapDiverged);
+}
+
+    function test_checkUpkeep_falseWhenFeeLowAndTwapNotDiverged() public {
+        mockHook.setPoolState(100, 3000, uint64(block.number), uint64(block.timestamp), true);
+        mockHook.setTwapTick(90);
+
+        (bool upkeepNeeded,) = rebalancer.checkUpkeep("");
+        assertFalse(upkeepNeeded);
+    }
+
+    function test_checkUpkeep_usesLastTickWhenTwapCallFails() public {
+        mockHook.setPoolState(100, 6000, uint64(block.number), uint64(block.timestamp), true);
+        mockHook.setShouldRevertOnTwap(true);
+
+        (bool upkeepNeeded, bytes memory performData) = rebalancer.checkUpkeep("");
+
+        assertTrue(upkeepNeeded, "fee-high path must still trigger even if twap call fails");
+        (int24 refTick, bool twapDiverged) = abi.decode(performData, (int24, bool));
+        assertEq(refTick, 100, "must fall back to lastTick when twapSuccess is false");
+        assertFalse(twapDiverged, "twapDiverged must be false when the twap call itself failed");
+    }
+
+    function test_checkUpkeep_falseWhenPoolStateUninitialized() public {
+        mockHook.setPoolState(100, 6000, uint64(block.number), uint64(block.timestamp), false);
+
+        (bool upkeepNeeded,) = rebalancer.checkUpkeep("");
+        assertFalse(upkeepNeeded, "uninitialized pool state must not trigger upkeep even with high fee");
     }
 }
 

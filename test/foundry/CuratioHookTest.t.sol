@@ -1273,5 +1273,235 @@ contract CuratioHookTest is Test, Deployers {
             "fee should persist (neither reset to BASE_FEE nor re-escalate) for a tiny swap within the decay window"
         );
     }
+
+
+    // ─── Chain Validation Tests ─────────────────────────────────────────────────
+
+function test_constructor_revertsOnWrongPoolManagerForChain() public {
+    vm.chainId(1); // Ethereum mainnet
+
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+
+    // ইচ্ছাকৃতভাবে ভুল PoolManager address — Ethereum mainnet-এর জন্য
+    // ChainRegistry.getPoolManager(1)-এর expected address না
+    address wrongManager = address(0xBEEF);
+
+    bytes memory constructorArgs = abi.encode(wrongManager, owner);
+    
+    (, bytes32 salt) =
+    HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+
+    vm.expectRevert("Wrong PoolManager for this chain");
+    new CuratioHook{salt: salt}(IPoolManager(wrongManager), owner);
+}
+
+function test_constructor_succeedsWithCorrectPoolManagerForChain() public {
+    vm.chainId(1); // Ethereum mainnet
+
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+
+    // ChainRegistry.getPoolManager(1)-এর exact expected address
+    address correctManager = 0x000000000004444c5dc75cB358380D2e3dE08A90;
+
+    bytes memory constructorArgs = abi.encode(correctManager, owner);
+    (address hookAddress, bytes32 salt) =
+        HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+
+    CuratioHook newHook = new CuratioHook{salt: salt}(IPoolManager(correctManager), owner);
+
+    require(address(newHook) == hookAddress, "Hook address mismatch");
+    assertEq(newHook.deployedChainId(), 1);
+    assertEq(newHook.chainName(), "Ethereum Mainnet");
+}
+
+function test_constructor_revertsOnWrongPoolManagerForBaseChain() public {
+    vm.chainId(8453); // Base mainnet
+
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+
+    address wrongManager = address(0xBEEF);
+
+    bytes memory constructorArgs = abi.encode(wrongManager, owner);
+    
+   (, bytes32 salt) =
+    HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+
+    vm.expectRevert("Wrong PoolManager for this chain");
+    new CuratioHook{salt: salt}(IPoolManager(wrongManager), owner);
+}
+
+function test_constructor_succeedsForBase() public {
+    vm.chainId(8453); // Base Mainnet
+
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+
+    address expectedManager = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
+
+    bytes memory constructorArgs = abi.encode(expectedManager, owner);
+    (address hookAddress, bytes32 salt) =
+        HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+
+    CuratioHook newHook = new CuratioHook{salt: salt}(IPoolManager(expectedManager), owner);
+
+    require(address(newHook) == hookAddress, "Hook address mismatch");
+    assertEq(newHook.deployedChainId(), 8453);
+    assertEq(newHook.chainName(), "Base Mainnet");
+}
+
+function test_constructor_succeedsForUnichain() public {
+    vm.chainId(130); // Unichain
+
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+
+    address expectedManager = 0x1F98400000000000000000000000000000000004;
+
+    bytes memory constructorArgs = abi.encode(expectedManager, owner);
+    (address hookAddress, bytes32 salt) =
+        HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+
+    CuratioHook newHook = new CuratioHook{salt: salt}(IPoolManager(expectedManager), owner);
+
+    require(address(newHook) == hookAddress, "Hook address mismatch");
+    assertEq(newHook.deployedChainId(), 130);
+    assertEq(newHook.chainName(), "Unichain Mainnet");
+}
+
+function test_constructor_succeedsForArbitrum() public {
+    vm.chainId(42161); // Arbitrum One
+
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+
+    address expectedManager = 0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32;
+
+    bytes memory constructorArgs = abi.encode(expectedManager, owner);
+    (address hookAddress, bytes32 salt) =
+        HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+
+    CuratioHook newHook = new CuratioHook{salt: salt}(IPoolManager(expectedManager), owner);
+
+    require(address(newHook) == hookAddress, "Hook address mismatch");
+    assertEq(newHook.deployedChainId(), 42161);
+    assertEq(newHook.chainName(), "Arbitrum One");
+}
+
+function test_constructor_succeedsForArbitrumSepolia() public {
+    vm.chainId(421614); // Arbitrum Sepolia
+
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+
+    address expectedManager = 0xFB3e0C6F74eB1a21CC1Da29aeC80D2Dfe6C9a317;
+
+    bytes memory constructorArgs = abi.encode(expectedManager, owner);
+    (address hookAddress, bytes32 salt) =
+        HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+
+    CuratioHook newHook = new CuratioHook{salt: salt}(IPoolManager(expectedManager), owner);
+
+    require(address(newHook) == hookAddress, "Hook address mismatch");
+    assertEq(newHook.deployedChainId(), 421614);
+    assertEq(newHook.chainName(), "Arbitrum Sepolia");
+}
+
+function test_constructor_succeedsForOptimism() public {
+    vm.chainId(10);
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+    address expectedManager = 0x9a13F98Cb987694C9F086b1F5eB990EeA8264Ec3;
+    bytes memory constructorArgs = abi.encode(expectedManager, owner);
+    (address hookAddress, bytes32 salt) =
+        HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+    CuratioHook newHook = new CuratioHook{salt: salt}(IPoolManager(expectedManager), owner);
+    require(address(newHook) == hookAddress, "Hook address mismatch");
+    assertEq(newHook.deployedChainId(), 10);
+}
+
+function test_constructor_succeedsForSepolia() public {
+    vm.chainId(11155111);
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+    address expectedManager = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
+    bytes memory constructorArgs = abi.encode(expectedManager, owner);
+    (address hookAddress, bytes32 salt) =
+        HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+    CuratioHook newHook = new CuratioHook{salt: salt}(IPoolManager(expectedManager), owner);
+    require(address(newHook) == hookAddress, "Hook address mismatch");
+    assertEq(newHook.deployedChainId(), 11155111);
+}
+
+function test_constructor_succeedsForUnichainSepolia() public {
+    vm.chainId(1301);
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+    address expectedManager = 0x00B036B58a818B1BC34d502D3fE730Db729e62AC;
+    bytes memory constructorArgs = abi.encode(expectedManager, owner);
+    (address hookAddress, bytes32 salt) =
+        HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+    CuratioHook newHook = new CuratioHook{salt: salt}(IPoolManager(expectedManager), owner);
+    require(address(newHook) == hookAddress, "Hook address mismatch");
+    assertEq(newHook.deployedChainId(), 1301);
+}
+
+function test_constructor_succeedsForBaseSepolia() public {
+    vm.chainId(84532);
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+    address expectedManager = 0x00B036B58a818B1BC34d502D3fE730Db729e62AC;
+    bytes memory constructorArgs = abi.encode(expectedManager, owner);
+    (address hookAddress, bytes32 salt) =
+        HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+    CuratioHook newHook = new CuratioHook{salt: salt}(IPoolManager(expectedManager), owner);
+    require(address(newHook) == hookAddress, "Hook address mismatch");
+    assertEq(newHook.deployedChainId(), 84532);
+}
+
+function test_constructor_revertsOnUnsupportedChain() public {
+    vm.chainId(137); // Polygon — ChainRegistry-তে নেই
+
+    uint160 flags = uint160(
+        Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+    );
+
+    address anyManager = address(0xBEEF);
+
+    bytes memory constructorArgs = abi.encode(anyManager, owner);
+    (, bytes32 salt) =
+        HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
+
+    // BaseHook-এর address validation পাস হয়ে যাবে (কারণ salt সঠিকভাবে mined),
+    // তারপর CuratioHook constructor-এর ভেতরের chain-check revert করবে
+    vm.expectRevert("ChainRegistry: unsupported chain");
+    new CuratioHook{salt: salt}(IPoolManager(anyManager), owner);
+}
+
 }
 

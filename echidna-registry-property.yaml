@@ -1,0 +1,17 @@
+# echidna-registry-property.yaml
+# Runs the echidna_*-prefixed bool invariants:
+#   - echidna_registered_strategist_never_unregisters
+#   - echidna_pool_owner_consistency
+#   - echidna_no_duplicate_strategists_in_list
+#
+# sender intentionally omitted so Echidna uses its default sender
+# (= address(this), the deploying test contract), which matches the
+# constructor's own DEFAULT_ADMIN_ROLE / REGISTRAR_ROLE grants.
+
+testMode: "property"
+seqLen: 100
+testLimit: 50000
+workers: 2
+corpusDir: "echidna-corpus-registry-property"
+coverage: true
+codeSize: 0x20000
