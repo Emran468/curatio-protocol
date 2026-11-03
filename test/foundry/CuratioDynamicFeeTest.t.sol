@@ -44,6 +44,7 @@ contract CuratioDynamicFeeTest is Test {
         assertEq(fee.feeRecipient(), feeRecipient);
         assertEq(fee.performanceFeeBps(), 1000);
         assertEq(fee.totalFeesCharged(), 0);
+        assertEq(fee.totalYieldProcessed(), 0);
         assertTrue(fee.hasRole(fee.DEFAULT_ADMIN_ROLE(), admin));
         assertTrue(fee.hasRole(fee.FEE_ADMIN_ROLE(), admin));
         assertTrue(fee.hasRole(fee.VAULT_ROLE(), vault));
@@ -276,5 +277,86 @@ contract CuratioDynamicFeeTest is Test {
         fee.reportPerformanceFeeCharged(100 ether, 10 ether);
 
         assertEq(fee.totalFeesCharged(), 10 ether);
+    }
+
+    // ── reportPerformanceFeeCharged: fee must not exceed the calculated fee ──
+
+    function test_report_revertsWhenFeeExceedsCalculated() public {
+        vm.prank(vault);
+        vm.expectRevert(abi.encodeWithSelector(CuratioDynamicFee.FeeExceedsCalculated.selector, 101 ether, 100 ether));
+        fee.reportPerformanceFeeCharged(1000 ether, 101 ether);
+
+        assertEq(fee.totalFeesCharged(), 0, "a rejected report must change nothing");
+        assertEq(fee.totalYieldProcessed(), 0, "a rejected report must change nothing");
+    }
+
+    function test_report_succeedsAtExactCalculatedFee() public {
+        vm.prank(vault);
+        fee.reportPerformanceFeeCharged(1000 ether, 100 ether);
+
+        assertEq(fee.totalFeesCharged(), 100 ether);
+    }
+
+    /// Boundary with rounding: 999 wei at 10% rounds down to 99, so 100 must be rejected.
+    function test_report_revertsByOneWeiAboveRoundedDownFee() public {
+        vm.prank(vault);
+        vm.expectRevert(abi.encodeWithSelector(CuratioDynamicFee.FeeExceedsCalculated.selector, 100, 99));
+        fee.reportPerformanceFeeCharged(999, 100);
+    }
+
+    /// The check is an upper bound only: charging less than the calculated fee is allowed.
+    function test_report_allowsFeeBelowCalculated() public {
+        vm.prank(vault);
+        fee.reportPerformanceFeeCharged(1000 ether, 50 ether);
+
+        assertEq(fee.totalFeesCharged(), 50 ether);
+    }
+
+    function test_report_revertsAnyFeeWhenRateIsZero() public {
+        vm.prank(admin);
+        fee.setPerformanceFeeBps(0);
+
+        vm.prank(vault);
+        vm.expectRevert(abi.encodeWithSelector(CuratioDynamicFee.FeeExceedsCalculated.selector, 1, 0));
+        fee.reportPerformanceFeeCharged(1000 ether, 1);
+    }
+
+    /// The vault quotes a fee, the admin lowers the rate, then the vault reports the old quote.
+    /// The report must be rejected, so the vault has to quote and report in the same transaction.
+    function test_report_revertsIfRateWasLoweredAfterQuote() public {
+        uint256 quoted = fee.calculatePerformanceFee(1000 ether); // 100 ether at 10%
+
+        vm.prank(admin);
+        fee.setPerformanceFeeBps(500); // 5%
+
+        vm.prank(vault);
+        vm.expectRevert(abi.encodeWithSelector(CuratioDynamicFee.FeeExceedsCalculated.selector, quoted, 50 ether));
+        fee.reportPerformanceFeeCharged(1000 ether, quoted);
+    }
+
+    function test_report_tracksTotalYield() public {
+        vm.startPrank(vault);
+        fee.reportPerformanceFeeCharged(1000 ether, 100 ether);
+        fee.reportPerformanceFeeCharged(500 ether, 0);
+        vm.stopPrank();
+
+        assertEq(fee.totalYieldProcessed(), 1500 ether);
+        assertEq(fee.totalFeesCharged(), 100 ether);
+    }
+
+    // ── Documents current behaviour: VAULT_ROLE does not gate reporting ──
+
+    /// `onlyVault` compares msg.sender with the `vault` address and never looks at VAULT_ROLE.
+    /// So granting the role to another address does NOT let it report. If the modifier is ever
+    /// changed to use the role, this test fails on purpose so the change is noticed.
+    function test_vaultRole_doesNotGateReporting() public {
+        bytes32 vaultRole = fee.VAULT_ROLE();
+
+        vm.prank(admin);
+        fee.grantRole(vaultRole, attacker);
+
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(CuratioDynamicFee.NotVault.selector, attacker));
+        fee.reportPerformanceFeeCharged(1000 ether, 100 ether);
     }
 }

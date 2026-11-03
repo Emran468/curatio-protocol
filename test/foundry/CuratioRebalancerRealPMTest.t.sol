@@ -33,18 +33,13 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         (currency0, currency1) = deployMintAndApprove2Currencies();
 
         poolKey = PoolKey({
-            currency0: currency0,
-            currency1: currency1,
-            fee: 3000,
-            tickSpacing: 60,
-            hooks: IHooks(address(0))
+            currency0: currency0, currency1: currency1, fee: 3000, tickSpacing: 60, hooks: IHooks(address(0))
         });
         poolId = poolKey.toId();
         manager.initialize(poolKey, SQRT_1_1);
 
-        rebalancer = new CuratioRebalancer(
-            address(manager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether
-        );
+        rebalancer =
+            new CuratioRebalancer(address(manager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether);
         vm.prank(admin);
         rebalancer.setManagedPool(poolKey);
     }

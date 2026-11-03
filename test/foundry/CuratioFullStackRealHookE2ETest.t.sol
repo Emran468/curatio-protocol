@@ -23,6 +23,7 @@ import {CuratioAccess} from "../../src/CuratioAccess.sol";
 contract CuratioFullStackRealHookE2ETest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
 
+    uint256 constant SCALE = 1e6; // = 10 ** _decimalsOffset() in CuratioVault
     uint256 constant MAX = type(uint256).max;
 
     CuratioHook hook;
@@ -72,7 +73,13 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
 
         access = new CuratioAccess(admin);
         rebalancer = new CuratioRebalancer(
-            address(manager), address(hook), makeAddr("placeholderVault"), admin, 1 ether, automationRegistry, 1000 ether
+            address(manager),
+            address(hook),
+            makeAddr("placeholderVault"),
+            admin,
+            1 ether,
+            automationRegistry,
+            1000 ether
         );
         vault = new CuratioVault(asset, address(access), address(rebalancer), admin, 1000 ether);
 
@@ -124,7 +131,7 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
 
         vm.prank(alice);
         uint256 shares = vault.deposit(10 ether, alice);
-        assertEq(shares, 10 ether);
+        assertEq(shares, 10 ether * SCALE);
     }
 
     function test_realHook_afterWarmup_totalAssetsMatchesDeposit() public {
@@ -168,7 +175,7 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
 
         swap(poolKey, true, -int256(10 ether), ""); // ~20% price impact
 
-        (, , , , bool init) = hook.getPoolState(poolKey);
+        (,,,, bool init) = hook.getPoolState(poolKey);
         assertTrue(init);
         assertEq(vault.totalAssets(), before, "reported assets must follow the TWAP, not spot");
     }

@@ -39,11 +39,7 @@ contract CuratioRebalancerValuationTest is Test, Deployers {
         t1 = Currency.unwrap(currency1);
 
         poolKey = PoolKey({
-            currency0: currency0,
-            currency1: currency1,
-            fee: 3000,
-            tickSpacing: 60,
-            hooks: IHooks(address(0))
+            currency0: currency0, currency1: currency1, fee: 3000, tickSpacing: 60, hooks: IHooks(address(0))
         });
         manager.initialize(poolKey, SQRT_1_1);
 
@@ -210,5 +206,18 @@ contract CuratioRebalancerValuationTest is Test, Deployers {
         vm.prank(vault);
         vm.expectRevert(CuratioRebalancer.AssetNotSet.selector);
         rebalancer.returnToVault(1 ether);
+    }
+
+    function test_setAsset_revertsWhilePositionActive() public {
+        _fund(1000 ether, 1000 ether);
+        mockHook.setTwapTick(0);
+        vm.prank(admin);
+        rebalancer.rebalanceLiquidity(-120, 120, 100 ether, MAX, MAX);
+
+        vm.prank(admin);
+        vm.expectRevert(CuratioRebalancer.PositionStillActive.selector);
+        rebalancer.setAsset(t1);
+
+        assertEq(rebalancer.asset(), t0, "asset must not change");
     }
 }

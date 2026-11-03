@@ -9,7 +9,7 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
@@ -44,13 +44,27 @@ interface ICuratioHookView {
  *      - Valuation: `totalManagedAssets()` prices everything at the hook's TWAP, never at
  *        pool spot, and reverts if the TWAP is unavailable.
  *
- *      Known limitations (prototype): tokens must already be held by this contract (vault
- *      fund flow not wired yet), `returnToVault` serves idle asset only (no swap-on-withdraw
- *      yet), uncollected LP fees are not counted in valuation, and the contract is unaudited.
+ *      Trust assumptions (prototype, unaudited):
+ *      - DEFAULT_ADMIN controls where funds can go. setVault() is IMMEDIATE and returnToVault() pays the
+ *        current vault address, so a compromised admin key can redirect idle funds, or freeze exits by
+ *        pointing the vault elsewhere. Only the hook (TWAP source) change is timelocked (HOOK_TIMELOCK).
+ *      - The asset cannot be changed, and the pool cannot be replaced, while a position exists.
+ *      - A strategist chooses its own slippage caps per rebalance; only the keeper path has admin-set
+ *        caps (keeperMaxPay0/1, default 0).
+ *
+ *      Known limitations (prototype):
+ *      - Uncollected LP fees are not counted in valuation; they only show up once the position is modified.
+ *      - Withdrawals that need the LP can revert while the hook charges MEV penalty fees (SwapPriceDeviation).
+ *      - Keeper range selection uses a fixed width (2 or 3 tick spacings around the reference tick).
+ *      - The contract is unaudited.
+ *
  */
 contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, AutomationCompatibleInterface {
     using PoolIdLibrary for PoolKey;
     using SafeERC20 for IERC20;
+
+    uint256 public constant HOOK_TIMELOCK = 2 days;
+    uint256 public pendingHookEta;
 
     bytes32 public constant STRATEGIST_ROLE = keccak256("STRATEGIST_ROLE");
     bytes32 public constant VAULT_ROLE = keccak256("VAULT_ROLE");
@@ -60,7 +74,16 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     uint24 public constant FEE_ESCALATION_THRESHOLD = 6000; // MID_VOLATILE_FEE, not BASE_FEE
     uint256 public constant TICK_DIVERGENCE_THRESHOLD = 200;
     uint256 private constant Q96 = 1 << 96;
+    uint256 private constant BPS = 10_000;
+    /// @dev Extra value unwound on withdrawals to cover swap fees and rounding.
+    uint256 public constant UNWIND_BUFFER_BPS = 100;
+    /// @dev Headroom left by quoteLiquidityForValue for swap fee / price impact.
+    uint256 public constant QUOTE_HEADROOM_BPS = 100;
+    /// @dev Max tolerated gap (incl. pool fee) between a swap's execution price and the TWAP price.
+    ///      Above this the rebalancer refuses to swap, e.g. while the hook charges MEV penalty fees.
+    uint256 public maxSwapSlippageBps = 300;
 
+    address public pendingHook;
     address public automationRegistry;
     /// @dev Liquidity UNITS (not token amounts) used only when no position exists yet.
     uint256 public defaultRebalanceAmount;
@@ -90,7 +113,8 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     uint256 public minBlocksBetweenRebalances = 10;
 
     enum ActionType {
-        REBALANCE
+        REBALANCE,
+        UNWIND
     }
 
     struct RebalanceCallbackData {
@@ -105,6 +129,14 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         uint256 maxPay1;
     }
 
+    struct UnwindCallbackData {
+        PoolKey key;
+        int24 tickLower;
+        int24 tickUpper;
+        uint128 liquidityToRemove; // may be 0 (e.g. only idle tokens need swapping)
+        uint256 requiredAsset; // asset balance that must exist after settlement
+    }
+
     // ── Events ───────────────────────────────────────────────────────────────
     event HookUpdated(address indexed oldHook, address indexed newHook);
     event VaultUpdated(address indexed oldVault, address indexed newVault);
@@ -117,6 +149,10 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     event RebalanceThresholdUpdated(uint256 newThreshold);
     event KeeperMaxPayUpdated(uint256 maxPay0, uint256 maxPay1);
     event FundsReturned(uint256 amount);
+    event LiquidityUnwound(uint128 liquidityRemoved, uint128 liquidityLeft);
+    event MaxSwapSlippageUpdated(uint256 newBps);
+    event HookProposed(address indexed newHook, uint256 eta);
+    event HookProposalCancelled(address indexed cancelledHook);
 
     // ── Errors ───────────────────────────────────────────────────────────────
     error ZeroAddress();
@@ -133,6 +169,11 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     error AssetNotSet();
     error TwapUnavailable();
     error InsufficientIdle(uint256 available, uint256 requested);
+    error InsufficientFunds();
+    error SwapPriceDeviation();
+    error InvalidBps();
+    error NoPendingHook();
+    error HookTimelockActive(uint256 eta);
 
     modifier onlyVault() {
         if (msg.sender != vault) revert NotVault(msg.sender);
@@ -189,18 +230,20 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     function notifyDeposit(uint256 assets) external onlyVault {
         emit DepositNotified(assets, block.number);
         if (assets >= rebalanceThreshold) {
-            _maybeAutoRebalance();
+            _flagRebalanceDue();
         }
     }
 
     function notifyWithdraw(uint256 assets) external onlyVault {
         emit WithdrawNotified(assets, block.number);
         if (assets >= rebalanceThreshold) {
-            _maybeAutoRebalance();
+            _flagRebalanceDue();
         }
     }
 
-    function _maybeAutoRebalance() internal {
+    /// @dev Does NOT rebalance. Only emits an event telling off-chain keepers/strategists whether a
+    ///      rebalance is currently due. Tick selection stays a strategist/keeper decision.
+    function _flagRebalanceDue() internal {
         if (!poolConfigured) {
             emit RebalanceSkipped("Pool not configured");
             return;
@@ -209,17 +252,19 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
             emit RebalanceSkipped("Too soon since last rebalance");
             return;
         }
-        // Tick selection stays a strategist/keeper decision; this only flags that a rebalance is due.
         emit RebalanceSkipped("Rebalance due - awaiting strategist execution");
     }
 
     /// @notice Vault pulls back idle `asset` (e.g. to serve a withdrawal).
-    /// @dev TODO(swap): when idle < amount, remove liquidity and swap into `asset` first.
+    /// @dev If idle asset is short, part of the LP position is removed and the other token is
+    ///      swapped into `asset` (inside one unlock, priced against the TWAP) before paying out.
     function returnToVault(uint256 amount) external onlyVault nonReentrant {
         if (asset == address(0)) revert AssetNotSet();
 
         uint256 idleBalance = IERC20(asset).balanceOf(address(this));
-        if (idleBalance < amount) revert InsufficientIdle(idleBalance, amount);
+        if (idleBalance < amount) {
+            _unwindForVault(amount, idleBalance);
+        }
 
         IERC20(asset).safeTransfer(vault, amount);
         emit FundsReturned(amount);
@@ -345,6 +390,9 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         if (actionType == ActionType.REBALANCE) {
             RebalanceCallbackData memory data = abi.decode(payload, (RebalanceCallbackData));
             _executeRebalance(data);
+        } else if (actionType == ActionType.UNWIND) {
+            UnwindCallbackData memory u = abi.decode(payload, (UnwindCallbackData));
+            _executeUnwind(u);
         }
 
         return "";
@@ -378,21 +426,23 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
             ""
         );
 
-        // 3. Net delta, slippage caps, settlement
-        int128 delta0 = deltaRemove.amount0() + deltaAdd.amount0();
-        int128 delta1 = deltaRemove.amount1() + deltaAdd.amount1();
+        // 3. Net delta; any shortfall is covered by swapping the other currency (priced vs TWAP)
+        int256 delta0 = int256(deltaRemove.amount0()) + int256(deltaAdd.amount0());
+        int256 delta1 = int256(deltaRemove.amount1()) + int256(deltaAdd.amount1());
+        (delta0, delta1) = _coverDeficits(data.key, delta0, delta1, 0, 0);
 
-        if (delta0 < 0 && uint256(uint128(-delta0)) > data.maxPay0) revert SlippageExceeded();
-        if (delta1 < 0 && uint256(uint128(-delta1)) > data.maxPay1) revert SlippageExceeded();
+        // slippage caps apply to the FINAL net payment, swap cost included
+        if (delta0 < 0 && uint256(-delta0) > data.maxPay0) revert SlippageExceeded();
+        if (delta1 < 0 && uint256(-delta1) > data.maxPay1) revert SlippageExceeded();
 
         _settleCurrency(data.key.currency0, delta0);
         _settleCurrency(data.key.currency1, delta1);
     }
 
     /// @dev Settle a net delta with the PoolManager (negative = we pay, positive = we take).
-    function _settleCurrency(Currency currency, int128 delta) internal {
+    function _settleCurrency(Currency currency, int256 delta) internal {
         if (delta < 0) {
-            uint256 amount = uint256(uint128(-delta));
+            uint256 amount = uint256(-delta);
 
             poolManager.sync(currency);
 
@@ -403,7 +453,7 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
                 poolManager.settle();
             }
         } else if (delta > 0) {
-            poolManager.take(currency, address(this), uint256(uint128(delta)));
+            poolManager.take(currency, address(this), uint256(delta));
         }
     }
 
@@ -466,6 +516,176 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         _executeRebalanceLogic(newLower, newUpper, liq, keeperMaxPay0, keeperMaxPay1);
     }
 
+    // ═════════════════════════════════════════════════════════════════════════
+    // Swap support: cover shortfalls, unwind for withdrawals, sizing helper
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// @notice Largest liquidity whose total value (both tokens, TWAP price) fits in `valueInAsset`,
+    ///         with QUOTE_HEADROOM_BPS left for swap fee and price impact. Use it to size a position
+    ///         when only the vault asset is available; the rebalancer swaps the missing token itself.
+    function quoteLiquidityForValue(int24 tickLower, int24 tickUpper, uint256 valueInAsset)
+        external
+        view
+        returns (uint128)
+    {
+        if (asset == address(0)) revert AssetNotSet();
+        _validateTicks(tickLower, tickUpper);
+
+        uint160 sqrtP = TickMath.getSqrtPriceAtTick(_getTwapTickOrFail());
+        bool assetIs0 = Currency.unwrap(managedPool.currency0) == asset;
+
+        (uint256 a0, uint256 a1) = _lpAmounts(sqrtP, uint128(1e18), tickLower, tickUpper);
+        uint256 unitValue = assetIs0 ? a0 + _convert(a1, false, sqrtP) : a1 + _convert(a0, true, sqrtP);
+        if (unitValue == 0) revert InvalidLiquidity();
+
+        uint256 liq = FullMath.mulDiv(valueInAsset, 1e18, unitValue);
+        liq = (liq * (BPS - QUOTE_HEADROOM_BPS)) / BPS;
+        if (liq > type(uint128).max) revert InvalidLiquidity();
+        return uint128(liq);
+    }
+
+    /// @dev Amounts of token0/token1 a position of `liq` holds at price `sqrtP`.
+    function _lpAmounts(uint160 sqrtP, uint128 liq, int24 lo, int24 hi) internal pure returns (uint256 a0, uint256 a1) {
+        uint160 sL = TickMath.getSqrtPriceAtTick(lo);
+        uint160 sU = TickMath.getSqrtPriceAtTick(hi);
+        if (sqrtP <= sL) {
+            a0 = SqrtPriceMath.getAmount0Delta(sL, sU, liq, false);
+        } else if (sqrtP < sU) {
+            a0 = SqrtPriceMath.getAmount0Delta(sqrtP, sU, liq, false);
+            a1 = SqrtPriceMath.getAmount1Delta(sL, sqrtP, liq, false);
+        } else {
+            a1 = SqrtPriceMath.getAmount1Delta(sL, sU, liq, false);
+        }
+    }
+
+    /// @dev Convert `amount` between the two pool tokens at price `sqrtP`.
+    ///      isToken0 = true : token0 -> token1.  isToken0 = false : token1 -> token0.
+    function _convert(uint256 amount, bool isToken0, uint160 sqrtP) internal pure returns (uint256) {
+        if (isToken0) return FullMath.mulDiv(FullMath.mulDiv(amount, sqrtP, Q96), sqrtP, Q96);
+        return FullMath.mulDiv(FullMath.mulDiv(amount, Q96, sqrtP), Q96, sqrtP);
+    }
+
+    function _lpValueInAsset(uint160 sqrtP, uint128 liq, bool assetIs0) internal view returns (uint256) {
+        (uint256 a0, uint256 a1) = _lpAmounts(sqrtP, liq, currentTickLower, currentTickUpper);
+        return assetIs0 ? a0 + _convert(a1, false, sqrtP) : a1 + _convert(a0, true, sqrtP);
+    }
+
+    /// @dev Called inside unlock. `d0`/`d1` are the net deltas so far (negative = we owe the pool).
+    ///      `req0`/`req1` are the minimum balances that must remain after settlement.
+    ///      If one currency would end up short, it is bought with the other one (exact-output swap),
+    ///      after checking the execution price against the TWAP. Reverts if it cannot be covered.
+    function _coverDeficits(PoolKey memory key, int256 d0, int256 d1, uint256 req0, uint256 req1)
+        internal
+        returns (int256, int256)
+    {
+        address t0 = Currency.unwrap(key.currency0);
+        address t1 = Currency.unwrap(key.currency1);
+
+        int256 short0 = int256(req0) - (int256(_idleBalance(t0)) + d0);
+        int256 short1 = int256(req1) - (int256(_idleBalance(t1)) + d1);
+
+        if (short0 <= 0 && short1 <= 0) return (d0, d1);
+        if (short0 > 0 && short1 > 0) revert InsufficientFunds();
+
+        uint160 sqrtP = TickMath.getSqrtPriceAtTick(_getTwapTickOrFail());
+        BalanceDelta sd;
+        if (short0 > 0) {
+            // need token0, pay token1
+            sd = _swapExactOut(key, false, uint256(short0));
+            _checkSwapPrice(uint256(int256(sd.amount0())), uint256(-int256(sd.amount1())), true, sqrtP);
+        } else {
+            // need token1, pay token0
+            sd = _swapExactOut(key, true, uint256(short1));
+            _checkSwapPrice(uint256(int256(sd.amount1())), uint256(-int256(sd.amount0())), false, sqrtP);
+        }
+        d0 += int256(sd.amount0());
+        d1 += int256(sd.amount1());
+
+        // final solvency check (a partially filled swap would leave us short)
+        if (int256(req0) > int256(_idleBalance(t0)) + d0 || int256(req1) > int256(_idleBalance(t1)) + d1) {
+            revert InsufficientFunds();
+        }
+
+        return (d0, d1);
+    }
+
+    function _swapExactOut(PoolKey memory key, bool zeroForOne, uint256 amountOut) internal returns (BalanceDelta) {
+        SwapParams memory params = SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: int256(amountOut), // positive = exact output
+            sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+        });
+        return poolManager.swap(key, params, "");
+    }
+
+    /// @dev `got` is the amount received (token0 if gotIsToken0), `paid` the amount of the other
+    ///      token given up. Reverts if `paid` exceeds the TWAP-fair price by more than maxSwapSlippageBps.
+    function _checkSwapPrice(uint256 got, uint256 paid, bool gotIsToken0, uint160 sqrtP) internal view {
+        uint256 fairPaid = _convert(got, gotIsToken0, sqrtP);
+        if (paid > FullMath.mulDiv(fairPaid, BPS + maxSwapSlippageBps, BPS)) revert SwapPriceDeviation();
+    }
+
+    /// @dev Frees up enough idle `asset` to pay `amount` out: removes the needed share of the LP
+    ///      position (plus a small buffer) and swaps the other token into the asset.
+    function _unwindForVault(uint256 amount, uint256 idleAsset) internal {
+        PoolKey memory key = managedPool;
+        bool assetIs0 = Currency.unwrap(key.currency0) == asset;
+        uint256 otherIdle = _idleBalance(Currency.unwrap(assetIs0 ? key.currency1 : key.currency0));
+
+        uint128 liq = currentLiquidity;
+        if (liq == 0 && otherIdle == 0) revert InsufficientIdle(idleAsset, amount);
+
+        uint128 toRemove = 0;
+        if (liq > 0) {
+            uint160 sqrtP = TickMath.getSqrtPriceAtTick(_getTwapTickOrFail());
+            uint256 lpValue = _lpValueInAsset(sqrtP, liq, assetIs0);
+            uint256 need = ((amount - idleAsset) * (BPS + UNWIND_BUFFER_BPS)) / BPS;
+            if (lpValue == 0 || need >= lpValue) {
+                toRemove = liq;
+            } else {
+                toRemove = uint128(FullMath.mulDivRoundingUp(uint256(liq), need, lpValue));
+            }
+        }
+
+        UnwindCallbackData memory u = UnwindCallbackData({
+            key: key,
+            tickLower: currentTickLower,
+            tickUpper: currentTickUpper,
+            liquidityToRemove: toRemove,
+            requiredAsset: amount
+        });
+        poolManager.unlock(abi.encode(ActionType.UNWIND, abi.encode(u)));
+
+        if (toRemove > 0) {
+            currentLiquidity = liq - toRemove;
+            emit LiquidityUnwound(toRemove, liq - toRemove);
+        }
+    }
+
+    function _executeUnwind(UnwindCallbackData memory d) internal {
+        BalanceDelta removed;
+        if (d.liquidityToRemove > 0) {
+            (removed,) = poolManager.modifyLiquidity(
+                d.key,
+                ModifyLiquidityParams({
+                    tickLower: d.tickLower,
+                    tickUpper: d.tickUpper,
+                    liquidityDelta: -int256(uint256(d.liquidityToRemove)),
+                    salt: bytes32(0)
+                }),
+                ""
+            );
+        }
+
+        bool assetIs0 = Currency.unwrap(d.key.currency0) == asset;
+        int256 d0 = int256(removed.amount0());
+        int256 d1 = int256(removed.amount1());
+        (d0, d1) = _coverDeficits(d.key, d0, d1, assetIs0 ? d.requiredAsset : 0, assetIs0 ? 0 : d.requiredAsset);
+
+        _settleCurrency(d.key.currency0, d0);
+        _settleCurrency(d.key.currency1, d1);
+    }
+
     // ─── Hook read helpers ───────────────────────────────────────────────────
 
     function _tryGetPoolState() internal view returns (bool success, int24 lastTick, uint24 fee, bool initialized) {
@@ -511,18 +731,39 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     /// @notice Select which pool currency is the vault asset (valuation/return unit).
     function setAsset(address _asset) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (!poolConfigured) revert PoolNotConfigured();
+        if (currentLiquidity != 0) revert PositionStillActive(); // NEW: never switch the asset under a live position
         if (
             _asset == address(0)
-                || (_asset != Currency.unwrap(managedPool.currency0) && _asset != Currency.unwrap(managedPool.currency1))
+                || (_asset != Currency.unwrap(managedPool.currency0)
+                    && _asset != Currency.unwrap(managedPool.currency1))
         ) revert InvalidAsset();
         asset = _asset;
         emit AssetUpdated(_asset);
     }
 
-    function setHook(address _hook) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function proposeHook(address _hook) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_hook == address(0)) revert ZeroAddress();
-        emit HookUpdated(address(hook), _hook);
-        hook = ICuratioHookView(_hook);
+        pendingHook = _hook;
+        pendingHookEta = block.timestamp + HOOK_TIMELOCK;
+        emit HookProposed(_hook, pendingHookEta);
+    }
+
+    function executeHook() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        address newHook = pendingHook;
+        if (newHook == address(0)) revert NoPendingHook();
+        if (block.timestamp < pendingHookEta) revert HookTimelockActive(pendingHookEta);
+
+        emit HookUpdated(address(hook), newHook);
+        hook = ICuratioHookView(newHook);
+        pendingHook = address(0);
+        pendingHookEta = 0;
+    }
+
+    function cancelHookProposal() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (pendingHook == address(0)) revert NoPendingHook();
+        emit HookProposalCancelled(pendingHook);
+        pendingHook = address(0);
+        pendingHookEta = 0;
     }
 
     function setVault(address _vault) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -547,6 +788,12 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         keeperMaxPay0 = maxPay0;
         keeperMaxPay1 = maxPay1;
         emit KeeperMaxPayUpdated(maxPay0, maxPay1);
+    }
+
+    function setMaxSwapSlippageBps(uint256 newBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newBps > BPS) revert InvalidBps();
+        maxSwapSlippageBps = newBps;
+        emit MaxSwapSlippageUpdated(newBps);
     }
 
     function setAutomationRegistry(address _newRegistry) external onlyRole(DEFAULT_ADMIN_ROLE) {

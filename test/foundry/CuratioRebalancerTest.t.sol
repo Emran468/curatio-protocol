@@ -116,11 +116,7 @@ contract MockHookView is ICuratioHookView {
         return mockFee;
     }
 
-    function getPoolState(PoolKey calldata)
-        external
-        view
-        returns (int24, uint24, uint64, uint64, bool)
-    {
+    function getPoolState(PoolKey calldata) external view returns (int24, uint24, uint64, uint64, bool) {
         if (shouldRevertOnPoolState) revert("mock: pool state revert");
         return (mockLastTick, mockFee, mockLastBlock, mockLastTimestamp, mockInitialized);
     }
@@ -336,23 +332,163 @@ contract CuratioRebalancerTest is Test, Deployers {
 
     // ── Admin: setHook / setVault Tests ───────────────────────────
 
-    function test_setHook_onlyAdmin() public {
+    // ── Admin: hook timelock (propose / execute / cancel) ─────────
+
+    function test_proposeHook_onlyAdmin() public {
         vm.prank(attacker);
         vm.expectRevert();
-        rebalancer.setHook(makeAddr("newHook"));
+        rebalancer.proposeHook(makeAddr("newHook"));
     }
 
-    function test_setHook_revertsOnZero() public {
+    function test_proposeHook_revertsOnZero() public {
         vm.prank(admin);
         vm.expectRevert(CuratioRebalancer.ZeroAddress.selector);
-        rebalancer.setHook(address(0));
+        rebalancer.proposeHook(address(0));
     }
 
-    function test_setHook_updatesState() public {
+    function test_proposeHook_setsPendingAndEmits() public {
         address newHook = makeAddr("newHook");
+        uint256 expectedEta = block.timestamp + rebalancer.HOOK_TIMELOCK();
+
+        vm.expectEmit(true, false, false, true);
+        emit CuratioRebalancer.HookProposed(newHook, expectedEta);
+
         vm.prank(admin);
-        rebalancer.setHook(newHook);
+        rebalancer.proposeHook(newHook);
+
+        assertEq(rebalancer.pendingHook(), newHook);
+        assertEq(rebalancer.pendingHookEta(), expectedEta);
+        assertEq(address(rebalancer.hook()), hook, "hook must not change on propose");
+    }
+
+    function test_proposeHook_secondProposalOverwritesAndRestartsTimelock() public {
+        address first = makeAddr("firstHook");
+        address second = makeAddr("secondHook");
+
+        vm.prank(admin);
+        rebalancer.proposeHook(first);
+
+        vm.warp(block.timestamp + 1 days);
+
+        vm.prank(admin);
+        rebalancer.proposeHook(second);
+
+        assertEq(rebalancer.pendingHook(), second);
+        assertEq(rebalancer.pendingHookEta(), block.timestamp + rebalancer.HOOK_TIMELOCK());
+    }
+
+    function test_executeHook_revertsWithNoProposal() public {
+        vm.prank(admin);
+        vm.expectRevert(CuratioRebalancer.NoPendingHook.selector);
+        rebalancer.executeHook();
+    }
+
+    function test_executeHook_revertsBeforeTimelock() public {
+        address newHook = makeAddr("newHook");
+
+        vm.prank(admin);
+        rebalancer.proposeHook(newHook);
+        uint256 eta = rebalancer.pendingHookEta();
+
+        vm.warp(eta - 1);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CuratioRebalancer.HookTimelockActive.selector, eta));
+        rebalancer.executeHook();
+
+        assertEq(address(rebalancer.hook()), hook, "hook must not change early");
+        assertEq(rebalancer.pendingHook(), newHook, "proposal must survive a failed execute");
+    }
+
+    /// Boundary: the check is `block.timestamp < eta`, so executing exactly at eta must work.
+    function test_executeHook_succeedsExactlyAtEta() public {
+        address newHook = makeAddr("newHook");
+
+        vm.prank(admin);
+        rebalancer.proposeHook(newHook);
+
+        vm.warp(rebalancer.pendingHookEta());
+        vm.prank(admin);
+        rebalancer.executeHook();
+
         assertEq(address(rebalancer.hook()), newHook);
+    }
+
+    function test_executeHook_updatesStateAndEmitsAfterDelay() public {
+        address newHook = makeAddr("newHook");
+
+        vm.prank(admin);
+        rebalancer.proposeHook(newHook);
+        vm.warp(block.timestamp + rebalancer.HOOK_TIMELOCK() + 1);
+
+        vm.expectEmit(true, true, false, false);
+        emit CuratioRebalancer.HookUpdated(hook, newHook);
+
+        vm.prank(admin);
+        rebalancer.executeHook();
+
+        assertEq(address(rebalancer.hook()), newHook);
+        assertEq(rebalancer.pendingHook(), address(0), "pending must be cleared");
+        assertEq(rebalancer.pendingHookEta(), 0, "eta must be cleared");
+    }
+
+    function test_executeHook_onlyAdmin() public {
+        address newHook = makeAddr("newHook");
+
+        vm.prank(admin);
+        rebalancer.proposeHook(newHook);
+        vm.warp(block.timestamp + rebalancer.HOOK_TIMELOCK());
+
+        vm.prank(attacker);
+        vm.expectRevert();
+        rebalancer.executeHook();
+
+        assertEq(address(rebalancer.hook()), hook, "attacker must not be able to apply the hook");
+    }
+
+    function test_executeHook_cannotBeReplayed() public {
+        address newHook = makeAddr("newHook");
+
+        vm.startPrank(admin);
+        rebalancer.proposeHook(newHook);
+        vm.warp(block.timestamp + rebalancer.HOOK_TIMELOCK());
+        rebalancer.executeHook();
+
+        vm.expectRevert(CuratioRebalancer.NoPendingHook.selector);
+        rebalancer.executeHook();
+        vm.stopPrank();
+    }
+
+    function test_cancelHookProposal_clearsPending() public {
+        vm.startPrank(admin);
+        rebalancer.proposeHook(makeAddr("newHook"));
+        rebalancer.cancelHookProposal();
+        vm.stopPrank();
+
+        assertEq(rebalancer.pendingHook(), address(0));
+        assertEq(rebalancer.pendingHookEta(), 0);
+
+        // a cancelled proposal can never be executed, even after the delay
+        vm.warp(block.timestamp + rebalancer.HOOK_TIMELOCK() + 1);
+        vm.prank(admin);
+        vm.expectRevert(CuratioRebalancer.NoPendingHook.selector);
+        rebalancer.executeHook();
+    }
+
+    function test_cancelHookProposal_revertsWithNoProposal() public {
+        vm.prank(admin);
+        vm.expectRevert(CuratioRebalancer.NoPendingHook.selector);
+        rebalancer.cancelHookProposal();
+    }
+
+    function test_cancelHookProposal_onlyAdmin() public {
+        vm.prank(admin);
+        rebalancer.proposeHook(makeAddr("newHook"));
+
+        vm.prank(attacker);
+        vm.expectRevert();
+        rebalancer.cancelHookProposal();
+
+        assertTrue(rebalancer.pendingHook() != address(0), "attacker must not be able to cancel");
     }
 
     function test_setVault_onlyAdmin() public {
@@ -548,17 +684,6 @@ contract CuratioRebalancerIntegrationTest is Test {
         // rebalancer must have paid out 2x the configured per-call amount.
         assertEq(token0.balanceOf(address(rebalancer)), balBefore0 - 2 ether);
         assertEq(token1.balanceOf(address(rebalancer)), balBefore1 - 4 ether);
-    }
-
-    /// @notice Confirms the previously-skipped placeholder is now covered by
-    ///         real integration execution above; kept here as a marker so a
-    ///         `grep -r "vm.skip" test/` sweep doesn't silently miss this file.
-
-    /// @notice Confirms the previously-skipped placeholder is now covered by
-    ///         real integration execution above; kept here as a marker so a
-    ///         `grep -r "vm.skip" test/` sweep doesn't silently miss this file.
-    function test_rebalanceLiquidity_fullExecution_noLongerSkipped() public pure {
-        assertTrue(true);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -855,17 +980,17 @@ contract CuratioRebalancerCheckUpkeepTest is Test {
         assertEq(refTick, 100);
     }
 
-   function test_checkUpkeep_trueWhenTwapDiverged() public {
-    mockHook.setPoolState(500, 3000, uint64(block.number), uint64(block.timestamp), true);
-    mockHook.setTwapTick(100);
+    function test_checkUpkeep_trueWhenTwapDiverged() public {
+        mockHook.setPoolState(500, 3000, uint64(block.number), uint64(block.timestamp), true);
+        mockHook.setTwapTick(100);
 
-    (bool upkeepNeeded, bytes memory performData) = rebalancer.checkUpkeep("");
+        (bool upkeepNeeded, bytes memory performData) = rebalancer.checkUpkeep("");
 
-    assertTrue(upkeepNeeded, "twap divergence alone must trigger upkeep");
-    (int24 refTick, bool twapDiverged) = abi.decode(performData, (int24, bool));
-    assertEq(refTick, 100);   // ← 500 থেকে 100 করুন (TWAP tick, spot tick নয়)
-    assertTrue(twapDiverged);
-}
+        assertTrue(upkeepNeeded, "twap divergence alone must trigger upkeep");
+        (int24 refTick, bool twapDiverged) = abi.decode(performData, (int24, bool));
+        assertEq(refTick, 100); // ← 500 থেকে 100 করুন (TWAP tick, spot tick নয়)
+        assertTrue(twapDiverged);
+    }
 
     function test_checkUpkeep_falseWhenFeeLowAndTwapNotDiverged() public {
         mockHook.setPoolState(100, 3000, uint64(block.number), uint64(block.timestamp), true);

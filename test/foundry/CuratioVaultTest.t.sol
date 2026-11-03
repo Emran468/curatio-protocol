@@ -6,6 +6,7 @@ import {CuratioVault} from "../../src/CuratioVault.sol";
 import {CuratioAccess} from "../../src/CuratioAccess.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MockERC20} from "@uniswap/v4-core/lib/solmate/src/test/utils/mocks/MockERC20.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 /// @dev Configurable mock rebalancer. Covers:
 ///      - notify success / failure (try/catch non-blocking path in the vault)
@@ -70,6 +71,7 @@ contract CuratioVaultTest is Test {
     CuratioAccess public access;
     MockRebalancer public rebalancer;
     MockERC20 public asset;
+    uint256 constant SCALE = 1e6; // = 10 ** _decimalsOffset() in CuratioVault
 
     address public admin = makeAddr("admin");
     address public alice = makeAddr("alice");
@@ -221,7 +223,7 @@ contract CuratioVaultTest is Test {
         vm.prank(alice);
         vault.deposit(100 ether, bob);
 
-        assertEq(vault.balanceOf(bob), 100 ether);
+        assertEq(vault.balanceOf(bob), 100 ether * SCALE);
         assertEq(vault.balanceOf(alice), 0);
     }
 
@@ -249,11 +251,14 @@ contract CuratioVaultTest is Test {
     }
 
     function test_mint_revertsIfCapExceeded() public {
+        // mint() takes SHARES. Scale so the request is worth DEPOSIT_CAP + 1 ether of assets.
+        uint256 shares = (DEPOSIT_CAP + 1 ether) * SCALE;
+
         vm.prank(alice);
         vm.expectRevert(
             abi.encodeWithSelector(CuratioVault.DepositCapExceeded.selector, DEPOSIT_CAP + 1 ether, DEPOSIT_CAP)
         );
-        vault.mint(DEPOSIT_CAP + 1 ether, alice);
+        vault.mint(shares, alice);
     }
 
     function test_mint_succeedsAndNotifiesRebalancer() public {
@@ -277,17 +282,30 @@ contract CuratioVaultTest is Test {
     // ── Withdraw ─────────────────────────────────────────────────
 
     function test_withdraw_revertsIfNotWhitelisted() public {
+        // 1. Alice deposits while whitelisted
         vm.prank(alice);
-        vault.deposit(100 ether, alice);
+        uint256 shares = vault.deposit(100 ether, alice);
+        assertGt(shares, 0, "deposit must mint shares");
 
-        // Revoke alice's whitelist status after she has already deposited,
-        // to isolate the withdraw-path whitelist check.
+        // 2. Admin PROPOSES removal (not immediate)
         vm.prank(admin);
-        access.setWhitelistedUser(alice, false);
+        access.proposeRemoval(alice);
 
+        // 3. Withdraw is NOT yet blocked — removal is only pending.
+        //    Guards against silently breaking the timelock.
+        vm.prank(alice);
+        uint256 out = vault.withdraw(10 ether, alice, alice);
+        assertGt(out, 0, "withdraw must succeed while removal is pending");
+
+        // 4. Warp past the timelock and execute removal
+        vm.warp(block.timestamp + access.REMOVAL_TIMELOCK());
+        vm.prank(admin);
+        access.executeRemoval(alice);
+
+        // 5. NOW withdraw must revert with NotWhitelisted
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(CuratioVault.NotWhitelisted.selector, alice));
-        vault.withdraw(50 ether, alice, alice);
+        vault.withdraw(10 ether, alice, alice);
     }
 
     function test_withdraw_revertsIfReceiverNotWhitelisted() public {
@@ -347,15 +365,33 @@ contract CuratioVaultTest is Test {
     // ── Redeem ───────────────────────────────────────────────────
 
     function test_redeem_revertsIfNotWhitelisted() public {
+        // 1. Alice deposits while whitelisted
         vm.prank(alice);
         uint256 shares = vault.deposit(100 ether, alice);
+        assertGt(shares, 0, "deposit must mint shares");
 
+        // 2. Admin PROPOSES removal (not immediate)
         vm.prank(admin);
-        access.setWhitelistedUser(alice, false);
+        access.proposeRemoval(alice);
+
+        // 3. Removal is NOT yet effective — redeem must still work
+        //    (this guards against silently breaking the timelock)
+        vm.prank(alice);
+        uint256 out = vault.redeem(shares / 2, alice, alice);
+        assertGt(out, 0, "redeem must succeed while removal is pending");
+
+        // 4. Warp past the timelock and execute removal
+        vm.warp(block.timestamp + access.REMOVAL_TIMELOCK());
+        vm.prank(admin);
+        access.executeRemoval(alice);
+
+        // 5. NOW redeem must revert with NotWhitelisted
+        uint256 remainingShares = vault.balanceOf(alice);
+        assertGt(remainingShares, 0, "alice must still hold shares to redeem");
 
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(CuratioVault.NotWhitelisted.selector, alice));
-        vault.redeem(shares, alice, alice);
+        vault.redeem(remainingShares, alice, alice);
     }
 
     function test_redeem_revertsIfReceiverNotWhitelisted() public {
@@ -443,7 +479,9 @@ contract CuratioVaultTest is Test {
     function test_maxMint_matchesRemainingCapacity() public {
         vm.prank(alice);
         vault.deposit(300 ether, alice);
-        assertEq(vault.maxMint(alice), 700 ether); // 1:1 pricing
+
+        // remaining capacity is 700 ether of assets; shares are scaled by 10 ** _decimalsOffset()
+        assertEq(vault.maxMint(alice), 700 ether * SCALE);
     }
 
     // ── deployToRebalancer / withdraw pulls from rebalancer ──────
@@ -527,54 +565,369 @@ contract CuratioVaultTest is Test {
         vault.withdraw(101 ether, alice, alice);
     }
 
-    // ── Admin: setAccessControl ────────────────────────────────────
+    // ── Admin: access-contract timelock ──────────────────────────────
 
-    function test_setAccessControl_onlyDefaultAdmin() public {
+    function test_proposeAccessControl_onlyDefaultAdmin() public {
         vm.prank(attacker);
         vm.expectRevert();
-        vault.setAccessControl(makeAddr("newAccess"));
+        vault.proposeAccessControl(makeAddr("newAccess"));
     }
 
-    function test_setAccessControl_revertsOnZero() public {
+    function test_proposeAccessControl_revertsOnZero() public {
         vm.prank(admin);
         vm.expectRevert(CuratioVault.ZeroAddress.selector);
-        vault.setAccessControl(address(0));
+        vault.proposeAccessControl(address(0));
     }
 
-    function test_setAccessControl_updatesStateAndEmits() public {
-        CuratioAccess newAccess = new CuratioAccess(admin);
+    function test_proposeAccessControl_setsPendingAndEmits() public {
+        address newAccess = makeAddr("newAccess");
+        uint256 expectedEta = block.timestamp + vault.ADMIN_TIMELOCK();
+
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit CuratioVault.AccessControlProposed(newAccess, expectedEta);
 
         vm.prank(admin);
-        vm.expectEmit(true, true, true, true);
-        emit AccessControlUpdated(address(access), address(newAccess));
-        vault.setAccessControl(address(newAccess));
+        vault.proposeAccessControl(newAccess);
 
-        assertEq(address(vault.accessControl()), address(newAccess));
+        assertEq(vault.pendingAccessControl(), newAccess);
+        assertEq(vault.pendingAccessControlEta(), expectedEta);
+        assertEq(address(vault.accessControl()), address(access), "must not change on propose");
     }
 
-    // ── Admin: setRebalancer ────────────────────────────────────────
+    function test_executeAccessControl_revertsWithNoProposal() public {
+        vm.prank(admin);
+        vm.expectRevert(CuratioVault.NoPendingProposal.selector);
+        vault.executeAccessControl();
+    }
 
-    function test_setRebalancer_onlyDefaultAdmin() public {
+    function test_executeAccessControl_revertsBeforeTimelock() public {
+        address newAccess = address(new CuratioAccess(admin));
+
+        vm.prank(admin);
+        vault.proposeAccessControl(newAccess);
+        uint256 eta = vault.pendingAccessControlEta();
+
+        vm.warp(eta - 1);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CuratioVault.TimelockNotElapsed.selector, eta));
+        vault.executeAccessControl();
+
+        assertEq(address(vault.accessControl()), address(access), "must not change early");
+        assertEq(vault.pendingAccessControl(), newAccess, "proposal must survive a failed execute");
+    }
+
+    /// Boundary: the check is `block.timestamp < eta`, so executing exactly at eta must work.
+    function test_executeAccessControl_succeedsExactlyAtEta() public {
+        address newAccess = address(new CuratioAccess(admin));
+
+        vm.prank(admin);
+        vault.proposeAccessControl(newAccess);
+
+        vm.warp(vault.pendingAccessControlEta());
+        vm.prank(admin);
+        vault.executeAccessControl();
+
+        assertEq(address(vault.accessControl()), newAccess);
+    }
+
+    function test_executeAccessControl_updatesStateAndEmits() public {
+        address newAccess = address(new CuratioAccess(admin));
+
+        vm.startPrank(admin);
+        vault.proposeAccessControl(newAccess);
+        vm.warp(block.timestamp + vault.ADMIN_TIMELOCK() + 1);
+
+        vm.expectEmit(true, true, false, false, address(vault));
+        emit AccessControlUpdated(address(access), newAccess);
+        vault.executeAccessControl();
+        vm.stopPrank();
+
+        assertEq(address(vault.accessControl()), newAccess);
+        assertEq(vault.pendingAccessControl(), address(0), "pending must be cleared");
+        assertEq(vault.pendingAccessControlEta(), 0, "eta must be cleared");
+    }
+
+    function test_executeAccessControl_onlyDefaultAdmin() public {
+        address newAccess = address(new CuratioAccess(admin));
+
+        vm.prank(admin);
+        vault.proposeAccessControl(newAccess);
+        vm.warp(block.timestamp + vault.ADMIN_TIMELOCK());
+
         vm.prank(attacker);
         vm.expectRevert();
-        vault.setRebalancer(makeAddr("newRebalancer"));
+        vault.executeAccessControl();
+
+        assertEq(address(vault.accessControl()), address(access), "attacker must not apply the change");
     }
 
-    function test_setRebalancer_revertsOnZero() public {
+    function test_executeAccessControl_cannotBeReplayed() public {
+        address newAccess = address(new CuratioAccess(admin));
+
+        vm.startPrank(admin);
+        vault.proposeAccessControl(newAccess);
+        vm.warp(block.timestamp + vault.ADMIN_TIMELOCK());
+        vault.executeAccessControl();
+
+        vm.expectRevert(CuratioVault.NoPendingProposal.selector);
+        vault.executeAccessControl();
+        vm.stopPrank();
+    }
+
+    function test_cancelAccessControl_clearsPending() public {
+        vm.startPrank(admin);
+        vault.proposeAccessControl(makeAddr("newAccess"));
+        vault.cancelAccessControl();
+        vm.stopPrank();
+
+        assertEq(vault.pendingAccessControl(), address(0));
+        assertEq(vault.pendingAccessControlEta(), 0);
+
+        // a cancelled proposal can never be executed, even after the delay
+        vm.warp(block.timestamp + vault.ADMIN_TIMELOCK() + 1);
+        vm.prank(admin);
+        vm.expectRevert(CuratioVault.NoPendingProposal.selector);
+        vault.executeAccessControl();
+    }
+
+    function test_cancelAccessControl_revertsWithNoProposal() public {
+        vm.prank(admin);
+        vm.expectRevert(CuratioVault.NoPendingProposal.selector);
+        vault.cancelAccessControl();
+    }
+
+    function test_cancelAccessControl_onlyDefaultAdmin() public {
+        vm.prank(admin);
+        vault.proposeAccessControl(makeAddr("newAccess"));
+
+        vm.prank(attacker);
+        vm.expectRevert();
+        vault.cancelAccessControl();
+
+        assertTrue(vault.pendingAccessControl() != address(0), "attacker must not cancel");
+    }
+
+    // ── Admin: rebalancer timelock ───────────────────────────────────
+
+    function test_proposeRebalancer_onlyDefaultAdmin() public {
+        vm.prank(attacker);
+        vm.expectRevert();
+        vault.proposeRebalancer(makeAddr("newRebalancer"));
+    }
+
+    function test_proposeRebalancer_revertsOnZero() public {
         vm.prank(admin);
         vm.expectRevert(CuratioVault.ZeroAddress.selector);
-        vault.setRebalancer(address(0));
+        vault.proposeRebalancer(address(0));
     }
 
-    function test_setRebalancer_updatesStateAndEmits() public {
+    function test_proposeRebalancer_setsPendingAndEmits() public {
+        address newReb = makeAddr("newRebalancer");
+        uint256 expectedEta = block.timestamp + vault.ADMIN_TIMELOCK();
+
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit CuratioVault.RebalancerProposed(newReb, expectedEta);
+
+        vm.prank(admin);
+        vault.proposeRebalancer(newReb);
+
+        assertEq(vault.pendingRebalancer(), newReb);
+        assertEq(vault.pendingRebalancerEta(), expectedEta);
+        assertEq(address(vault.rebalancer()), address(rebalancer), "must not change on propose");
+    }
+
+    function test_proposeRebalancer_secondProposalOverwritesAndRestartsTimelock() public {
+        address first = makeAddr("firstReb");
+        address second = makeAddr("secondReb");
+
+        vm.prank(admin);
+        vault.proposeRebalancer(first);
+        vm.warp(block.timestamp + 1 days);
+
+        vm.prank(admin);
+        vault.proposeRebalancer(second);
+
+        assertEq(vault.pendingRebalancer(), second);
+        assertEq(vault.pendingRebalancerEta(), block.timestamp + vault.ADMIN_TIMELOCK());
+    }
+
+    function test_executeRebalancer_revertsWithNoProposal() public {
+        vm.prank(admin);
+        vm.expectRevert(CuratioVault.NoPendingProposal.selector);
+        vault.executeRebalancer();
+    }
+
+    function test_executeRebalancer_revertsBeforeTimelock() public {
+        MockRebalancer newReb = new MockRebalancer();
+
+        vm.prank(admin);
+        vault.proposeRebalancer(address(newReb));
+        uint256 eta = vault.pendingRebalancerEta();
+
+        vm.warp(eta - 1);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CuratioVault.TimelockNotElapsed.selector, eta));
+        vault.executeRebalancer();
+
+        assertEq(address(vault.rebalancer()), address(rebalancer), "must not change early");
+        assertEq(vault.pendingRebalancer(), address(newReb), "proposal must survive a failed execute");
+    }
+
+    function test_executeRebalancer_succeedsExactlyAtEta() public {
+        MockRebalancer newReb = new MockRebalancer();
+
+        vm.prank(admin);
+        vault.proposeRebalancer(address(newReb));
+
+        vm.warp(vault.pendingRebalancerEta());
+        vm.prank(admin);
+        vault.executeRebalancer();
+
+        assertEq(address(vault.rebalancer()), address(newReb));
+    }
+
+    function test_executeRebalancer_updatesStateAndEmits() public {
+        MockRebalancer newReb = new MockRebalancer();
+
+        vm.startPrank(admin);
+        vault.proposeRebalancer(address(newReb));
+        vm.warp(block.timestamp + vault.ADMIN_TIMELOCK() + 1);
+
+        vm.expectEmit(true, true, false, false, address(vault));
+        emit RebalancerUpdated(address(rebalancer), address(newReb));
+        vault.executeRebalancer();
+        vm.stopPrank();
+
+        assertEq(address(vault.rebalancer()), address(newReb));
+        assertEq(vault.pendingRebalancer(), address(0), "pending must be cleared");
+        assertEq(vault.pendingRebalancerEta(), 0, "eta must be cleared");
+    }
+
+    function test_executeRebalancer_onlyDefaultAdmin() public {
+        MockRebalancer newReb = new MockRebalancer();
+
+        vm.prank(admin);
+        vault.proposeRebalancer(address(newReb));
+        vm.warp(block.timestamp + vault.ADMIN_TIMELOCK());
+
+        vm.prank(attacker);
+        vm.expectRevert();
+        vault.executeRebalancer();
+
+        assertEq(address(vault.rebalancer()), address(rebalancer), "attacker must not apply the change");
+    }
+
+    function test_executeRebalancer_cannotBeReplayed() public {
+        MockRebalancer newReb = new MockRebalancer();
+
+        vm.startPrank(admin);
+        vault.proposeRebalancer(address(newReb));
+        vm.warp(block.timestamp + vault.ADMIN_TIMELOCK());
+        vault.executeRebalancer();
+
+        vm.expectRevert(CuratioVault.NoPendingProposal.selector);
+        vault.executeRebalancer();
+        vm.stopPrank();
+    }
+
+    function test_cancelRebalancer_clearsPending() public {
+        vm.startPrank(admin);
+        vault.proposeRebalancer(address(new MockRebalancer()));
+        vault.cancelRebalancer();
+        vm.stopPrank();
+
+        assertEq(vault.pendingRebalancer(), address(0));
+        assertEq(vault.pendingRebalancerEta(), 0);
+
+        vm.warp(block.timestamp + vault.ADMIN_TIMELOCK() + 1);
+        vm.prank(admin);
+        vm.expectRevert(CuratioVault.NoPendingProposal.selector);
+        vault.executeRebalancer();
+    }
+
+    function test_cancelRebalancer_revertsWithNoProposal() public {
+        vm.prank(admin);
+        vm.expectRevert(CuratioVault.NoPendingProposal.selector);
+        vault.cancelRebalancer();
+    }
+
+    function test_cancelRebalancer_onlyDefaultAdmin() public {
         MockRebalancer newRebalancer = new MockRebalancer();
-
         vm.prank(admin);
-        vm.expectEmit(true, true, true, true);
-        emit RebalancerUpdated(address(rebalancer), address(newRebalancer));
-        vault.setRebalancer(address(newRebalancer));
+        vault.proposeRebalancer(address(newRebalancer));
 
-        assertEq(address(vault.rebalancer()), address(newRebalancer));
+        assertEq(vault.pendingRebalancer(), address(newRebalancer));
+
+        vm.prank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, attacker, bytes32(0))
+        );
+        vault.cancelRebalancer();
+
+        assertEq(vault.pendingRebalancer(), address(newRebalancer), "attacker must not cancel");
+    }
+
+    // ── What the timelock protects ───────────────────────────────────
+
+    /// Valuation (and therefore the share price) cannot be changed by a proposal alone. After
+    /// execution the OLD rebalancer's holdings stop being counted: documents why funds must be moved first.
+    function test_rebalancerChange_doesNotAffectValuationUntilExecuted() public {
+        vm.prank(alice);
+        vault.deposit(100 ether, alice);
+        rebalancer.setManagedAssets(500 ether);
+        uint256 totalBefore = vault.totalAssets(); // 100 idle + 500 managed
+        assertEq(totalBefore, 600 ether);
+
+        MockRebalancer empty = new MockRebalancer();
+        vm.prank(admin);
+        vault.proposeRebalancer(address(empty));
+
+        assertEq(vault.totalAssets(), totalBefore, "a proposal must not move the share price");
+        assertEq(address(vault.rebalancer()), address(rebalancer));
+
+        vm.warp(block.timestamp + vault.ADMIN_TIMELOCK());
+        vm.prank(admin);
+        vault.executeRebalancer();
+
+        assertEq(vault.totalAssets(), 100 ether, "after the switch the old rebalancer's 500 are no longer counted");
+    }
+
+    /// The reason for the delay: users can leave while a (possibly hostile) change is pending.
+    function test_proposedRebalancer_usersCanStillWithdrawDuringDelay() public {
+        vm.prank(alice);
+        vault.deposit(100 ether, alice);
+
+        MockRebalancer newRebalancer = new MockRebalancer();
+        vm.prank(admin);
+        vault.proposeRebalancer(address(newRebalancer));
+        assertEq(vault.pendingRebalancer(), address(newRebalancer), "proposal not recorded");
+
+        uint256 before_ = asset.balanceOf(alice);
+        vm.prank(alice);
+        vault.withdraw(40 ether, alice, alice);
+
+        assertEq(asset.balanceOf(alice), before_ + 40 ether);
+    }
+
+    /// A new access contract that does not whitelist alice blocks her exit, but only after the delay.
+    function test_accessControlChange_doesNotBlockExitsUntilExecuted() public {
+        vm.prank(alice);
+        vault.deposit(100 ether, alice);
+
+        CuratioAccess strict = new CuratioAccess(admin); // alice is not whitelisted here
+        vm.prank(admin);
+        vault.proposeAccessControl(address(strict));
+
+        vm.prank(alice);
+        vault.withdraw(10 ether, alice, alice); // still fine during the delay
+
+        vm.warp(block.timestamp + vault.ADMIN_TIMELOCK());
+        vm.prank(admin);
+        vault.executeAccessControl();
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(CuratioVault.NotWhitelisted.selector, alice));
+        vault.withdraw(10 ether, alice, alice);
     }
 
     // ── Admin: setDepositCap ────────────────────────────────────────

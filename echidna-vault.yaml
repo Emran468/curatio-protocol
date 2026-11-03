@@ -1,0 +1,6 @@
+testMode: property
+testLimit: 300000
+seqLen: 60
+codeSize: 0xffffff
+corpusDir: echidna-corpus-vault
+coverage: true

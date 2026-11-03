@@ -22,6 +22,8 @@ contract CuratioDynamicFee is AccessControl {
 
     uint256 public totalFeesCharged;
 
+    uint256 public totalYieldProcessed;
+
     event PerformanceFeeCharged(address indexed vault, uint256 yieldAmount, uint256 feeAmount);
     event PerformanceFeeUpdated(uint256 newBps);
     event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
@@ -30,6 +32,7 @@ contract CuratioDynamicFee is AccessControl {
     error ZeroAddress();
     error FeeTooHigh(uint256 requested, uint256 max);
     error NotVault(address caller);
+    error FeeExceedsCalculated(uint256 reported, uint256 maxAllowed);
 
     modifier onlyVault() {
         if (msg.sender != vault) revert NotVault(msg.sender);
@@ -56,8 +59,13 @@ contract CuratioDynamicFee is AccessControl {
 
     /// @notice Vault calls this after actually transferring the fee, for accounting/events.
     ///         Restricted to the registered vault only.
+
     function reportPerformanceFeeCharged(uint256 yieldAmount, uint256 feeAmount) external onlyVault {
+        uint256 maxFee = (yieldAmount * performanceFeeBps) / 10_000;
+        if (feeAmount > maxFee) revert FeeExceedsCalculated(feeAmount, maxFee);
+
         totalFeesCharged += feeAmount;
+        totalYieldProcessed += yieldAmount;
         emit PerformanceFeeCharged(msg.sender, yieldAmount, feeAmount);
     }
 
