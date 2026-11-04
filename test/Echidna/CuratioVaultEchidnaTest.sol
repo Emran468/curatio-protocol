@@ -162,9 +162,9 @@ contract VtAttacker {
     function probe() external returns (bool) {
         try v.setDepositCap(0) { return true; } catch {}
         try v.setDepositsPaused(true) { return true; } catch {}
-        try v.setRebalancer(address(0xBEEF)) { return true; } catch {}
-        try v.setAccessControl(address(0xBEEF)) { return true; } catch {}
-        try v.setFeeModule(address(0)) { return true; } catch {}
+        try v.proposeRebalancer(address(0xBEEF)) { return true; } catch {}
+        try v.proposeAccessControl(address(0xBEEF)) { return true; } catch {}
+        try v.proposeFeeModule(address(0)) { return true; } catch {}
         try v.harvest() { return true; } catch {}
         try v.grantRole(v.VAULT_MANAGER_ROLE(), address(this)) { return true; } catch {}
         try a.setWhitelistedUser(address(this), true) { return true; } catch {}
@@ -311,7 +311,7 @@ contract CuratioVaultEchidnaTest {
 
         // fee module: this contract is its admin (FEE_ADMIN_ROLE), actors[0] receives the fee shares
         dynamicFee = new CuratioDynamicFee(address(this), address(vault), address(actors[0]));
-        vault.setFeeModule(address(dynamicFee));
+        vault.initializeFeeModule(address(dynamicFee));
 
         attacker = new VtAttacker(vault, access, rebalancer, dynamicFee);
 
@@ -649,7 +649,7 @@ contract CuratioVaultEchidnaTest {
 
     /// @notice Re-registering the module resets the HWM to 0 (a fresh baseline).
     function rebaselineModule() external {
-        vault.setFeeModule(address(dynamicFee));
+        vault.initializeFeeModule(address(dynamicFee));
         hwmFloor = 0;
         if (vault.highWaterMark() != 0) harvestBroken = true;
         rebaselines++;

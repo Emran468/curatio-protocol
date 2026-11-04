@@ -1,0 +1,8 @@
+# echidna-fee.yaml
+testMode: "assertion"
+seqLen: 100
+testLimit: 50000
+workers: 2
+corpusDir: "echidna-corpus-fee"
+coverage: true
+sender: ["0x10000", "0x20000"]

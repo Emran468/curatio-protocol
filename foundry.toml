@@ -1,5 +1,5 @@
 [profile.default]
-test = "test/foundry" 
+test = "test" 
 auto_detect_solc = true
 offline = false
 evm_version = "cancun"
