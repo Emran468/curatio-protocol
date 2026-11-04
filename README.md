@@ -144,13 +144,14 @@ Registers strategists, assigns pools to them (inactive strategists cannot be ass
 
 ## Getting started
 
-Requirements: [Foundry](https://book.getfoundry.sh/), Solidity `^0.8.26`, and the OpenZeppelin, OpenZeppelin Uniswap Hooks, Uniswap v4-core and Chainlink contract dependencies.
+Requirements: [Foundry](https://book.getfoundry.sh/), Solidity `^0.8.26`, and the OpenZeppelin, Uniswap v4-core and Chainlink contract dependencies.
 
 ```bash
+git clone https://github.com/Emran468/curatio-protocol
+cd curatio-protocol
 forge install
 forge build
 forge test
-```
 
 ### Suggested deployment order
 
