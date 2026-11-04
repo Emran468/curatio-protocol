@@ -13,6 +13,59 @@ import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol"
 ///      - valuation (`totalManagedAssets`) which is deliberately NOT affected by `shouldRevert`,
 ///        because Vault.totalAssets() depends on it; use `shouldRevertOnValuation` to test that
 ///      - `returnToVault`, which pays out of the mock's own token balance.
+// contract MockRebalancer {
+//     bool public shouldRevert;
+//     bool public shouldRevertOnValuation;
+//     uint256 public lastDepositNotified;
+//     uint256 public lastWithdrawNotified;
+//     uint256 public depositCallCount;
+//     uint256 public withdrawCallCount;
+
+//     uint256 public managedAssets;
+//     address public returnToken;
+//     uint256 public returnCallCount;
+//     uint256 public lastReturnRequested;
+
+//     function setShouldRevert(bool _shouldRevert) external {
+//         shouldRevert = _shouldRevert;
+//     }
+
+//     function setShouldRevertOnValuation(bool v) external {
+//         shouldRevertOnValuation = v;
+//     }
+
+//     function setManagedAssets(uint256 v) external {
+//         managedAssets = v;
+//     }
+
+//     function setReturnToken(address t) external {
+//         returnToken = t;
+//     }
+
+//     function notifyDeposit(uint256 assets) external {
+//         if (shouldRevert) revert("MockRebalancer: forced revert");
+//         lastDepositNotified = assets;
+//         depositCallCount++;
+//     }
+
+//     function notifyWithdraw(uint256 assets) external {
+//         if (shouldRevert) revert("MockRebalancer: forced revert");
+//         lastWithdrawNotified = assets;
+//         withdrawCallCount++;
+//     }
+
+//     function totalManagedAssets() external view returns (uint256) {
+//         if (shouldRevertOnValuation) revert("MockRebalancer: valuation unavailable");
+//         return managedAssets;
+//     }
+
+//     function returnToVault(uint256 amount) external {
+//         returnCallCount++;
+//         lastReturnRequested = amount;
+//         IERC20(returnToken).transfer(msg.sender, amount);
+//     }
+// }
+
 contract MockRebalancer {
     bool public shouldRevert;
     bool public shouldRevertOnValuation;
@@ -25,6 +78,14 @@ contract MockRebalancer {
     address public returnToken;
     uint256 public returnCallCount;
     uint256 public lastReturnRequested;
+
+    // ✅ নতুন ভেরিয়েবল (টেস্টের জন্য)
+    address public strategistRegistry;
+
+    // ✅ নতুন ফাংশন (টেস্টের জন্য)
+    function setStrategistRegistry(address r) external {
+        strategistRegistry = r;
+    }
 
     function setShouldRevert(bool _shouldRevert) external {
         shouldRevert = _shouldRevert;
@@ -77,6 +138,7 @@ contract CuratioVaultTest is Test {
     address public alice = makeAddr("alice");
     address public bob = makeAddr("bob");
     address public attacker = makeAddr("attacker");
+    address public strategist = makeAddr("strategist");
 
     uint256 public constant DEPOSIT_CAP = 1_000 ether;
 
@@ -975,5 +1037,61 @@ contract CuratioVaultTest is Test {
         vm.prank(alice);
         uint256 shares = vault.deposit(100 ether, alice);
         assertGt(shares, 0);
+    }
+
+    // ==========================================
+    // ✅ NEW: Copy-LP / Follow Strategist Tests
+    // ==========================================
+
+    function test_followStrategist_success() public {
+        vm.prank(admin);
+        access.setWhitelistedUser(alice, true);
+
+        // ✅ Mock the rebalancer's registry call
+        address mockRegistry = makeAddr("mockRegistry");
+        vm.mockCall(address(rebalancer), abi.encodeWithSignature("strategistRegistry()"), abi.encode(mockRegistry));
+
+        // ✅ Mock the registry's checks to return true
+        vm.mockCall(
+            mockRegistry, abi.encodeWithSignature("isRegisteredStrategist(address)", strategist), abi.encode(true)
+        );
+        vm.mockCall(mockRegistry, abi.encodeWithSignature("isActiveStrategist(address)", strategist), abi.encode(true));
+
+        // ✅ Now Alice can follow
+        vm.prank(alice);
+        vault.followStrategist(strategist);
+
+        assertEq(vault.depositorToStrategist(alice), strategist, "Alice should follow the strategist");
+    }
+
+    function test_followStrategist_revertsIfNotWhitelisted() public {
+        // ✅ alice এর বদলে attacker ব্যবহার করা হলো
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(CuratioVault.NotWhitelisted.selector, attacker));
+        vault.followStrategist(makeAddr("strategist"));
+    }
+
+    function test_unfollowStrategist_success() public {
+        vm.prank(admin);
+        access.setWhitelistedUser(alice, true);
+
+        // Mock for following
+        address mockRegistry = makeAddr("mockRegistry");
+        vm.mockCall(address(rebalancer), abi.encodeWithSignature("strategistRegistry()"), abi.encode(mockRegistry));
+        vm.mockCall(
+            mockRegistry, abi.encodeWithSignature("isRegisteredStrategist(address)", strategist), abi.encode(true)
+        );
+        vm.mockCall(mockRegistry, abi.encodeWithSignature("isActiveStrategist(address)", strategist), abi.encode(true));
+
+        // Follow
+        vm.prank(alice);
+        vault.followStrategist(strategist);
+        assertEq(vault.depositorToStrategist(alice), strategist);
+
+        // Unfollow
+        vm.prank(alice);
+        vault.unfollowStrategist();
+
+        assertEq(vault.depositorToStrategist(alice), address(0), "Alice should unfollow successfully");
     }
 }

@@ -12,6 +12,8 @@ contract CuratioStrategistRegistryTest is Test {
     address public strategist1 = address(0x456);
     address public strategist2 = address(0x789);
     address public unauthorized = address(0xabc);
+    address public strategist = makeAddr("strategist");
+    address public rebalancer = makeAddr("rebalancer");
 
     PoolId public poolId1 = PoolId.wrap(bytes32(uint256(1)));
     PoolId public poolId2 = PoolId.wrap(bytes32(uint256(2)));
@@ -27,6 +29,10 @@ contract CuratioStrategistRegistryTest is Test {
 
     function setUp() public {
         registry = new CuratioStrategistRegistry(admin);
+
+        vm.startPrank(admin);
+        registry.grantRole(registry.REBALANCER_ROLE(), rebalancer);
+        vm.stopPrank();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -815,5 +821,36 @@ contract CuratioStrategistRegistryTest is Test {
             )
         );
         registry.bulkReassignPools(strategist1, strategist2, type(uint256).max);
+    }
+
+    // ==========================================
+    // ✅ NEW: Backtesting Tests
+    // ==========================================
+
+    function test_backtestStrategy_returnsCorrectEstimates() public {
+        // ১. একটি স্ট্র্যাটেজিস্ট রেজিস্টার করুন
+        vm.prank(admin);
+        registry.registerStrategist(strategist, "Test Strategist");
+
+        // ২. স্ট্র্যাটেজিস্টের জন্য কিছু ফি রেকর্ড করুন (যেমন: 10 ether)
+        vm.prank(rebalancer);
+        registry.recordFeesGenerated(strategist, 10 ether);
+
+        // ৩. backtestStrategy কল করে ফলাফল চেক করুন
+        (uint256 estimatedYield, uint256 estimatedFee) = registry.backtestStrategy(strategist);
+
+        // ৪. যাচাই করুন (ফলাফল: yield = 10 ether, fee = 10% of yield = 1 ether)
+        assertEq(estimatedYield, 10 ether, "Estimated yield should match total fees generated");
+        assertEq(estimatedFee, 1 ether, "Estimated fee should be 10% of the yield");
+    }
+
+    function test_backtestStrategy_returnsZeroIfNotRegistered() public {
+        address unknownStrategist = makeAddr("unknown");
+
+        // ✅ রেজিস্টার্ড না থাকলে (0, 0) রিটার্ন করবে
+        (uint256 estimatedYield, uint256 estimatedFee) = registry.backtestStrategy(unknownStrategist);
+
+        assertEq(estimatedYield, 0, "Yield should be 0 for unregistered strategist");
+        assertEq(estimatedFee, 0, "Fee should be 0 for unregistered strategist");
     }
 }

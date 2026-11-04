@@ -235,4 +235,29 @@ contract CuratioStrategistRegistry is AccessControl {
             }
         }
     }
+
+    // ✅ নতুন হেল্পার ফাংশন
+    function isActiveStrategist(address strategist) external view returns (bool) {
+        return strategists[strategist].active;
+    }
+
+    /// @notice Simulates a strategy's historical performance for backtesting purposes.
+    /// @dev This is a read-only function and does not alter the state.
+    function backtestStrategy(address strategist) external view returns (uint256 estimatedYield, uint256 estimatedFee) {
+        // ১. চেক করা হচ্ছে স্ট্র্যাটেজিস্ট রেজিস্টার্ড কিনা
+        if (!isRegisteredStrategist[strategist]) {
+            return (0, 0);
+        }
+
+        StrategistProfile memory profile = strategists[strategist];
+
+        // ২. সিমুলেশন লজিক (Historical yield-এর ওপর ভিত্তি করে)
+        // এখানে আমরা তার আগের মোট ফিকে ইল্ড হিসেবে ধরে নিচ্ছি
+        estimatedYield = profile.totalFeesGeneratedForVault;
+
+        // ৩. সিমুলেটেড ফি (ধরি ১০% পারফরম্যান্স ফি)
+        estimatedFee = (estimatedYield * 1000) / 10000;
+
+        return (estimatedYield, estimatedFee);
+    }
 }

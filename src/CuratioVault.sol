@@ -8,6 +8,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "./CuratioAccess.sol";
+import {CuratioStrategistRegistry} from "./CuratioStrategistRegistry.sol";
 
 /// @dev Interface to CuratioRebalancer (Layer 4).
 interface ICuratioRebalancer {
@@ -17,6 +18,7 @@ interface ICuratioRebalancer {
     function totalManagedAssets() external view returns (uint256);
     /// @dev Sends idle vault asset back to the vault. Unwinds part of the LP and swaps if idle asset is short.
     function returnToVault(uint256 amount) external;
+    function strategistRegistry() external view returns (address);
 }
 
 /// @dev Interface to CuratioDynamicFee (Layer 5).
@@ -112,6 +114,8 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
     /// @notice Highest share price (PRICE_PRECISION scale) already accounted for. 0 = not yet baselined.
     uint256 public highWaterMark;
 
+    mapping(address => address) public depositorToStrategist;
+
     event AccessControlUpdated(address indexed oldAccess, address indexed newAccess);
     event RebalancerUpdated(address indexed oldRebalancer, address indexed newRebalancer);
     event FeeModuleUpdated(address indexed oldModule, address indexed newModule);
@@ -126,6 +130,8 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
     event FundsDeployed(uint256 amount);
     event RebalancerNotifyFailed(bool isDeposit, uint256 assets);
     event Harvested(uint256 yieldAssets, uint256 feeAssets, uint256 feeShares, uint256 newHighWaterMark);
+    event StrategistFollowed(address indexed depositor, address indexed strategist);
+    event StrategistUnfollowed(address indexed depositor, address indexed strategist);
 
     error NotWhitelisted(address user);
     error DepositCapExceeded(uint256 attempted, uint256 cap);
@@ -487,5 +493,30 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
     function setDepositsPaused(bool _paused) external onlyRole(VAULT_MANAGER_ROLE) {
         depositsPaused = _paused;
         emit DepositsPausedToggled(_paused);
+    }
+
+    // ==========================================
+    // ✅ NEW: Copy-LP / Delegated Liquidity Management
+    // ==========================================
+    function followStrategist(address strategist) external nonReentrant {
+        _checkWhitelist(msg.sender); // ✅ এটি CuratioVault.NotWhitelisted এররটি নিক্ষেপ করবে
+
+        address registryAddr = rebalancer.strategistRegistry();
+        CuratioStrategistRegistry registry = CuratioStrategistRegistry(registryAddr);
+
+        require(registry.isRegisteredStrategist(strategist), "Strategist not registered");
+        require(registry.isActiveStrategist(strategist), "Strategist is inactive");
+
+        depositorToStrategist[msg.sender] = strategist;
+        emit StrategistFollowed(msg.sender, strategist);
+    }
+
+    /// @notice Allows a depositor to stop following a strategist.
+    function unfollowStrategist() external nonReentrant {
+        address currentStrategist = depositorToStrategist[msg.sender];
+        require(currentStrategist != address(0), "Not following anyone");
+
+        delete depositorToStrategist[msg.sender];
+        emit StrategistUnfollowed(msg.sender, currentStrategist);
     }
 }
