@@ -54,7 +54,7 @@ A Uniswap v4 hook with these permissions enabled: `afterInitialize`, `afterAddLi
 | `HIGH_VOLATILE_FEE` | 1.50% (15000) | Spot ≥ 200 ticks from TWAP, or large tick move |
 | `MEV_PENALTY_FEE` | 10.00% (100000) | Spot ≥ 500 ticks from TWAP, or sandwich detected in the current block |
 
-**TWAP oracle.** A Uniswap-v3-style `tickCumulative` ring buffer (`TwapOracle` library), written in `afterSwap`. Cardinality is pre-warmed at pool initialisation (`initialCardinality`, default 100) and can be grown by anyone via `increaseObservationCardinality`, clamped per call by `maxCardinalityPerCall` (hard ceiling 1000). `isOracleWarm` / `getTwapTick` expose the oracle; the default window is 120 s. While the oracle is cold the hook charges the conservative mid fee instead of assuming safety.
+**TWAP oracle.** A Uniswap-v3-style `tickCumulative` ring buffer (`TwapOracle` library), written in `afterSwap`. Cardinality is pre-warmed at pool initialisation (`initialCardinality`, default 100) and can be grown by anyone via `increaseObservationCardinality`, clamped per call by `maxCardinalityPerCall` (hard ceiling 1000). `isOracleWarm` / `getTwapTick` expose the oracle; the default window is 120 s. While the oracle is cold the hook charges the conservative mid fee instead of assuming safety. See [Known limitations](#known-limitations) for how the default depth interacts with fast chains.
 
 **Sandwich detection (heuristic).** Within a block the hook tracks the first and last tick move and cumulative volume. A direction reversal with volume above `mevVolumeThreshold` flags the block, and all further swaps in that block pay `MEV_PENALTY_FEE`. This is a heuristic, not a classifier — legitimate opposing flow or arbitrage can trigger it.
 
@@ -138,7 +138,22 @@ Registers strategists, assigns pools to them (inactive strategists cannot be ass
 - The `sandwichTickThreshold` parameter is stored and timelocked but is not currently used in the detection logic.
 - `followStrategist` stores a preference only; it has no on-chain effect on funds yet.
 - Switching the vault's rebalancer stops counting what the old one holds — move funds first.
+- Keeper rebalances are reported to the strategist registry under the automation registry's address, which is not a registered strategist, so they are not attributed to any strategist (the registry call is wrapped in `try/catch`).
+- `mevVolumeThreshold` is compared against the raw `amountSpecified` of each swap, so it is not normalised across token decimals (for example a USDC leg of a USDC/WETH pool counts in 6-decimal units). Not yet covered by a test.
 - Unaudited.
+
+### Weaknesses confirmed by the Unichain fork tests
+
+The `test_finding_*` tests in `CuratioForkFindingsTest` and the `test_swapPath_*` tests in `CuratioForkSwapPathTest` assert the behaviour the code has **today**, so they pass while these weaknesses exist. After a fix, flip the assertions.
+
+1. **Default oracle depth is too small for a 1-second chain.** `initialCardinality` defaults to 100 observations. On Unichain (1 s blocks) a pool that swaps every second only covers about 99 s of history, which is shorter than the 120 s TWAP window. `isOracleWarm` turns false, so the hook charges the cold-start fee and the TWAP guard is off. `getTwapTick` also reverts, so the vault's `totalAssets()` reverts and **deposits and withdrawals halt** until the pool is quiet for roughly 20–30 s. Growing the buffer before it wraps (for example to 400) keeps the oracle warm, so the problem is the default, not the TWAP design. Suggested fix: set the default high enough for the window (more observations than window ÷ seconds per write, with margin).
+   Tests: `test_finding_busyPool_oracleNeverWarms_vaultFrozen_thenRecovers`, `test_finding_largerCardinalityBeforeWrap_keepsOracleWarm`.
+
+2. **Anyone can break the oracle by growing it after the ring has wrapped.** `increaseObservationCardinality` is permissionless and sets `cardinality = cardinalityNext` immediately. If the ring has already wrapped while the oracle is warm, the buffer becomes `[old part][empty gap][new part]`, `TwapOracle.binarySearch` cannot bracket `now − 120 s` and reverts with `insufficient observation history`. `beforeSwap` and the vault's valuation both depend on it, so **swaps on the pool and the vault halt** (a swap after more than 120 s of quiet takes the extrapolation path and works once, then the problem returns). Suggested fix: apply the new cardinality only when the write index reaches the end of the old ring (as Uniswap v3 does), or make the function owner-only.
+   Test: `test_finding_growingOracleAfterWrap_bricksSwapsAndVault`.
+
+3. **The MEV penalty is cheap to trigger and lasts a whole decay window.** Any address can flag a "sandwich" with two opposite swaps in one block above `mevVolumeThreshold`; the attack costs only swap fees (the test bounds it below 2.5% of the traded volume). The stored 10% fee then keeps applying to calm swaps for `blockDecayWindow` blocks (300 on Unichain, about 5 minutes). During that time the rebalancer's TWAP price check fails, so **withdrawals that must unwind the LP and keeper rebalances that need a swap revert** with `SwapPriceDeviation`. Withdrawals that the rebalancer's idle asset can cover are not affected. Possible mitigations: apply the penalty only in the flagged block, or let the vault fall back to a partial withdrawal when the swap would be rejected.
+   Tests: `test_finding_cheapSandwichFlagsPenaltyForAnyone`, `test_swapPath_withdrawNeedingSwap_revertsInSandwichBlock`, `test_swapPath_withdrawNeedingSwap_succeedsOnlyAfterDecayWindow`, `test_swapPath_withdrawWithinIdle_worksDuringPenalty`, `test_swapPath_keeperTwoSidedRange_revertsInSandwichBlock`.
 
 ---
 
@@ -152,13 +167,14 @@ cd curatio-protocol
 forge install
 forge build
 forge test
+```
 
 ### Suggested deployment order
 
 1. `CuratioAccess(admin)`
 2. `CuratioStrategistRegistry(admin)`
 3. `CuratioHook(poolManager, owner)`, deployed to an address whose low bits match the hook permissions (CREATE2 / address mining, as required by Uniswap v4)
-4. `CuratioRebalancer(...)` and `CuratioVault(asset, access, rebalancer, admin, depositCap)`. Each takes the other's address, so deploy the rebalancer first with a placeholder vault and call `setVault()` afterwards
+4. `CuratioRebalancer(...)` and `CuratioVault(asset, access, rebalancer, admin, depositCap)`. Each takes the other's address, so deploy the rebalancer first with a placeholder vault and call `setVault()` afterwards. (The fork tests instead predict the vault address from the deployer nonce and deploy the rebalancer and vault back to back.)
 5. `CuratioDynamicFee(admin, vault, feeRecipient)`, then `vault.initializeFeeModule(feeModule)`
 6. Configure:
    - `rebalancer.setManagedPool(key)` then `rebalancer.setAsset(asset)`
@@ -171,7 +187,7 @@ forge test
 
 ## Testing
 
-The Foundry suite currently reports **490 passing tests across 18 suites, 0 failures**.
+The Foundry suite currently reports **490 passing tests across 18 suites, 0 failures**. In addition, **41 mainnet-fork tests across 5 suites** (see below) pass against Unichain.
 
 ### Coverage
 
@@ -201,12 +217,64 @@ Regenerate with `forge coverage`.
 | Registry | `CuratioStrategistRegistryTest` |
 | End-to-end | `CuratioVaultRebalancerE2ETest`, `CuratioFullStackRealHookE2ETest`, `CuratioFullProtocolE2ETest` |
 
+### Mainnet-fork tests (Unichain)
+
+41 tests in 5 suites, all passing. They run against the **real Unichain PoolManager** (`0x1F98…0004`, chain id 130) with a freshly deployed Curatio stack and a new pool that uses the hook, so no existing Uniswap pool is touched. Fees are read from the PoolManager's own `Swap` event, so they show the fee actually charged. Block time on Unichain is 1 s, so the tests move blocks and seconds together.
+
+| Suite (`test/fork/`) | Tests | What it covers |
+|----------------------|------:|----------------|
+| `CuratioForkTest` | 16 | Chain guard and wrong-PoolManager revert, hook initialisation, fee tiers (cold 6000, calm 3000, escalation to 15000 and decay after 300 blocks), TWAP-based MEV penalty, sandwich detection, oracle observations, vault deposit/redeem, LP creation in the real PoolManager, partial and full unwind, harvest, `checkUpkeep` |
+| `CuratioForkKeeperTest` | 6 | `performUpkeep`: registry-only access, default caps of 0 revert with `SlippageExceeded`, position opened around the TWAP, "too soon" and "range unchanged" skips, no strategist attribution |
+| `CuratioForkRealTokensTest` | 7 | Real Unichain USDC (6 decimals) and WETH (18) in a ~\$3000 pool: 12-decimal shares, fee tiers at tick ~196k, TWAP valuation of idle WETH, single-sided USDC LP, partial withdraw and full redeem |
+| `CuratioForkSwapPathTest` | 6 | Paths that swap inside the unlock: withdrawals that unwind a two-sided LP and keeper rebalances into a range containing the price, including their failure during a MEV-penalty window |
+| `CuratioForkFindingsTest` | 6 | Two pools sharing one hook stay isolated, timelocked thresholds change real fees, and the weaknesses listed under [Known limitations](#weaknesses-confirmed-by-the-unichain-fork-tests) |
+
+**Setup.** Add a profile to `foundry.toml` (the default profile points `test` at `test/foundry`):
+
+```toml
+[profile.fork]
+test = "test/fork"
+```
+
+Put the RPC URL in a `.env` file (or export it). The public endpoint needs no account; if you hit rate limits, pin the block with `UNICHAIN_FORK_BLOCK` so Foundry caches the state.
+
+```
+UNICHAIN_RPC=https://mainnet.unichain.org
+```
+
+Without `UNICHAIN_RPC` every fork test is skipped.
+
+**Run.** `CuratioForkKeeperTest`, `CuratioForkSwapPathTest` and `CuratioForkFindingsTest` inherit the fixture of `CuratioForkTest`, so filter by test name to run only their own tests:
+
+```bash
+# bash
+export FOUNDRY_PROFILE=fork
+forge test --match-path test/fork/CuratioForkTest.t.sol -vv
+forge test --match-path test/fork/CuratioForkKeeperTest.t.sol   --match-test test_keeper -vv
+forge test --match-path test/fork/CuratioForkRealTokensTest.t.sol -vv
+forge test --match-path test/fork/CuratioForkSwapPathTest.t.sol --match-test test_swapPath -vv
+forge test --match-path test/fork/CuratioForkFindingsTest.t.sol --match-test "test_more|test_finding" -vv
+```
+
+```powershell
+# PowerShell
+$env:FOUNDRY_PROFILE = "fork"
+forge test --match-path test/fork/CuratioForkTest.t.sol -vv
+```
+
+Clear the profile afterwards (`unset FOUNDRY_PROFILE` / `Remove-Item Env:FOUNDRY_PROFILE`) so a plain `forge test` goes back to `test/foundry`.
+
+**Not yet covered by fork tests:** USDC blacklist behaviour, and the decimals handling of `mevVolumeThreshold`.
+
 ---
 
 ## Roadmap
 
 **Phase 1: Hardening (current)**
 - [x] Foundry unit, fuzz and end-to-end suite (490 tests, 18 suites)
+- [x] Unichain mainnet-fork suite (41 tests, 5 suites, including real USDC/WETH)
+- [ ] **Fix the three confirmed weaknesses** (default oracle depth, permissionless cardinality growth after wrap, penalty window blocking withdrawals) and flip the `test_finding_*` assertions
+- [ ] Make `mevVolumeThreshold` decimals-aware and cover it with a real-token fork test
 - [ ] **Echidna property-based fuzzing** of the core invariants:
   - Vault: user actions never change the high-water mark; `harvest()` never charges more than the fee rate × gain; a sole depositor's deposit/redeem round trip is exact.
   - Vault: no deposit or mint ever succeeds with zero shares.
