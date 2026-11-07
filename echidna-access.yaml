@@ -4,5 +4,3 @@ testLimit: 50000
 workers: 2
 corpusDir: "echidna-corpus-access"
 coverage: true
-# ✅ এই লাইনটি যোগ করুন
-cryticArgs: ["--ignore-compile"] 

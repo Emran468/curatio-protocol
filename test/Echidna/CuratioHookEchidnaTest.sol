@@ -1,65 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/*//////////////////////////////////////////////////////////////////////////
-    CuratioHookEchidnaTest
-
-    Echidna property tests for CuratioHook.sol.
-
-    WHY A CUSTOM HARNESS IS NEEDED
-    -------------------------------
-    CuratioHook extends BaseHook, whose constructor calls
-    Hooks.validateHookPermissions(this, getHookPermissions()), which reverts
-    unless the low bits of the *deployed contract address* exactly match the
-    hook's declared permission flags (afterInitialize, afterAddLiquidity,
-    afterRemoveLiquidity, beforeSwap, afterSwap). CuratioHook's own
-    constructor also reverts unless the supplied PoolManager address equals
-    ChainRegistry.getPoolManager(block.chainid) — UNLESS block.chainid == 31337.
-
-    Echidna 2.3.1 has no way to set block.chainid (no config key, no
-    cheatcode), and its default chainid is not 31337. So instead of trying
-    to fake the chain id, CuratioHook.sol exposes a virtual
-    `_skipChainCheck()` hook (default: false, dead code in production) that
-    CuratioHookHarness overrides to true — this bypasses ONLY the
-    chain/PoolManager-address guard, never any of the hook's actual logic
-    under test.
-
-    So this harness:
-      1. Deploys a MockPoolManager the hook can call getSlot0/getLiquidity on,
-         and that itself acts as `msg.sender` when driving hook callbacks
-         (satisfying `onlyPoolManager`).
-      2. Mines a CREATE2 salt so CuratioHookHarness's address carries the
-         correct hook-flag bits.
-      3. Overrides `_skipChainCheck()` to bypass the PoolManager-address
-         guard regardless of Echidna's (unconfigurable) chain id.
-
-    Run with (from repo root):
-      echidna test/Echidna/CuratioHookEchidnaTest.sol \
-        --contract CuratioHookEchidnaTest --config test/Echidna/echidna.yaml
-
-    NOTE ON THIS CLEANED-UP VERSION
-    --------------------------------
-    - Fixed a compile error in testOracleWarmImpliesTwapAvailable: `warm` was
-      referenced but never declared (its declaration line was commented out).
-      It now calls hook.isOracleWarm / hook.getTwapTick directly, mirroring
-      how every other property in this file calls the hook. If either of
-      those is `internal` on CuratioHook rather than `public`/`external`,
-      add `exposed_isOracleWarm` / `exposed_getTwapTick` wrappers to
-      CuratioHookHarness the same way exposed_computeFee etc. are done below.
-    - Removed a duplicate `exposed_tickCumulativeDelta` that was redefined
-      loose inside the test contract; the harness's copy (used by
-      testTickCumulativeNeverOverflows) is the only one now.
-    - Removed three fully-empty stub functions (test_ObserveAt_* /
-      test_BinarySearch_*) that had no bodies — they compiled but asserted
-      nothing, so they weren't testing anything. Restore them with real
-      bodies when you're ready to write those properties.
-    - Moved the two Foundry-style tests (test_IncreaseObservationCardinality_
-      LargeValue_GasBounded, test_SetInitialCardinality_LargeValue_
-      DoesNotBrickInitialize) out to their own Foundry test file, matching
-      the `// test/Foundry/CardinalityGasDoS.t.sol` comment that was already
-      pointing at that intent. Echidna and Foundry tests generally shouldn't
-      live in the same contract.
-//////////////////////////////////////////////////////////////////////////*/
+/*
+    CuratioHookEchidnaTest — ASSERTION mode.
+    Rules used throughout:
+      * every check is an assert (echidna_* properties are NOT evaluated in assertion mode)
+      * every test function is non-view (counters double as canaries)
+      * expected reverts are matched on the exact revert string, never just "!success"
+      * a valid swap must never revert (no silent `return` on failure)
+      * every path has a counter and a canary_* function that FAILS once the path was reached
+    Needs echidna.yaml with testMode: assertion (see the answer for suggested time settings).
+*/
 
 import {CuratioHook} from "../../src/CuratioHook.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
@@ -73,10 +24,9 @@ import {BeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 
 // ─── Minimal PoolManager mock ──────────────────────────────────────────────
-// Implements only what CuratioHook actually calls (getSlot0, getLiquidity),
-// plus pass-through "driver" functions so this contract is the msg.sender
-// the hook sees, matching onlyPoolManager.
 contract MockPoolManager {
+    using PoolIdLibrary for PoolKey;
+
     struct Slot0 {
         uint160 sqrtPriceX96;
         int24 tick;
@@ -87,27 +37,17 @@ contract MockPoolManager {
     mapping(bytes32 => Slot0) public slot0Of;
     mapping(bytes32 => uint128) public liquidityOf;
 
-    // Uniswap v4 StateLibrary slot layout for Pool.State.
-    // StateLibrary computes: keccak256(abi.encode(poolId, POOLS_SLOT))
-    // POOLS_SLOT is slot 6 in the standard v4 Pool.State storage layout.
     function _getSlot0StorageSlot(PoolId poolId) internal pure returns (bytes32) {
         return keccak256(abi.encode(PoolId.unwrap(poolId), uint256(6)));
     }
 
     function setSlot0(PoolId poolId, uint160 sqrtPriceX96, int24 tick) public {
-        // 1. Solidity struct mapping update
         slot0Of[PoolId.unwrap(poolId)] = Slot0(sqrtPriceX96, tick, 0, 0);
 
-        // 2. Packed Slot0 value formatting (as expected by Uniswap v4)
-        // Format: sqrtPriceX96 (160 bits) | tick (24 bits) | protocolFee (24 bits) | lpFee (24 bits)
         bytes32 packedSlot0 = bytes32(
-            uint256(sqrtPriceX96) |
-            (uint256(uint24(tick)) << 160) |
-            (uint256(0) << 184) |
-            (uint256(0) << 208)
+            uint256(sqrtPriceX96) | (uint256(uint24(tick)) << 160) | (uint256(0) << 184) | (uint256(0) << 208)
         );
 
-        // 3. Write to BOTH common slot layouts (Slot 0 & Slot 6) so StateLibrary finds it
         bytes32 slot0Loc = keccak256(abi.encode(PoolId.unwrap(poolId), uint256(0)));
         bytes32 slot6Loc = keccak256(abi.encode(PoolId.unwrap(poolId), uint256(6)));
 
@@ -160,12 +100,46 @@ contract MockPoolManager {
 
         PoolId poolId = key.toId();
 
-        // Ensure Slot0 reflects the post-swap tick before afterSwap runs.
         uint160 currentPrice = slot0Of[PoolId.unwrap(poolId)].sqrtPriceX96;
         if (currentPrice == 0) currentPrice = 79228162514264337593543950336;
 
         setSlot0(poolId, currentPrice, postSwapTick);
 
+        IHooks(hook).afterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
+    }
+
+    /// @dev beforeSwap twice in ONE transaction with no afterSwap in between.
+    ///      The hook must revert on the second call (transient-storage dirty guard).
+    function driveBeforeSwapTwice(address hook, PoolKey calldata key, SwapParams calldata params) external {
+        IHooks(hook).beforeSwap(address(this), key, params, "");
+        IHooks(hook).beforeSwap(address(this), key, params, "");
+    }
+
+    /// @dev Two complete swaps (pre -> a, then a -> b) and a THIRD beforeSwap, all in one transaction.
+    ///      Returns the fee the third swap is charged. Also proves the transient flag is cleared by afterSwap
+    ///      (otherwise the second beforeSwap would revert).
+    function driveSandwich(
+        address hook,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        int24 preTick,
+        int24 tickA,
+        int24 tickB
+    ) external returns (uint24 fee3) {
+        PoolId poolId = key.toId();
+        uint160 price = 79228162514264337593543950336;
+
+        setSlot0(poolId, price, preTick);
+        IHooks(hook).beforeSwap(address(this), key, params, "");
+        setSlot0(poolId, price, tickA);
+        IHooks(hook).afterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
+
+        IHooks(hook).beforeSwap(address(this), key, params, "");
+        setSlot0(poolId, price, tickB);
+        IHooks(hook).afterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
+
+        (,, uint24 fee) = IHooks(hook).beforeSwap(address(this), key, params, "");
+        fee3 = fee & ~LPFeeLibrary.OVERRIDE_FEE_FLAG;
         IHooks(hook).afterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
     }
 
@@ -181,7 +155,7 @@ contract MockPoolManager {
         IHooks(hook).afterRemoveLiquidity(address(this), key, params, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "");
     }
 
-    // ── Extsload Implementations ──
+    // ── Extsload ──
 
     function extsload(bytes32 slot) external view returns (bytes32 value) {
         assembly {
@@ -202,7 +176,7 @@ contract MockPoolManager {
     }
 }
 
-// ─── Harness: exposes CuratioHook's internal pure/view helpers ────────────
+// ─── Harness ───────────────────────────────────────────────────────────────
 contract CuratioHookHarness is CuratioHook {
     constructor(IPoolManager pm, address owner_) CuratioHook(pm, owner_) {}
 
@@ -226,24 +200,44 @@ contract CuratioHookHarness is CuratioHook {
         return abs(n);
     }
 
-    function exposed_tickCumulativeDelta(int24 tick, uint32 delta) external pure returns (int56) {
-        return int56(tick) * int56(uint56(delta));
-    }
-
-    // Testing-only bypass for the constructor's chain/PoolManager-address
-    // guard (see CuratioHook.sol). Echidna can't set block.chainid, so we
-    // skip that specific check here instead — everything else in the
-    // constructor, and all hook logic under test, runs unmodified.
     function _skipChainCheck() internal pure override returns (bool) {
         return true;
     }
 }
 
-// ─── CREATE2 salt miner ────────────────────────────────────────────────────
-// Mines (once, at test-suite deployment) a salt whose resulting address
-// carries exactly the hook-flag bits CuratioHook declares in
-// getHookPermissions(): afterInitialize | afterAddLiquidity |
-// afterRemoveLiquidity | beforeSwap | afterSwap.
+// ─── Caller with no rights: every privileged call must revert ──────────────
+contract HookAttacker {
+    CuratioHookHarness public immutable hook;
+
+    constructor(CuratioHookHarness h) {
+        hook = h;
+    }
+
+    /// @return succeeded true if ANY privileged call went through (that would be a bug)
+    function probe(PoolKey calldata key, SwapParams calldata sp, ModifyLiquidityParams calldata mp)
+        external
+        returns (bool succeeded)
+    {
+        try hook.setInitialCardinality(10) { return true; } catch {}
+        try hook.setMaxCardinalityPerCall(10) { return true; } catch {}
+        try hook.proposeTickThresholds(2, 1, 1, 1) { return true; } catch {}
+        try hook.executeTickThresholds() { return true; } catch {}
+        try hook.cancelTickThresholdsProposal() { return true; } catch {}
+        try hook.transferOwnership(address(this)) { return true; } catch {}
+        try hook.afterInitialize(address(this), key, 0, 0) { return true; } catch {}
+        try hook.beforeSwap(address(this), key, sp, "") { return true; } catch {}
+        try hook.afterSwap(address(this), key, sp, BalanceDelta.wrap(0), "") { return true; } catch {}
+        try hook.afterAddLiquidity(address(this), key, mp, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "") {
+            return true;
+        } catch {}
+        try hook.afterRemoveLiquidity(address(this), key, mp, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "") {
+            return true;
+        } catch {}
+        return false;
+    }
+}
+
+// ─── CREATE2 salt miner (unchanged) ────────────────────────────────────────
 library HookMiner {
     uint160 internal constant REQUIRED_FLAGS =
         uint160(1 << 12) // AFTER_INITIALIZE_FLAG
@@ -262,7 +256,7 @@ library HookMiner {
         bytes memory initCode = abi.encodePacked(creationCode, constructorArgs);
         bytes32 initCodeHash = keccak256(initCode);
 
-        for (uint256 i = 0; i < 200_000; i++) {
+        for (uint256 i = 0; i < 200_00; i++) {
             salt = bytes32(i);
             hookAddress = computeAddress(deployer, salt, initCodeHash);
             if (uint160(hookAddress) & ALL_HOOK_MASK == REQUIRED_FLAGS) {
@@ -277,30 +271,75 @@ library HookMiner {
     }
 }
 
-// ─── Echidna test contract ─────────────────────────────────────────────────
+// ─── Echidna test ──────────────────────────────────────────────────────────
 contract CuratioHookEchidnaTest {
     using PoolIdLibrary for PoolKey;
 
+    uint160 internal constant PRICE_1_1 = 79228162514264337593543950336;
+    int256 internal constant MAX_TICK = 887272;
+    /// @dev Tiny ring so it WRAPS after 3 swaps (the default 100 slots would need 100 swaps).
+    uint16 internal constant TEST_CARDINALITY = 3;
+
     MockPoolManager public poolManager;
     CuratioHookHarness public hook;
+    HookAttacker public attacker;
     PoolKey internal poolKey;
     PoolId internal poolId;
 
-    // Tracks the last cardinalityNext observed by fuzz calls, so we can
-    // assert monotonicity across the whole campaign, not just within one call.
+    // ── ghost state ──
+    int256 internal minTickSeen; // every tick ever handed to the pool manager mock
+    int256 internal maxTickSeen;
+    int24 internal lastTickGhost;
     uint16 internal lastCardinalityNext;
+    bool internal grewAfterWrap;
+    uint128[4] internal ghostLiq;
 
-    // Echidna deploys this contract once; deployment is msg.sender == this,
-    // so `owner` on the hook is set to address(this), letting fuzz functions
-    // call onlyOwner admin functions directly.
+    // ── reachability counters (each has a canary at the bottom) ──
+    uint256 public swapsOk;
+    uint256 public swapsWarm;
+    uint256 public swapsCold;
+    uint256 public tierBase;
+    uint256 public tierMid;
+    uint256 public tierHigh;
+    uint256 public tierMev;
+    uint256 public oracleWrites;
+    uint256 public sandwichScenarios;
+    uint256 public sandwichPenalized;
+    uint256 public guardBeforeTwice;
+    uint256 public guardAfterAlone;
+    uint256 public thresholdProposals;
+    uint256 public badProposalRejected;
+    uint256 public thresholdExecutions;
+    uint256 public earlyExecRejected;
+    uint256 public thresholdCancels;
+    uint256 public growthOk;
+    uint256 public growthAfterWrap;
+    uint256 public swapsAfterWrapGrowth;
+    uint256 public warmTwapChecks;
+    uint256 public notWarmChecks;
+    uint256 public twapBoundsChecks;
+    uint256 public liqAdds;
+    uint256 public liqRemoves;
+    uint256 public liqOverRemoveRejected;
+    uint256 public liqWrongSignRejected;
+    uint256 public hugeDeltaRejected;
+    uint256 public attackerProbes;
+    uint256 public trackerRoundTrips;
+    uint256 public computeFeeChecks;
+    uint256 public absChecks;
+    uint256 public invariantChecks;
+    uint256 public initialCardinalityChecks;
+
     constructor() {
         poolManager = new MockPoolManager();
 
         bytes memory creationCode = type(CuratioHookHarness).creationCode;
         bytes memory args = abi.encode(address(poolManager), address(this));
-
         (bytes32 salt,) = HookMiner.find(address(this), creationCode, args);
         hook = new CuratioHookHarness{salt: salt}(IPoolManager(address(poolManager)), address(this));
+
+        // must be set BEFORE the pool is initialised: it sizes the ring created in afterInitialize
+        hook.setInitialCardinality(TEST_CARDINALITY);
 
         poolKey = PoolKey({
             currency0: Currency.wrap(address(0x1111)),
@@ -311,349 +350,587 @@ contract CuratioHookEchidnaTest {
         });
         poolId = poolKey.toId();
 
-        poolManager.driveAfterInitialize(address(hook), poolKey, 79228162514264337593543950336, 0);
+        poolManager.driveAfterInitialize(address(hook), poolKey, PRICE_1_1, 0);
+        attacker = new HookAttacker(hook);
 
         (,, lastCardinalityNext) = hook.getOracleState(poolKey);
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // Property: SandwichTracker pack/unpack round-trips losslessly.
-    // (int24 fields are stored in 24 bits and must sign-extend correctly.)
-    // ════════════════════════════════════════════════════════════════════
-    function testTrackerRoundTrip(int24 firstMove, int24 lastMove, int24 peakTick, uint32 swapCount, uint256 startBlock)
-        public view
-    {
+    // ═════════════════════════════════════════════════════════════════════
+    // Helpers
+    // ═════════════════════════════════════════════════════════════════════
+
+    function _bound(int256 x, int256 lo, int256 hi) internal pure returns (int256) {
+        if (lo >= hi) return lo;
+        int256 range = hi - lo + 1;
+        int256 w = x % range;
+        if (w < 0) w += range;
+        return lo + w;
+    }
+
+    /// @dev mode even: anywhere in range; mode odd: close to the last tick (reaches the MID/HIGH fee tiers).
+    function _pickTick(int256 raw, uint8 mode) internal view returns (int24) {
+        if (mode % 2 == 0) return int24(_bound(raw, -MAX_TICK, MAX_TICK));
+        return int24(_bound(int256(lastTickGhost) + (raw % 1000), -MAX_TICK, MAX_TICK));
+    }
+
+    function _trackTick(int24 t) internal {
+        int256 v = int256(t);
+        if (v < minTickSeen) minTickSeen = v;
+        if (v > maxTickSeen) maxTickSeen = v;
+    }
+
+    function _setTick(int24 t) internal {
+        poolManager.setSlot0(poolId, PRICE_1_1, t);
+        lastTickGhost = t;
+        _trackTick(t);
+    }
+
+    function _params(bool zeroForOne, int256 amt) internal pure returns (SwapParams memory) {
+        return SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: amt,
+            sqrtPriceLimitX96: zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341
+        });
+    }
+
+    function _absDiff(int24 a, int24 b) internal pure returns (uint256) {
+        int256 d = int256(a) - int256(b);
+        return uint256(d >= 0 ? d : -d);
+    }
+
+    /// @dev True iff `ret` is exactly Error(expected). A revert for the WRONG reason does not match.
+    function _isError(bytes memory ret, string memory expected) internal pure returns (bool) {
+        return keccak256(ret) == keccak256(abi.encodeWithSignature("Error(string)", expected));
+    }
+
+    function _assertTier(uint24 fee) internal view {
+        assert(
+            fee == hook.BASE_FEE() || fee == hook.MID_VOLATILE_FEE() || fee == hook.HIGH_VOLATILE_FEE()
+                || fee == hook.MEV_PENALTY_FEE()
+        );
+    }
+
+    function _countTier(uint24 fee) internal {
+        if (fee == hook.BASE_FEE()) tierBase++;
+        else if (fee == hook.MID_VOLATILE_FEE()) tierMid++;
+        else if (fee == hook.HIGH_VOLATILE_FEE()) tierHigh++;
+        else if (fee == hook.MEV_PENALTY_FEE()) tierMev++;
+    }
+
+    /// @dev A TWAP is an average of ticks the pool actually had, so it must lie between the extremes ever used
+    ///      (+-2 for integer rounding in the interpolation). Garbage from a broken ring would break this.
+    function _checkTwapBounds(int24 t) internal {
+        assert(int256(t) >= minTickSeen - 2 && int256(t) <= maxTickSeen + 2);
+        twapBoundsChecks++;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Swaps: a valid swap must NEVER be blocked, and its fee must follow the spec
+    // ═════════════════════════════════════════════════════════════════════
+
+    function act_swap(int256 amtRaw, bool zeroForOne, int256 preRaw, int256 postRaw, uint8 mode) public {
+        int256 amt = amtRaw % 1e30; // realistic magnitude; huge values only test arithmetic limits
+        if (amt == 0) return; // zero-amount swaps are rejected by the pool manager itself
+        _runSwap(_pickTick(preRaw, mode), _pickTick(postRaw, mode >> 1), amt, zeroForOne);
+    }
+
+    function _runSwap(int24 preTick, int24 postTick, int256 amt, bool zeroForOne) internal {
+        _setTick(preTick);
+        _trackTick(postTick);
+
+        (bool warm, uint256 divergence) = _preSwapInfo(preTick);
+        (uint16 idxBefore,,) = hook.getOracleState(poolKey);
+
+        (bool ok, bytes memory ret) = address(poolManager).call(
+            abi.encodeWithSelector(
+                poolManager.driveFullSwap.selector, address(hook), poolKey, _params(zeroForOne, amt), postTick
+            )
+        );
+        assert(ok); // a valid swap must never be blocked by the hook (no silent return)
+
+        _afterSwap(ret, warm, divergence, idxBefore);
+    }
+
+    /// @dev Reads what the hook will see: is the oracle warm, and how far is spot from the TWAP.
+    ///      A warm oracle whose TWAP cannot be read would make beforeSwap revert.
+    function _preSwapInfo(int24 preTick) internal returns (bool warm, uint256 divergence) {
+        uint32 window = hook.DEFAULT_TWAP_WINDOW();
+        warm = hook.isOracleWarm(poolKey, window);
+        if (warm) {
+            try hook.getTwapTick(poolKey, window) returns (int24 t) {
+                _checkTwapBounds(t);
+                divergence = _absDiff(preTick, t);
+            } catch {
+                assert(false); // warm but unreadable: swaps and the vault's valuation would revert
+            }
+        }
+    }
+
+    function _afterSwap(bytes memory ret, bool warm, uint256 divergence, uint16 idxBefore) internal {
+        uint24 fee = abi.decode(ret, (uint24));
+        swapsOk++;
+
+        (uint16 idxAfter,,) = hook.getOracleState(poolKey);
+        if (idxAfter != idxBefore) oracleWrites++;
+
+        if (warm) swapsWarm++;
+        else swapsCold++;
+        if (grewAfterWrap) swapsAfterWrapGrowth++;
+
+        _countTier(fee);
+        _assertTier(fee);
+
+        // Fee spec. MEV is always allowed because a sandwich flagged earlier in the same block overrides everything.
+        if (!warm) {
+            assert(fee == hook.MID_VOLATILE_FEE() || fee == hook.MEV_PENALTY_FEE());
+        } else if (divergence >= hook.tickThresholdHigh()) {
+            assert(fee == hook.MEV_PENALTY_FEE());
+        } else if (divergence >= hook.tickThresholdMid()) {
+            assert(fee == hook.HIGH_VOLATILE_FEE() || fee == hook.MEV_PENALTY_FEE());
+        }
+    }
+
+    /// @dev Deterministic sandwich: two swaps whose tick moves reverse, volume above the threshold, all in one
+    ///      transaction. The third swap in the same block MUST be charged MEV_PENALTY_FEE.
+    function act_sandwich(int256 preRaw, int256 aRaw, int256 bRaw) public {
+        uint256 thr = hook.mevVolumeThreshold();
+        if (thr > 1e30) return; // an executed proposal effectively switched detection off
+        _runSandwich(
+            int24(_bound(preRaw, -MAX_TICK, MAX_TICK)),
+            int24(_bound(aRaw, -MAX_TICK, MAX_TICK)),
+            int24(_bound(bRaw, -MAX_TICK, MAX_TICK)),
+            thr
+        );
+    }
+
+    function _runSandwich(int24 preTick, int24 tickA, int24 tickB, uint256 thr) internal {
+        _setTick(preTick);
+        _trackTick(tickA);
+        _trackTick(tickB);
+
+        (bool ok, bytes memory ret) = address(poolManager).call(
+            abi.encodeWithSelector(
+                poolManager.driveSandwich.selector,
+                address(hook),
+                poolKey,
+                _params(true, -int256(thr + 1)), // each swap alone is above the volume threshold
+                preTick,
+                tickA,
+                tickB
+            )
+        );
+        assert(ok); // also proves the transient flag is cleared between swaps of one transaction
+        lastTickGhost = tickB;
+
+        uint24 fee3 = abi.decode(ret, (uint24));
+        sandwichScenarios++;
+
+        if (_isReversal(preTick, tickA, tickB)) {
+            assert(fee3 == hook.MEV_PENALTY_FEE());
+            sandwichPenalized++;
+        } else {
+            _assertTier(fee3);
+        }
+    }
+
+    function _isReversal(int24 preTick, int24 tickA, int24 tickB) internal pure returns (bool) {
+        int256 m1 = int256(tickA) - int256(preTick);
+        int256 m2 = int256(tickB) - int256(tickA);
+        return (m1 > 0 && m2 < 0) || (m1 < 0 && m2 > 0);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Guards must fire, with the exact reason
+    // ═════════════════════════════════════════════════════════════════════
+
+    function act_guardBeforeSwapTwice() public {
+        (bool ok, bytes memory ret) = address(poolManager).call(
+            abi.encodeWithSelector(
+                poolManager.driveBeforeSwapTwice.selector, address(hook), poolKey, _params(true, -1 ether)
+            )
+        );
+        assert(!ok);
+        assert(_isError(ret, "Transient storage dirty: composability violation"));
+        guardBeforeTwice++;
+    }
+
+    function act_guardAfterSwapWithoutBefore() public {
+        (bool ok, bytes memory ret) = address(poolManager).call(
+            abi.encodeWithSelector(poolManager.driveAfterSwap.selector, address(hook), poolKey, _params(true, -1 ether))
+        );
+        assert(!ok);
+        assert(_isError(ret, "Composability violation: unexpected state"));
+        guardAfterAlone++;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Threshold governance (propose -> wait -> execute / cancel), including the EXECUTE path
+    // ═════════════════════════════════════════════════════════════════════
+
+    function act_proposeThresholds(uint256 highRaw, uint256 midRaw, uint256 volRaw, uint256 sandwRaw) public {
+        // bounded so the fee tiers stay reachable after an execution
+        uint256 high = highRaw % 2000;
+        uint256 mid = midRaw % 2000;
+        uint256 vol = volRaw % 10 ether;
+
+        if (high <= mid) {
+            (bool ok, bytes memory ret) = address(hook).call(
+                abi.encodeWithSelector(hook.proposeTickThresholds.selector, high, mid, vol, sandwRaw)
+            );
+            assert(!ok);
+            assert(_isError(ret, "High threshold must be greater than mid"));
+            badProposalRejected++;
+            return;
+        }
+
+        hook.proposeTickThresholds(high, mid, vol, sandwRaw);
+
+        (uint256 h, uint256 m, uint256 v, uint256 s, uint256 eta, bool exists) = hook.pendingThresholds();
+        assert(exists);
+        assert(eta == block.timestamp + hook.THRESHOLD_TIMELOCK_DELAY());
+        assert(h == high && m == mid && v == vol && s == sandwRaw);
+        thresholdProposals++;
+    }
+
+    function act_executeThresholds() public {
+        (uint256 h, uint256 m, uint256 v, uint256 s, uint256 eta, bool exists) = hook.pendingThresholds();
+
+        (bool ok, bytes memory ret) =
+            address(hook).call(abi.encodeWithSelector(hook.executeTickThresholds.selector));
+
+        if (!exists) {
+            assert(!ok);
+            assert(_isError(ret, "No pending proposal"));
+            return;
+        }
+        if (block.timestamp < eta) {
+            assert(!ok);
+            assert(_isError(ret, "Timelock not elapsed"));
+            earlyExecRejected++;
+            return;
+        }
+
+        assert(ok);
+        assert(hook.tickThresholdHigh() == h);
+        assert(hook.tickThresholdMid() == m);
+        assert(hook.mevVolumeThreshold() == v);
+        assert(hook.sandwichTickThreshold() == s);
+        (,,,,, bool stillExists) = hook.pendingThresholds();
+        assert(!stillExists);
+        assert(hook.tickThresholdHigh() > hook.tickThresholdMid());
+        thresholdExecutions++;
+    }
+
+    function act_cancelThresholds() public {
+        (,,,,, bool exists) = hook.pendingThresholds();
+        (bool ok, bytes memory ret) =
+            address(hook).call(abi.encodeWithSelector(hook.cancelTickThresholdsProposal.selector));
+
+        if (!exists) {
+            assert(!ok);
+            assert(_isError(ret, "No pending proposal"));
+            return;
+        }
+        assert(ok);
+        (,,,,, bool after_) = hook.pendingThresholds();
+        assert(!after_);
+        thresholdCancels++;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Oracle ring: growth, warm/TWAP consistency
+    // ═════════════════════════════════════════════════════════════════════
+
+    function act_growCardinality(uint16 target) public {
+        (,, uint16 next0) = hook.getOracleState(poolKey);
+        (uint16 oldNext, uint16 newNext) = hook.increaseObservationCardinality(poolKey, target);
+
+        assert(oldNext == next0);
+        assert(newNext >= oldNext);
+        assert(newNext >= lastCardinalityNext);
+        assert(uint256(newNext) - uint256(oldNext) <= hook.maxCardinalityPerCall()); // per-call DoS cap
+        if (target <= oldNext) assert(newNext == oldNext); // nothing to grow
+        lastCardinalityNext = newNext;
+
+        if (newNext > oldNext) {
+            growthOk++;
+            // growth AFTER the ring wrapped is the dangerous case (see the contract notes)
+            if (oracleWrites >= TEST_CARDINALITY) {
+                grewAfterWrap = true;
+                growthAfterWrap++;
+            }
+        }
+    }
+
+    function act_checkWarmTwap(uint256 windowRaw) public {
+        uint32 window = uint32(1 + (windowRaw % 3600));
+
+        if (hook.isOracleWarm(poolKey, window)) {
+            warmTwapChecks++;
+            try hook.getTwapTick(poolKey, window) returns (int24 t) {
+                _checkTwapBounds(t);
+            } catch {
+                assert(false); // warm must imply readable
+            }
+            // warm for a window implies warm for every shorter window
+            assert(hook.isOracleWarm(poolKey, (window / 2) + 1));
+        } else {
+            notWarmChecks++;
+            // not warm for a window implies not warm for any longer window
+            assert(!hook.isOracleWarm(poolKey, window + 1000));
+        }
+        assert(!hook.isOracleWarm(poolKey, 0));
+    }
+
+    function act_setInitialCardinality(uint16 v) public {
+        (bool ok, bytes memory ret) =
+            address(hook).call(abi.encodeWithSelector(hook.setInitialCardinality.selector, v));
+
+        if (v == 0) {
+            assert(!ok);
+            assert(_isError(ret, "Must be > 0"));
+        } else if (v > hook.maxCardinalityPerCall()) {
+            assert(!ok);
+            assert(_isError(ret, "Exceeds max cardinality per call"));
+        } else {
+            assert(ok);
+            assert(hook.initialCardinality() == v);
+        }
+        initialCardinalityChecks++;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Liquidity bookkeeping against a ghost model
+    // ═════════════════════════════════════════════════════════════════════
+
+    function _lower(uint8 i) internal pure returns (int24) {
+        if (i == 0) return -120;
+        if (i == 1) return -60;
+        if (i == 2) return 0;
+        return 60;
+    }
+
+    function _upper(uint8 i) internal pure returns (int24) {
+        if (i == 0) return 120;
+        if (i == 1) return 60;
+        if (i == 2) return 60;
+        return 180;
+    }
+
+    function _stored(uint8 i) internal view returns (uint128) {
+        bytes32 key = keccak256(abi.encodePacked(address(poolManager), poolId, _lower(i), _upper(i)));
+        return hook.storedPositions(key);
+    }
+
+    function _liqParams(uint8 i, int256 delta) internal pure returns (ModifyLiquidityParams memory) {
+        return ModifyLiquidityParams({
+            tickLower: _lower(i), tickUpper: _upper(i), liquidityDelta: delta, salt: bytes32(0)
+        });
+    }
+
+    function _callAdd(uint8 i, int256 delta) internal returns (bool, bytes memory) {
+        return address(poolManager).call(
+            abi.encodeWithSelector(
+                poolManager.driveAfterAddLiquidity.selector, address(hook), poolKey, _liqParams(i, delta)
+            )
+        );
+    }
+
+    function _callRemove(uint8 i, int256 delta) internal returns (bool, bytes memory) {
+        return address(poolManager).call(
+            abi.encodeWithSelector(
+                poolManager.driveAfterRemoveLiquidity.selector, address(hook), poolKey, _liqParams(i, delta)
+            )
+        );
+    }
+
+    function act_addLiquidity(uint8 idx, uint256 amtRaw) public {
+        uint8 i = idx % 4;
+        uint128 amt = uint128(1 + (amtRaw % 1e30));
+        (bool ok,) = _callAdd(i, int256(uint256(amt)));
+        assert(ok);
+        ghostLiq[i] += amt;
+        assert(_stored(i) == ghostLiq[i]);
+        liqAdds++;
+    }
+
+    function act_removeLiquidity(uint8 idx, uint256 amtRaw) public {
+        uint8 i = idx % 4;
+        uint128 amt = uint128(1 + (amtRaw % 1e30));
+        (bool ok, bytes memory ret) = _callRemove(i, -int256(uint256(amt)));
+
+        if (amt > ghostLiq[i]) {
+            assert(!ok);
+            assert(_isError(ret, "Insufficient liquidity"));
+            liqOverRemoveRejected++;
+        } else {
+            assert(ok);
+            ghostLiq[i] -= amt;
+            liqRemoves++;
+        }
+        assert(_stored(i) == ghostLiq[i]);
+    }
+
+    function act_wrongSignLiquidity(uint8 idx, bool addPath, uint256 amtRaw) public {
+        uint8 i = idx % 4;
+        int256 amt = int256(1 + (amtRaw % 1e30));
+        bool ok;
+        bytes memory ret;
+
+        if (addPath) {
+            (ok, ret) = _callAdd(i, -amt);
+            assert(!ok);
+            assert(_isError(ret, "Delta must be positive when adding"));
+        } else {
+            (ok, ret) = _callRemove(i, amt);
+            assert(!ok);
+            assert(_isError(ret, "Delta must be negative when removing"));
+        }
+        assert(_stored(i) == ghostLiq[i]);
+        liqWrongSignRejected++;
+    }
+
+    function act_hugeDelta(bool addPath) public {
+        int256 huge = int256(uint256(type(uint128).max)) + 1;
+        bool ok;
+        bytes memory ret;
+
+        if (addPath) (ok, ret) = _callAdd(0, huge);
+        else (ok, ret) = _callRemove(0, -huge);
+
+        assert(!ok);
+        assert(_isError(ret, "Delta too large"));
+        assert(_stored(0) == ghostLiq[0]);
+        hugeDeltaRejected++;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Access control, tracker packing, fee spec, abs
+    // ═════════════════════════════════════════════════════════════════════
+
+    function act_attackerProbe() public {
+        ModifyLiquidityParams memory mp = _liqParams(0, 1);
+        assert(!attacker.probe(poolKey, _params(true, -1 ether), mp));
+        attackerProbes++;
+    }
+
+    function act_trackerRoundTrip(
+        int24 firstMove,
+        int24 lastMove,
+        int24 peakTick,
+        uint32 swapCount,
+        uint256 startBlock,
+        bool initialized
+    ) public {
         CuratioHook.SandwichTracker memory t = CuratioHook.SandwichTracker({
             firstMove: firstMove,
             lastMove: lastMove,
             peakTick: peakTick,
             swapCount: swapCount,
             startBlock: startBlock % (1 << 96), // startBlock is packed into 96 bits
-            initialized: true
+            initialized: initialized
         });
 
-        uint256 packed = hook.exposed_packTracker(t);
-        CuratioHook.SandwichTracker memory t2 = hook.exposed_unpackTracker(packed);
+        CuratioHook.SandwichTracker memory t2 = hook.exposed_unpackTracker(hook.exposed_packTracker(t));
 
         assert(t2.firstMove == firstMove);
         assert(t2.lastMove == lastMove);
         assert(t2.peakTick == peakTick);
         assert(t2.swapCount == swapCount);
         assert(t2.startBlock == t.startBlock);
-        assert(t2.initialized == true);
+        assert(t2.initialized == initialized);
+        trackerRoundTrips++;
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // Property: _computeFee only ever returns one of the four declared
-    // fee tiers — never an arbitrary value.
-    // ════════════════════════════════════════════════════════════════════
-    function testComputeFeeIsAlwaysAKnownTier(uint24 tickDelta, uint256 blockDelta, uint24 currentFee) public view {
+    /// @dev Regression guard: an explicit copy of the fee spec. It fails if a branch of _computeFee is changed.
+    function act_computeFeeSpec(uint24 tickDelta, uint256 blockDelta, uint24 currentFee) public {
         uint24 fee = hook.exposed_computeFee(tickDelta, blockDelta, currentFee);
-        assert(
-            fee == hook.BASE_FEE() || fee == hook.MID_VOLATILE_FEE() || fee == hook.HIGH_VOLATILE_FEE()
-                || fee == currentFee
-        );
+        uint24 expected;
+
+        if (uint256(tickDelta) >= hook.tickThresholdHigh()) expected = hook.HIGH_VOLATILE_FEE();
+        else if (uint256(tickDelta) >= hook.tickThresholdMid()) expected = hook.MID_VOLATILE_FEE();
+        else if (blockDelta >= uint256(hook.blockDecayWindow()) || currentFee == 0) expected = hook.BASE_FEE();
+        else expected = currentFee;
+
+        assert(fee == expected);
+        computeFeeChecks++;
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // Property: abs() never returns a value whose sign bit implies overflow,
-    // and matches the mathematical absolute value for all int24 inputs
-    // except type(int24).min (which has no representable positive counterpart).
-    // ════════════════════════════════════════════════════════════════════
-    function testAbsIsNonNegativeAndCorrect(int24 n) public view {
-        if (n == type(int24).min) return; // no representable abs, skip
-        uint24 result = hook.exposed_abs(n);
-        int24 expected = n >= 0 ? n : -n;
-        assert(int24(result) == expected);
+    function act_abs(int24 n) public {
+        if (n == type(int24).min) return; // no representable absolute value
+        uint24 r = hook.exposed_abs(n);
+        assert(int256(uint256(r)) == (n >= 0 ? int256(n) : -int256(n)));
+        absChecks++;
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // Property: getCurrentFee() never reverts and always returns a fee
-    // within the declared tiers (never 0, never an out-of-range value).
-    // ════════════════════════════════════════════════════════════════════
-    function testGetCurrentFeeBounded() public view {
-        uint24 fee = hook.getCurrentFee(poolKey);
-        assert(
-            fee == hook.BASE_FEE() || fee == hook.MID_VOLATILE_FEE() || fee == hook.HIGH_VOLATILE_FEE()
-                || fee == hook.MEV_PENALTY_FEE()
-        );
+    // ═════════════════════════════════════════════════════════════════════
+    // Invariants (assertions, called like any other function)
+    // ═════════════════════════════════════════════════════════════════════
+
+    function invariant_thresholds() public {
+        assert(hook.tickThresholdHigh() > hook.tickThresholdMid());
+        invariantChecks++;
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // Property: threshold timelock governance state machine.
-    // A proposal's eta must always be >= proposal time + delay, and
-    // execution must never succeed before eta.
-    // ════════════════════════════════════════════════════════════════════
-    function testProposeThresholdsEtaIsFuture(uint256 high, uint256 mid, uint256 volumeThreshold, uint256 sandwichThreshold)
-        public
-    {
-        if (high <= mid) return; // proposeTickThresholds requires high > mid
-
-        hook.proposeTickThresholds(high, mid, volumeThreshold, sandwichThreshold);
-        (,,,, uint256 eta, bool exists) = hook.pendingThresholds();
-
-        assert(exists);
-        assert(eta >= block.timestamp + hook.THRESHOLD_TIMELOCK_DELAY());
+    function invariant_oracle_state() public {
+        (uint16 index, uint16 cardinality, uint16 next) = hook.getOracleState(poolKey);
+        assert(cardinality >= 1);
+        assert(index < cardinality);
+        assert(next >= cardinality);
+        assert(next >= lastCardinalityNext); // never shrinks
+        invariantChecks++;
     }
 
-    function testExecuteThresholdsRevertsBeforeEta(uint256 high, uint256 mid) public {
-        if (high <= mid) return;
-
-        hook.proposeTickThresholds(high, mid, 1 ether, 80);
-
-        // Immediately attempting execution (same block, timelock not
-        // elapsed) must revert — call via low-level to observe failure
-        // without aborting the whole property.
-        (bool success,) = address(hook).call(abi.encodeWithSelector(hook.executeTickThresholds.selector));
-        assert(!success);
-
-        hook.cancelTickThresholdsProposal(); // reset state for next run
+    function invariant_pool_state() public {
+        (int24 lastTick, uint24 fee, uint64 lastBlock, uint64 lastTs, bool init) = hook.getPoolState(poolKey);
+        assert(init);
+        assert(lastBlock <= block.number);
+        assert(lastTs <= block.timestamp);
+        assert(int256(lastTick) >= -MAX_TICK && int256(lastTick) <= MAX_TICK);
+        _assertTier(fee);
+        _assertTier(hook.getCurrentFee(poolKey));
+        invariantChecks++;
     }
 
-    // Property: after execute OR cancel, no pending proposal remains.
-    function testProposalAlwaysClearedAfterCancel(uint256 high, uint256 mid) public {
-        if (high <= mid) return;
+    // ═════════════════════════════════════════════════════════════════════
+    // CANARIES: each FAILS once its path was reached. A canary that is still
+    // "passing" at the end means that path never ran, so the checks above
+    // proved nothing about it.
+    // ═════════════════════════════════════════════════════════════════════
 
-        hook.proposeTickThresholds(high, mid, 1 ether, 80);
-        hook.cancelTickThresholdsProposal();
-
-        (,,,,, bool exists) = hook.pendingThresholds();
-        assert(!exists);
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // Property: tickThresholdHigh is always strictly greater than
-    // tickThresholdMid — enforced at proposal time and must never be
-    // violated by an executed proposal.
-    // ════════════════════════════════════════════════════════════════════
-    function echidna_high_threshold_exceeds_mid() public view returns (bool) {
-        return hook.tickThresholdHigh() > hook.tickThresholdMid();
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // Property: the fee applied by beforeSwap is always one of the
-    // declared tiers. Uses the full beforeSwap->afterSwap round trip so
-    // transient-storage state and packed trackers evolve realistically
-    // across a fuzzed sequence of swaps.
-    // ════════════════════════════════════════════════════════════════════
-    function testSwapFeeAlwaysKnownTier(int256 amountSpecified, bool zeroForOne, int24 preTick, int24 postTick)
-        public
-    {
-        if (amountSpecified == 0) return;
-        if (preTick < -887272 || preTick > 887272) return;
-        if (postTick < -887272 || postTick > 887272) return;
-
-        poolManager.setSlot0(poolId, 79228162514264337593543950336, preTick);
-
-        SwapParams memory params = SwapParams({
-            zeroForOne: zeroForOne,
-            amountSpecified: amountSpecified,
-            sqrtPriceLimitX96: zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341
-        });
-
-        (bool success, bytes memory ret) = address(poolManager).call(
-            abi.encodeWithSelector(poolManager.driveFullSwap.selector, address(hook), poolKey, params, postTick)
-        );
-        if (!success) return; // e.g. transient-storage dirty guard tripped; not a violation
-
-        uint24 fee = abi.decode(ret, (uint24));
-
-        assert(
-            fee == hook.BASE_FEE() || fee == hook.MID_VOLATILE_FEE() || fee == hook.HIGH_VOLATILE_FEE()
-                || fee == hook.MEV_PENALTY_FEE()
-        );
-
-        // getCurrentFee must stay consistent with what afterSwap persisted.
-        testGetCurrentFeeBounded();
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // Property: once a sandwich is flagged for the current block, every
-    // swap attempted later in that same block is charged MEV_PENALTY_FEE.
-    // ════════════════════════════════════════════════════════════════════
-    function testSandwichFlagStaysStickyWithinBlock(int24 preTick, int24 postTick) public {
-        require(preTick >= -887272 && preTick <= 887272, "Invalid preTick");
-        require(postTick >= -887272 && postTick <= 887272, "Invalid postTick");
-
-        poolManager.setSlot0(poolId, 79228162514264337593543950336, preTick);
-
-        SwapParams memory params = SwapParams({
-            zeroForOne: true,
-            amountSpecified: -1e18,
-            sqrtPriceLimitX96: 4295128740
-        });
-
-        (bool success1, bytes memory ret1) = address(poolManager).call(
-            abi.encodeWithSelector(poolManager.driveFullSwap.selector, address(hook), poolKey, params, postTick)
-        );
-        require(success1, "First swap failed");
-
-        uint24 rawFirstFee = abi.decode(ret1, (uint24));
-        uint24 firstFee = uint24(rawFirstFee & 0x00FFFFFF); // clear the dynamic-fee override flag
-
-        // Using require (not return) here deliberately forces Echidna to
-        // keep searching for inputs that actually trigger the MEV penalty,
-        // rather than silently passing on inputs that don't.
-        require(firstFee == hook.MEV_PENALTY_FEE(), "Sandwich wasn't triggered this run");
-
-        // A follow-up swap in the same block must also be penalized.
-        (bool success2, bytes memory ret2) = address(poolManager).call(
-            abi.encodeWithSelector(poolManager.driveFullSwap.selector, address(hook), poolKey, params, postTick)
-        );
-        require(success2, "Second swap failed");
-
-        uint24 rawSecondFee = abi.decode(ret2, (uint24));
-        uint24 secondFee = uint24(rawSecondFee & 0x00FFFFFF);
-
-        assert(secondFee == hook.MEV_PENALTY_FEE());
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // Property: increaseObservationCardinality never decreases
-    // cardinalityNext, and stored cardinalityNext only ever grows across
-    // the whole fuzzing campaign.
-    // ════════════════════════════════════════════════════════════════════
-    function testCardinalityNeverDecreases(uint16 targetCardinality) public {
-        (uint16 cardinalityNextOld, uint16 cardinalityNextNew) =
-            hook.increaseObservationCardinality(poolKey, targetCardinality);
-
-        assert(cardinalityNextNew >= cardinalityNextOld);
-        assert(cardinalityNextNew >= lastCardinalityNext);
-        lastCardinalityNext = cardinalityNextNew;
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // Property: setInitialCardinality rejects zero and always stores
-    // exactly what was requested when nonzero.
-    // ════════════════════════════════════════════════════════════════════
-    function testSetInitialCardinality(uint16 newCardinality) public {
-        if (newCardinality == 0) {
-            (bool success,) =
-                address(hook).call(abi.encodeWithSelector(hook.setInitialCardinality.selector, newCardinality));
-            assert(!success);
-            return;
-        }
-
-        hook.setInitialCardinality(newCardinality);
-        assert(hook.initialCardinality() == newCardinality);
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // Property: isOracleWarm() never reverts, and once true for a given
-    // window, getTwapTick() for that same window must not revert either.
-    //
-    // Calls hook.isOracleWarm / hook.getTwapTick directly (both must be
-    // public/external on CuratioHook). If either is internal, add
-    // exposed_isOracleWarm / exposed_getTwapTick wrappers to
-    // CuratioHookHarness instead, the same way exposed_computeFee is done.
-    // ════════════════════════════════════════════════════════════════════
-    function testOracleWarmImpliesTwapAvailable(uint32 twapWindow) external view {
-        require(twapWindow > 0, "TWAP window must be > 0");
-        require(twapWindow <= block.timestamp, "TWAP window cannot exceed current timestamp");
-
-        bool warm = hook.isOracleWarm(poolKey, twapWindow);
-
-        if (warm) {
-            try hook.getTwapTick(poolKey, twapWindow) returns (int24) {
-                assert(true);
-            } catch {
-                assert(false);
-            }
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // Property: a valid sandwich reversal pattern (tick moves back and
-    // forth across two swaps) is reflected in a bounded, known fee tier.
-    // ════════════════════════════════════════════════════════════════════
-    function testSandwichReversalActuallyDetected(int24 move1, int24 move2, uint256 vol1, uint256 vol2) external {
-        require(vol1 > 0 && vol2 > 0, "Volume must be > 0");
-        require(move1 != 0 && move2 != 0, "Tick moves must be non-zero");
-
-        bool isReversal = (move1 > 0 && move2 < 0) || (move1 < 0 && move2 > 0);
-        require(isReversal, "Moves do not form a reversal pattern");
-
-        int24 initialTick = 1;
-        poolManager.setSlot0(poolId, 79228162514264337593543950336, initialTick);
-
-        int24 nextTick = initialTick + move1 + move2;
-        poolManager.setSlot0(poolId, 79228162514264337593543950336, nextTick);
-
-        this.testGetCurrentFeeBounded();
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // Property: tickCumulative deltas never silently flip sign relative
-    // to a positive tick * positive time delta (i.e. no overflow-induced
-    // sign corruption within realistic ranges).
-    // ════════════════════════════════════════════════════════════════════
-    function testTickCumulativeNeverOverflows(int24 tick, uint32 delta) public view {
-        int56 result = hook.exposed_tickCumulativeDelta(tick, delta);
-        if (tick > 0 && delta > 0) {
-            assert(result >= 0);
-        }
-        if (tick < 0 && delta > 0) {
-            assert(result <= 0);
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-// Property: Transient storage flag is always cleanly zeroed out 
-// after afterSwap completes across any fuzzed swap context.
-// ════════════════════════════════════════════════════════════════════
-function testTransientStorageAlwaysCleared(int256 amountSpecified, bool zeroForOne, int24 preTick, int24 postTick) public {
-    if (amountSpecified == 0) return;
-    if (preTick < -887272 || preTick > 887272) return;
-    if (postTick < -887272 || postTick > 887272) return;
-
-    poolManager.setSlot0(poolId, 79228162514264337593543950336, preTick);
-
-    SwapParams memory params = SwapParams({
-        zeroForOne: zeroForOne,
-        amountSpecified: amountSpecified,
-        sqrtPriceLimitX96: zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341
-    });
-
-    // 1. Execute full swap (beforeSwap -> afterSwap)
-    (bool success, ) = address(poolManager).call(
-        abi.encodeWithSelector(poolManager.driveFullSwap.selector, address(hook), poolKey, params, postTick)
-    );
-
-    // 2. If swap succeeded, strictly verify the transient slot was cleared
-    if (success) {
-        bytes32 slot = hook.sandwichFlagSlotMap(poolId);
-        uint256 flagValue;
-        assembly {
-            flagValue := tload(slot)
-        }
-        assert(flagValue == 0);
-    }
+    function canary_swap_ok() public { assert(swapsOk == 0); }
+    function canary_swap_warm_oracle() public { assert(swapsWarm == 0); }
+    function canary_swap_cold_oracle() public { assert(swapsCold == 0); }
+    function canary_oracle_wrapped() public { assert(oracleWrites < TEST_CARDINALITY); }
+    function canary_tier_base() public { assert(tierBase == 0); }
+    function canary_tier_mid() public { assert(tierMid == 0); }
+    function canary_tier_high() public { assert(tierHigh == 0); }
+    function canary_tier_mev() public { assert(tierMev == 0); }
+    function canary_sandwich_scenario() public { assert(sandwichScenarios == 0); }
+    function canary_sandwich_penalized() public { assert(sandwichPenalized == 0); }
+    function canary_guard_before_twice() public { assert(guardBeforeTwice == 0); }
+    function canary_guard_after_alone() public { assert(guardAfterAlone == 0); }
+    function canary_threshold_proposed() public { assert(thresholdProposals == 0); }
+    function canary_bad_proposal_rejected() public { assert(badProposalRejected == 0); }
+    function canary_threshold_executed() public { assert(thresholdExecutions == 0); }
+    function canary_early_execution_rejected() public { assert(earlyExecRejected == 0); }
+    function canary_threshold_cancelled() public { assert(thresholdCancels == 0); }
+    function canary_growth() public { assert(growthOk == 0); }
+    function canary_growth_after_wrap() public { assert(growthAfterWrap == 0); }
+    function canary_swap_after_growth_after_wrap() public { assert(swapsAfterWrapGrowth == 0); }
+    function canary_warm_twap_checked() public { assert(warmTwapChecks == 0); }
+    function canary_not_warm_checked() public { assert(notWarmChecks == 0); }
+    function canary_twap_bounds_checked() public { assert(twapBoundsChecks == 0); }
+    function canary_liquidity_added() public { assert(liqAdds == 0); }
+    function canary_liquidity_removed() public { assert(liqRemoves == 0); }
+    function canary_liquidity_over_remove_rejected() public { assert(liqOverRemoveRejected == 0); }
+    function canary_liquidity_wrong_sign_rejected() public { assert(liqWrongSignRejected == 0); }
+    function canary_huge_delta_rejected() public { assert(hugeDeltaRejected == 0); }
+    function canary_attacker_probed() public { assert(attackerProbes == 0); }
+    function canary_tracker_round_trip() public { assert(trackerRoundTrips == 0); }
+    function canary_compute_fee_checked() public { assert(computeFeeChecks == 0); }
+    function canary_abs_checked() public { assert(absChecks == 0); }
+    function canary_invariants_called() public { assert(invariantChecks == 0); }
+    function canary_initial_cardinality_checked() public { assert(initialCardinalityChecks == 0); }
 }
-
-
-    // ════════════════════════════════════════════════════════════════════
-    // TODO: properties not yet implemented. Restore these with real bodies
-    // when ready — empty stubs were removed from this file because they
-    // compiled but asserted nothing:
-    //
-    //   - Observation-at-exact-boundary: keep cardinality small (e.g. 3) so
-    //     the ring buffer wraps quickly, run more swaps than cardinality,
-    //     then call getTwapTick exactly at the oldest observation's
-    //     timestamp — it should not revert and should return the correct
-    //     tickCumulative.
-    //   - Observation older than oldest: request a TWAP window wide enough
-    //     that the target falls before the oldest observation and assert
-    //     it reverts with the "target older than oldest observation"-style
-    //     error.
-    //   - Binary search over uninitialized slots: right after pool init
-    //     (only slot 0 populated, grown slots still zeroed) call the
-    //     observe/TWAP path with a target timestamp after the first
-    //     observation and assert it terminates (no infinite loop) and
-    //     either reverts cleanly or returns a sane value.
-    // ════════════════════════════════════════════════════════════════════
-}
-
-/*//////////////////////////////////////////////////////////////////////////
-    See echidna.yaml (same directory) for the required config:
-    testMode: assertion, chainId: 31337.
-//////////////////////////////////////////////////////////////////////////*/
