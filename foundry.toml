@@ -1,5 +1,5 @@
-[profile.fork]
-test = "test/fork" 
+[profile.invariant]
+test = "test/invariant" 
 auto_detect_solc = true
 offline = false
 evm_version = "cancun"
@@ -24,7 +24,7 @@ lint_on_build = false
 
 [profile.default.invariant]
 runs = 256
-depth = 25
+depth = 400
 fail_on_revert = true
 
 # ── RPC endpoints ──────────────────────────────────────────────────────────

@@ -270,8 +270,13 @@ contract CuratioHookTest is Test, Deployers {
         emit CuratioHook.OracleCardinalityIncreased(poolId, DEFAULT_ORACLE_CARDINALITY, targetCardinality);
         hook.increaseObservationCardinality(poolKey, targetCardinality);
 
-        (, uint16 cardinalityAfter,) = hook.getOracleState(poolKey);
-        assertEq(cardinalityAfter, targetCardinality, "cardinality should grow beyond the pre-warmed default");
+        // Uniswap-v3 rule: the new size is only RECORDED here; the ring switches to it when the
+        // write index reaches the end of the current ring.
+        (, uint16 cardinalityAfter, uint16 cardinalityNextAfter) = hook.getOracleState(poolKey);
+        assertEq(cardinalityNextAfter, targetCardinality, "cardinalityNext should grow beyond the pre-warmed default");
+        assertEq(
+            cardinalityAfter, DEFAULT_ORACLE_CARDINALITY, "ring size is unchanged until the write index reaches its end"
+        );
     }
 
     function test_increaseObservationCardinality_revertsIfPoolNotInitialized() public {

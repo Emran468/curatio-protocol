@@ -160,21 +160,66 @@ contract VtAttacker {
     }
 
     function probe() external returns (bool) {
-        try v.setDepositCap(0) { return true; } catch {}
-        try v.setDepositsPaused(true) { return true; } catch {}
-        try v.proposeRebalancer(address(0xBEEF)) { return true; } catch {}
-        try v.proposeAccessControl(address(0xBEEF)) { return true; } catch {}
-        try v.proposeFeeModule(address(0)) { return true; } catch {}
-        try v.harvest() { return true; } catch {}
-        try v.grantRole(v.VAULT_MANAGER_ROLE(), address(this)) { return true; } catch {}
-        try a.setWhitelistedUser(address(this), true) { return true; } catch {}
-        try a.toggleWhitelisting(false) { return true; } catch {}
-        try r.setVault(address(0xCAFE)) { return true; } catch {}
-        try r.setAsset(address(0xCAFE)) { return true; } catch {}
-        try f.setPerformanceFeeBps(0) { return true; } catch {}
-        try f.setFeeRecipient(address(this)) { return true; } catch {}
-        try f.setVault(address(this)) { return true; } catch {}
-        try f.reportPerformanceFeeCharged(0, 0) { return true; } catch {}
+        try v.setDepositCap(0) {
+            return true;
+        }
+            catch {}
+        try v.setDepositsPaused(true) {
+            return true;
+        }
+            catch {}
+        try v.proposeRebalancer(address(0xBEEF)) {
+            return true;
+        }
+            catch {}
+        try v.proposeAccessControl(address(0xBEEF)) {
+            return true;
+        }
+            catch {}
+        try v.proposeFeeModule(address(0)) {
+            return true;
+        }
+            catch {}
+        try v.harvest() {
+            return true;
+        }
+            catch {}
+        try v.grantRole(v.VAULT_MANAGER_ROLE(), address(this)) {
+            return true;
+        }
+            catch {}
+        try a.setWhitelistedUser(address(this), true) {
+            return true;
+        }
+            catch {}
+        try a.toggleWhitelisting(false) {
+            return true;
+        }
+            catch {}
+        try r.setVault(address(0xCAFE)) {
+            return true;
+        }
+            catch {}
+        try r.setAsset(address(0xCAFE)) {
+            return true;
+        }
+            catch {}
+        try f.setPerformanceFeeBps(0) {
+            return true;
+        }
+            catch {}
+        try f.setFeeRecipient(address(this)) {
+            return true;
+        }
+            catch {}
+        try f.setVault(address(this)) {
+            return true;
+        }
+            catch {}
+        try f.reportPerformanceFeeCharged(0, 0) {
+            return true;
+        }
+            catch {}
         return false;
     }
 }
@@ -594,7 +639,7 @@ contract CuratioVaultEchidnaTest {
         }
     }
 
-       function _checkHarvest(H memory h, uint256 feeShares) internal {
+    function _checkHarvest(H memory h, uint256 feeShares) internal {
         uint256 hwmAfter = vault.highWaterMark();
         if (hwmAfter < h.hwm) harvestBroken = true; // HWM never decreases
         if (vault.totalSupply() != h.supply + feeShares) harvestBroken = true;
@@ -693,7 +738,9 @@ contract CuratioVaultEchidnaTest {
     /// @dev Includes the fee recipient (actors[0]), so minted fee shares are accounted for.
     function echidna_shares_conserved() public view returns (bool) {
         uint256 sum;
-        for (uint256 i = 0; i < ACTORS; i++) sum += vault.balanceOf(address(actors[i]));
+        for (uint256 i = 0; i < ACTORS; i++) {
+            sum += vault.balanceOf(address(actors[i]));
+        }
         return sum == vault.totalSupply();
     }
 
@@ -857,8 +904,8 @@ contract CuratioVaultEchidnaTest {
         return feeCapRejections == 0;
     }
 
-        /// @dev Stronger than the one above: a fee harvest that happened while shares already existed.
+    /// @dev Stronger than the one above: a fee harvest that happened while shares already existed.
     function echidna_canary_fee_harvest_with_holders_reached() public view returns (bool) {
         return feeHarvestsWithHolders == 0;
-    } 
+    }
 }

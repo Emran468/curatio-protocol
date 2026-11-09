@@ -223,8 +223,10 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
         swap(poolKey, true, -int256(5 ether), "");
         swap(poolKey, false, -int256(5 ether), ""); // reversal with volume above the threshold
 
-        (, uint24 fee,,,) = hook.getPoolState(poolKey);
-        assertEq(fee, hook.MEV_PENALTY_FEE(), "hook must have flagged the sandwich");
+        // the penalty lives only in the flagged block and is no longer stored in the pool state
+        assertEq(hook.getCurrentFee(poolKey), hook.MEV_PENALTY_FEE(), "hook must have flagged the sandwich");
+        (, uint24 storedFee,,,) = hook.getPoolState(poolKey);
+        assertLt(uint256(storedFee), uint256(hook.MEV_PENALTY_FEE()), "the penalty must not be stored");
 
         vm.prank(admin);
         rebalancer.rebalanceLiquidity(-120, 120, 100 ether, MAX, MAX);

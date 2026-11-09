@@ -159,7 +159,7 @@ contract Attacker {
     }
 
     /// @return succeeded true if ANY privileged call went through (that would be a bug).
-       function probe(address newVault) external returns (bool succeeded) {
+    function probe(address newVault) external returns (bool succeeded) {
         try rebalancer.rebalanceLiquidity(-60, 60, 1, 0, 0) {
             return true;
         } catch {}
@@ -290,7 +290,7 @@ contract CuratioRebalancerEchidnaTest {
         token1.mint(address(rebalancer), a1 % 50_000 ether);
     }
 
-      /// @notice Changes the vault asset. While a position exists the call MUST revert and change nothing;
+    /// @notice Changes the vault asset. While a position exists the call MUST revert and change nothing;
     ///         with no position it MUST succeed.
     function selectAsset(bool pickToken0) external {
         address a = pickToken0 ? address(token0) : address(token1);
@@ -383,7 +383,8 @@ contract CuratioRebalancerEchidnaTest {
             poolSpacing = spacing;
             successfulPoolChanges++;
             if (rebalancer.asset() != address(0)) accountingBroken = true; // asset must reset
-            try rebalancer.setAsset(address(token0)) {} catch {
+            try rebalancer.setAsset(address(token0)) {}
+            catch {
                 unexpectedRevert = true;
             }
         } catch {
@@ -497,7 +498,7 @@ contract CuratioRebalancerEchidnaTest {
         return successfulPoolChanges == 0;
     }
 
-        function echidna_canary_asset_change_reached() public view returns (bool) {
+    function echidna_canary_asset_change_reached() public view returns (bool) {
         return successfulAssetChanges == 0;
     }
 

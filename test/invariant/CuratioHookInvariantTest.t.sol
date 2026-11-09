@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {StdInvariant} from "forge-std/StdInvariant.sol";
+import {console2} from "forge-std/console2.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
@@ -53,11 +54,7 @@ contract CuratioHookInvariantTest is StdInvariant, Deployers {
         require(address(hook) == hookAddress, "Mined address mismatch");
 
         poolKey = PoolKey({
-            currency0: currency0,
-            currency1: currency1,
-            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
-            tickSpacing: 60,
-            hooks: hook
+            currency0: currency0, currency1: currency1, fee: LPFeeLibrary.DYNAMIC_FEE_FLAG, tickSpacing: 60, hooks: hook
         });
         poolId = poolKey.toId();
 
@@ -166,6 +163,8 @@ contract CuratioHookInvariantTest is StdInvariant, Deployers {
         if (blockDelta >= hook.blockDecayWindow()) {
             assertEq(current, BASE_FEE, "Fee must decay to BASE_FEE after decay window");
         } else {
+            // inside a block flagged as a sandwich getCurrentFee reports MEV_PENALTY_FEE; the stored fee never does
+            if (current == MEV_PENALTY_FEE) return;
             assertEq(current, fee, "Fee must equal stored fee inside decay window");
         }
     }
@@ -191,8 +190,7 @@ contract CuratioHookInvariantTest is StdInvariant, Deployers {
     function invariant_sandwichTrackerConsistent() public view {
         if (handler.swapCount() == 0) return;
 
-        (,, int24 peakTick, uint256 startBlock, uint256 swapCount, bool initialized) =
-            hook.getSandwichTracker(poolKey);
+        (,, int24 peakTick, uint256 startBlock, uint256 swapCount, bool initialized) = hook.getSandwichTracker(poolKey);
 
         assertTrue(initialized, "Tracker must be initialized after a swap");
         assertEq(startBlock, handler.lastSwapBlock(), "Tracker startBlock != last swap block");
@@ -215,9 +213,7 @@ contract CuratioHookInvariantTest is StdInvariant, Deployers {
     }
 
     function invariant_activeLiquidityNeverExceedsTotal() public view {
-        assertLe(
-            uint256(manager.getLiquidity(poolId)), handler.totalGhostLiquidity(), "Active liquidity > total added"
-        );
+        assertLe(uint256(manager.getLiquidity(poolId)), handler.totalGhostLiquidity(), "Active liquidity > total added");
     }
 
     function invariant_seedLiquidityFloor() public view {
@@ -235,7 +231,13 @@ contract CuratioHookInvariantTest is StdInvariant, Deployers {
     /// Core DoS check: with ample liquidity, the hook must never be the
     /// reason a swap reverts. On failure, read handler.lastSwapRevertData().
     function invariant_swapsNeverRevert() public view {
-        assertEq(handler.unexpectedSwapReverts(), 0, "A swap reverted (see handler.lastSwapRevertData)");
+        if (handler.unexpectedSwapReverts() != 0) {
+            console2.log("hook-caused swap revert. tickBefore:", int256(handler.lastFailedTickBefore()));
+            console2.log("zeroForOne:", handler.lastFailedZeroForOne());
+            console2.log("amountSpecified:", handler.lastFailedAmountSpecified());
+            console2.logBytes(handler.lastSwapRevertData());
+        }
+        assertEq(handler.unexpectedSwapReverts(), 0, "A swap reverted inside the hook (see the logs above)");
     }
 
     function invariant_hookGasBounded() public view {
@@ -295,6 +297,30 @@ contract CuratioHookInvariantTest is StdInvariant, Deployers {
         assertEq(hook.owner(), OWNER, "Owner changed unexpectedly");
         assertFalse(handler.accessControlBroken(), "Non-owner executed an owner-only function");
         assertFalse(handler.adminUnexpectedRevert(), "A valid admin/oracle call reverted");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Fixes: block-scoped MEV penalty (FIX-C) and tick-based sandwich gate (FIX-D)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// FIX-C: the sandwich penalty is enforced per block through a flag and is NEVER written into the pool state.
+    /// (A stored penalty used to be re-applied to calm swaps for a whole decay window.)
+    function invariant_sandwichPenaltyIsNeverStored() public view {
+        (, uint24 storedFee,,,) = hook.getPoolState(poolKey);
+        assertTrue(storedFee != MEV_PENALTY_FEE, "MEV penalty must not be stored in the pool state");
+    }
+
+    /// FIX-C: getCurrentFee only reports the penalty inside a block that already contained a swap
+    /// (the flag is set in afterSwap of that block and ignored from the next block on).
+    function invariant_penaltyReportedOnlyInBlockWithSwap() public view {
+        if (hook.getCurrentFee(poolKey) != MEV_PENALTY_FEE) return;
+        assertEq(block.number, handler.lastSwapBlock(), "penalty reported in a block without a swap");
+    }
+
+    /// FIX-D: the tick move accumulated for "the current block" is 0 unless a swap happened in this block.
+    function invariant_blockTickMoveZeroWithoutSwapThisBlock() public view {
+        if (block.number == handler.lastSwapBlock()) return;
+        assertEq(hook.getBlockTickMove(poolKey), 0, "tick move recorded for a block without swaps");
     }
 
     function invariant_cardinalityCapsWithinHardCeiling() public view {

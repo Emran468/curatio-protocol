@@ -27,11 +27,12 @@ contract CuratioForkSwapPathTest is CuratioForkTest {
     //  Helpers
     // ═════════════════════════════════════════════════════════════════════════
 
-    /// @dev Same-block front-run + back-run: opposite directions, total volume 4e18 > mevVolumeThreshold (1e18).
-    ///      The external LP (1e20) keeps the price near 1:1 (a few ticks).
-    function _sandwichSameBlock() internal {
-        _swap(true, -2e18);
-        _swap(false, -2e18);
+    /// @dev Same-block front-run + back-run in opposite directions. A block is flagged when the swaps have moved the
+    ///      price by at least `sandwichTickThreshold` (80) ticks in total, so the size must fit the pool depth:
+    ///      ~2e18 for the shallow 1e20 pool, ~1e19 for the deep pool that also holds the rebalancer's LP.
+    function _sandwichSameBlock(int256 amountIn) internal {
+        _swap(true, -amountIn);
+        _swap(false, -amountIn);
         assertEq(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE), "sandwich must be flagged");
     }
 
@@ -68,7 +69,7 @@ contract CuratioForkSwapPathTest is CuratioForkTest {
 
     function test_swapPath_withdrawNeedingSwap_revertsInSandwichBlock() public {
         uint128 liqBefore = _twoSidedLpSetup();
-        _sandwichSameBlock();
+        _sandwichSameBlock(10e18);
 
         // 100 > ~60 idle token0 => LP must be unwound and ~20 token1 swapped into token0 at a 10% fee
         vm.prank(alice);
@@ -78,19 +79,15 @@ contract CuratioForkSwapPathTest is CuratioForkTest {
         assertEq(uint256(rebalancer.currentLiquidity()), uint256(liqBefore), "a failed withdraw must change nothing");
     }
 
-    /// @dev The same-block flag is gone one block later, but the MEV fee stays stored in the hook and is
-    ///      re-applied to calm swaps until blockDecayWindow (300 blocks on Unichain) has passed.
-    function test_swapPath_withdrawNeedingSwap_succeedsOnlyAfterDecayWindow() public {
+    /// @dev The penalty only lives in the flagged block (it is no longer stored in the hook's pool state), so the
+    ///      very next block the withdrawal's swap pays a normal fee, passes the TWAP price check and succeeds.
+    ///      (Before the fix the stored 10% fee kept blocking this for blockDecayWindow = 300 blocks.)
+    function test_swapPath_withdrawNeedingSwap_succeedsOneBlockAfterSandwich() public {
         uint128 liqBefore = _twoSidedLpSetup();
-        _sandwichSameBlock();
+        _sandwichSameBlock(10e18);
 
         _advance(1);
-        vm.prank(alice);
-        vm.expectRevert(CuratioRebalancer.SwapPriceDeviation.selector);
-        vault.withdraw(100e18, alice, alice);
-
-        _advance(uint256(hook.blockDecayWindow()));
-        assertEq(uint256(hook.getCurrentFee(key)), uint256(BASE_FEE), "fee must have decayed");
+        assertLt(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE), "penalty must be gone");
 
         uint256 balBefore = token0.balanceOf(alice);
         vm.prank(alice);
@@ -104,7 +101,7 @@ contract CuratioForkSwapPathTest is CuratioForkTest {
     ///      so the penalty window does not affect it.
     function test_swapPath_withdrawWithinIdle_worksDuringPenalty() public {
         uint128 liqBefore = _twoSidedLpSetup();
-        _sandwichSameBlock();
+        _sandwichSameBlock(10e18);
 
         uint256 balBefore = token0.balanceOf(alice);
         vm.prank(alice);
@@ -157,7 +154,7 @@ contract CuratioForkSwapPathTest is CuratioForkTest {
 
     function test_swapPath_keeperTwoSidedRange_revertsInSandwichBlock() public {
         _keeperSetup();
-        _sandwichSameBlock();
+        _sandwichSameBlock(2e18);
 
         vm.prank(automation);
         vm.expectRevert(CuratioRebalancer.SwapPriceDeviation.selector);
@@ -166,3 +163,4 @@ contract CuratioForkSwapPathTest is CuratioForkTest {
         assertEq(uint256(rebalancer.currentLiquidity()), 0, "nothing may have been deployed");
     }
 }
+

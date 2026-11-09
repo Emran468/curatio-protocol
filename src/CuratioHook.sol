@@ -82,6 +82,21 @@ library ChainRegistry {
         if (chainId == ARBITRUM_SEPOLIA) return 1000;
         return 25;
     }
+
+    /// @dev [FIX-A] Oracle ring-buffer size pre-warmed at pool init.
+    ///      The oracle writes at most ONE observation per distinct block.timestamp (1 second resolution).
+    ///      The TWAP window is 120 s, so a pool that trades every second needs MORE than 120 slots, otherwise the
+    ///      buffer never spans the window: the oracle never warms, the TWAP guard is off and the vault (which
+    ///      prices shares from the TWAP) cannot be valued. Chains with ~1 s (or faster) timestamps therefore get
+    ///      240 slots (2x the window). Slower chains (2 s+ blocks) are covered by 100 slots.
+    ///      Cost: one cold SSTORE per slot at pool initialisation (~22k gas each).
+    function getInitialCardinality(uint256 chainId) internal pure returns (uint16) {
+        if (chainId == UNICHAIN) return 240;
+        if (chainId == UNICHAIN_SEPOLIA) return 240;
+        if (chainId == ARBITRUM) return 240;
+        if (chainId == ARBITRUM_SEPOLIA) return 240;
+        return 100;
+    }
 }
 
 // ─── TWAP Oracle Library ──────────────────────────────────────────────────────
@@ -111,8 +126,14 @@ library TwapOracle {
 
     /// @dev Called on every swap (via afterSwap). No-op if oracle not grown
     ///      past cardinality 0, and no-op if called twice in the same block.
+    ///
+    ///      [FIX-B] Uniswap-v3 growth rule: a larger `cardinalityNext` is only applied when the write index is at
+    ///      the LAST slot of the current ring. The next observation then goes into the first NEW slot, so the ring
+    ///      stays one chronologically ordered block of slots and binarySearch keeps working. (Applying the new size
+    ///      immediately, as before, left an empty gap in the middle of a wrapped ring and made binarySearch revert.)
     function write(mapping(uint16 => Observation) storage self, State storage state, uint32 time, int24 tick) internal {
-        if (state.cardinality == 0) return;
+        uint16 cardinality = state.cardinality;
+        if (cardinality == 0) return;
 
         Observation memory last = self[state.index];
         if (last.blockTimestamp == time) return; // already recorded this block
@@ -138,13 +159,19 @@ library TwapOracle {
             tickCumulative = last.tickCumulative + int56(tick) * int56(uint56(delta));
         }
 
-        uint16 indexUpdated = uint16((uint256(state.index) + 1) % state.cardinality);
+        uint16 cardinalityUpdated = (state.cardinalityNext > cardinality && state.index == cardinality - 1)
+            ? state.cardinalityNext
+            : cardinality;
+
+        uint16 indexUpdated = uint16((uint256(state.index) + 1) % cardinalityUpdated);
         self[indexUpdated] = Observation({blockTimestamp: time, tickCumulative: tickCumulative, initialized: true});
         state.index = indexUpdated;
+        state.cardinality = cardinalityUpdated;
     }
 
     /// @dev Grows the ring buffer capacity. Anyone can call to pre-warm slots
     ///      (gas-expensive SSTOREs paid up front instead of during swaps).
+    ///      Only records `cardinalityNext`; `write()` applies it when the ring reaches its last slot.
     function grow(mapping(uint16 => Observation) storage self, State storage state, uint16 newCardinality) internal {
         uint16 current = state.cardinalityNext;
         if (newCardinality <= current) return;
@@ -284,7 +311,7 @@ library TwapOracle {
     {
         if (state.cardinality == 0 || window == 0) return false;
 
-        // window যদি বর্তমান block.timestamp-এর চেয়ে বড় হয়, তবে underflow এড়াতে false
+        // window যদি বর্তমান block.timestamp-এর চেয়ে বড় হয়, তবে underflow এড়াতে false
         if (window > block.timestamp) return false;
 
         uint16 oldestIndex = uint16((uint256(state.index) + 1) % state.cardinality);
@@ -294,7 +321,7 @@ library TwapOracle {
         }
         if (!oldest.initialized) return false;
 
-        // timestamp underflow এড়ানোর চেক
+        // timestamp underflow এড়ানোর চেক
         if (block.timestamp < oldest.blockTimestamp) return false;
 
         uint32 target = uint32(block.timestamp) - window;
@@ -325,6 +352,9 @@ contract CuratioHook is BaseHook, Ownable {
         uint32 swapCount;
         uint256 startBlock;
         bool initialized;
+        /// @dev Sum of |tick move| of all swaps in `startBlock` (saturating at uint32 max). Price impact is measured
+        ///      in ticks, so it needs no token-decimals normalisation and scales with each pool's depth.
+        uint32 totalMove;
     }
 
     struct PositionInfo {
@@ -348,9 +378,10 @@ contract CuratioHook is BaseHook, Ownable {
     // ── TWAP warm-up config [FIX-1] ───────────────────────────────────────────
     // Cardinality pre-warmed at pool init so TWAP protection is live from the
     // pool's first swaps instead of requiring a manual bootstrap call.
-    // 100 slots is a starting default — tune per deployment (gas cost at init
-    // scales linearly with this number, paid once by whoever initializes the pool).
-    uint16 public initialCardinality = 100;
+    // [FIX-A] The default now comes from ChainRegistry.getInitialCardinality(): 240 on chains with ~1 s
+    // timestamps (Unichain, Arbitrum), 100 elsewhere. Gas cost at init scales linearly with this number,
+    // paid once by whoever initializes the pool. The owner can still change it with setInitialCardinality.
+    uint16 public initialCardinality;
     uint32 public constant DEFAULT_TWAP_WINDOW = 120;
 
     // ── Timelock config [FIX-3] ───────────────────────────────────────────────
@@ -392,7 +423,13 @@ contract CuratioHook is BaseHook, Ownable {
     // ── Configurable thresholds ───────────────────────────────────────────────
     uint256 public tickThresholdHigh = 500;
     uint256 public tickThresholdMid = 200;
+    /// @dev DEPRECATED, no longer used by the sandwich detection. It compared the RAW `amountSpecified` of swaps
+    ///      against one hook-wide number, which ignores token decimals (a 6-decimal USDC leg never reached 1e18, a
+    ///      18-decimal WETH leg did at ~$3k). Kept only so the ABI, the timelocked proposal and existing integrators
+    ///      keep working. `blockVolumeMap` is still tracked for information.
     uint256 public mevVolumeThreshold = 1 ether;
+    /// @dev [FIX-D] Sandwich threshold in TICKS: a direction reversal inside a block, after the swaps of that block
+    ///      have moved the price by at least this many ticks in total, flags the block.
     uint256 public sandwichTickThreshold = 80;
 
     bool private _entered;
@@ -445,6 +482,7 @@ contract CuratioHook is BaseHook, Ownable {
         deployedChainId = block.chainid;
         blockDecayWindow = ChainRegistry.getBlockDecayWindow(block.chainid);
         chainName = ChainRegistry.getChainName(block.chainid);
+        initialCardinality = ChainRegistry.getInitialCardinality(block.chainid);
 
         if (block.chainid != 31337 && !_skipChainCheck()) {
             address expected = ChainRegistry.getPoolManager(block.chainid);
@@ -507,6 +545,9 @@ contract CuratioHook is BaseHook, Ownable {
         // same transaction, so write() no longer overwrites a single slot
         // forever. Gas cost of the pre-warm SSTOREs is paid once, here, by
         // whoever initializes the pool — not amortized silently later.
+        //
+        // Setting `cardinality` directly is safe here: only slot 0 exists and writes fill the slots in order
+        // (an unwrapped ring), so the layout is always one contiguous block of initialized slots.
         TwapOracle.State storage state = _observationStates[poolId];
         TwapOracle.initialize(_observations[poolId], state, uint32(block.timestamp));
 
@@ -650,6 +691,8 @@ contract CuratioHook is BaseHook, Ownable {
         }
 
         // ── MEV / Sandwich Block Level Check ─────────────────────────────────
+        // [FIX-C] The sandwich penalty is enforced HERE, for the rest of the flagged block only. It is not stored
+        // in poolStates.fee (see afterSwap), so it cannot leak into later blocks.
         uint256 sandwichBlock = _sandwichFlags[poolId];
         if (sandwichBlock == currentBlock) {
             return (
@@ -728,7 +771,8 @@ contract CuratioHook is BaseHook, Ownable {
                 peakTick: postSwapTick,
                 swapCount: 0,
                 startBlock: currentBlock,
-                initialized: true
+                initialized: true,
+                totalMove: 0
             });
         }
 
@@ -756,6 +800,9 @@ contract CuratioHook is BaseHook, Ownable {
             tracker.swapCount++;
             tracker.lastMove = currentMove;
 
+            uint256 newTotalMove = uint256(tracker.totalMove) + uint256(tickDelta);
+            tracker.totalMove = newTotalMove > type(uint32).max ? type(uint32).max : uint32(newTotalMove);
+
             if (tracker.firstMove == 0) {
                 tracker.firstMove = currentMove;
             }
@@ -768,18 +815,19 @@ contract CuratioHook is BaseHook, Ownable {
         }
 
         // NOTE: sandwich detection below is a heuristic (direction-reversal +
-        // per-block volume threshold), not a guaranteed classifier. It can
+        // cumulative per-block TICK move, see sandwichTickThreshold), not a guaranteed classifier. It can
         // produce false positives on legitimate opposing-direction trades or
         // arbitrage correction in the same block. Tune thresholds carefully
         // and treat MEV_PENALTY_FEE application here as "elevated suspicion",
         // not "proven attack".
         bool isSandwich = false;
-        uint256 volume = blockVolumeMap[poolId];
 
+        // [FIX-D] The size gate is the price impact in TICKS, not the raw token amount: it is independent of token
+        // decimals and of how deep the pool is. (The old gate compared raw `amountSpecified` with one hook-wide number.)
         if (tracker.swapCount >= 2 && tracker.firstMove != 0 && currentMove != 0) {
             bool isReversal = (tracker.firstMove > 0 && currentMove < 0) || (tracker.firstMove < 0 && currentMove > 0);
 
-            if (isReversal && volume > mevVolumeThreshold) {
+            if (isReversal && uint256(tracker.totalMove) >= sandwichTickThreshold) {
                 isSandwich = true;
             }
         }
@@ -789,14 +837,19 @@ contract CuratioHook is BaseHook, Ownable {
         }
 
         if (isSandwich) {
-            feeToSave = MEV_PENALTY_FEE;
+            // [FIX-C] Flag the block: beforeSwap charges MEV_PENALTY_FEE for the rest of THIS block.
+            // The penalty is deliberately NOT written into `feeToSave` / poolStates.fee. A stored MEV fee used to be
+            // re-applied to every calm swap (and re-stored by _computeFee) for as long as the pool kept trading
+            // within blockDecayWindow of the previous swap, so a cheap two-swap "sandwich" by anyone could keep the
+            // 10% fee on the pool and make the rebalancer's TWAP price check reject withdrawals and keeper swaps.
             _sandwichFlags[poolId] = currentBlock;
 
-            emit SandwichDetected(poolId, tracker.firstMove, currentMove, blockVolumeMap[poolId], feeToSave);
+            emit SandwichDetected(poolId, tracker.firstMove, currentMove, blockVolumeMap[poolId], MEV_PENALTY_FEE);
 
             tracker.firstMove = currentMove;
             tracker.swapCount = 1;
             tracker.lastMove = currentMove;
+            tracker.totalMove = tickDelta;
         }
 
         _packedTrackers[poolId] = _packTracker(tracker);
@@ -853,7 +906,8 @@ contract CuratioHook is BaseHook, Ownable {
         uint24 rawPeak = uint24(uint32(int32(t.peakTick)));
 
         return (uint256(rawFirst) << 232) | (uint256(rawLast) << 208) | (uint256(rawPeak) << 184)
-            | (uint256(t.swapCount) << 152) | (uint256(t.startBlock) << 56) | (t.initialized ? 1 : 0);
+            | (uint256(t.swapCount) << 152) | (uint256(t.startBlock) << 56) | (uint256(t.totalMove) << 1)
+            | (t.initialized ? 1 : 0);
     }
 
     function _unpackTracker(uint256 packed) internal pure returns (SandwichTracker memory t) {
@@ -867,6 +921,7 @@ contract CuratioHook is BaseHook, Ownable {
 
         t.swapCount = uint32((packed >> 152) & 0xFFFFFFFF);
         t.startBlock = (packed >> 56) & 0xFFFFFFFFFFFFFFFFFFFFFFFF;
+        t.totalMove = uint32((packed >> 1) & 0xFFFFFFFF);
         t.initialized = (packed & 0x1) == 1;
     }
 
@@ -888,10 +943,15 @@ contract CuratioHook is BaseHook, Ownable {
         return _sandwichFlagSlotMap[poolId];
     }
 
+    /// @notice The base fee a swap in the CURRENT block would pay (the TWAP-deviation guard in beforeSwap can
+    ///         still raise it for an individual swap). Returns MEV_PENALTY_FEE only inside a block that was
+    ///         flagged as a sandwich; the penalty is never stored.
     function getCurrentFee(PoolKey calldata key) external view returns (uint24) {
         PoolId poolId = key.toId();
         PackedPoolState memory state = poolStates[poolId];
         if (!state.initialized) return BASE_FEE;
+
+        if (_sandwichFlags[poolId] == block.number) return MEV_PENALTY_FEE;
 
         uint256 blockDelta = block.number > state.lastBlock ? block.number - state.lastBlock : 0;
 
@@ -929,6 +989,13 @@ contract CuratioHook is BaseHook, Ownable {
         uint256 packed = _packedTrackers[poolId];
         SandwichTracker memory t = _unpackTracker(packed);
         return (t.firstMove, t.lastMove, t.peakTick, t.startBlock, uint256(t.swapCount), t.initialized);
+    }
+
+    /// @notice Total |tick move| of the swaps seen so far in the CURRENT block (0 if none). This is the quantity
+    ///         compared with `sandwichTickThreshold`.
+    function getBlockTickMove(PoolKey calldata key) external view returns (uint256) {
+        SandwichTracker memory t = _unpackTracker(_packedTrackers[key.toId()]);
+        return (t.initialized && t.startBlock == block.number) ? uint256(t.totalMove) : 0;
     }
 
     function isInitialized(PoolKey calldata key) external view returns (bool) {
@@ -990,7 +1057,11 @@ contract CuratioHook is BaseHook, Ownable {
     }
 
     /// @notice Increases the oracle observation cardinality for a pool
-    /// @dev Only emits event if actual growth occurs (prevents no-op event emissions)
+    /// @dev Only emits event if actual growth occurs (prevents no-op event emissions).
+    ///      [FIX-B] This only RECORDS the new size (`cardinalityNext`) and pre-touches the new slots.
+    ///      The ring switches to it later, inside TwapOracle.write(), when the write index reaches the last slot
+    ///      of the current ring (Uniswap v3 behaviour). Applying it immediately corrupted the layout of an
+    ///      already-wrapped ring, which let anyone make binarySearch revert and halt swaps and vault valuation.
 
     function increaseObservationCardinality(PoolKey calldata key, uint16 targetCardinality)
         external
@@ -1021,7 +1092,7 @@ contract CuratioHook is BaseHook, Ownable {
 
         _observations[poolId].grow(state, cappedTarget);
 
-        state.cardinality = state.cardinalityNext;
+        // NOTE: `state.cardinality` is intentionally NOT touched here (see the @dev above).
         cardinalityNextNew = state.cardinalityNext;
 
         if (cardinalityNextNew > cardinalityNextOld) {

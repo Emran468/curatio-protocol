@@ -8,23 +8,23 @@ import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/Pool
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 
-import {CuratioRebalancer} from "../../src/CuratioRebalancer.sol";
 import {CuratioForkTest} from "./CuratioForkTest.t.sol";
 
 /**
- * @notice More fork tests, in two groups.
+ * @notice Regression tests for the three weaknesses the earlier `test_finding_*` tests exposed, plus two
+ *         general behaviour tests. The assertions of the old finding tests are FLIPPED: they now prove the fixes.
  *
- *  test_more_*     Behaviour that SHOULD hold (pool isolation, timelocked governance really changes fees).
+ *  FIX-A  per-chain default oracle depth (240 slots on Unichain)  -> a busy 1-second pool keeps the oracle warm
+ *  FIX-B  V3-style cardinality growth (applied at the ring's end) -> growing a wrapped ring no longer bricks it
+ *  FIX-C  the sandwich penalty lives only in the flagged block    -> it can no longer block later withdrawals
  *
- *  test_finding_*  Probes for weaknesses found by reading CuratioHook / TwapOracle. They assert what the
- *                  code does TODAY, so they PASS while the weakness exists. After a fix, flip the asserts.
- *                  If one of them FAILS, either the weakness is not real or the test model is wrong:
- *                  send the output.
+ *  test_more_*  behaviour that should hold (pool isolation, timelocked governance changes real fees)
+ *  test_fix_*   the fixes
  *
  * Reuses the CuratioForkTest fixture (real Unichain PoolManager + fresh Curatio stack + mock tokens).
  * It inherits the original tests too, so run ONLY these with:
  *
- *   forge test --match-path test/fork/CuratioForkFindingsTest.t.sol --match-test "test_more|test_finding" -vv
+ *   forge test --match-path test/fork/CuratioForkFindingsTest.t.sol --match-test "test_more|test_fix" -vv
  */
 contract CuratioForkFindingsTest is CuratioForkTest {
     using PoolIdLibrary for PoolKey;
@@ -148,116 +148,97 @@ contract CuratioForkFindingsTest is CuratioForkTest {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  test_finding: oracle depth (100 slots) vs a 120s window on a 1-second chain
+    //  test_fix: FIX-A  default oracle depth for a 1-second chain
     // ═════════════════════════════════════════════════════════════════════════
 
-    /// @dev 100 observations written once per second only cover ~99s, which is shorter than the 120s TWAP
-    ///      window. isWarm() turns false, so on a pool that trades every second:
-    ///        - the hook falls back to the cold-start fee and the TWAP guard is off,
-    ///        - getTwapTick reverts, so the vault's totalAssets() reverts and deposits AND withdrawals halt,
-    ///        until the pool is quiet for ~20s (the oldest observation ages past 120s).
-    function test_finding_busyPool_oracleNeverWarms_vaultFrozen_thenRecovers() public {
-        _seedLp(1e20);
-        _advance(130);
-        vm.prank(alice);
-        vault.deposit(100e18, alice);
-        assertTrue(hook.isOracleWarm(key, 120), "warm before the ring wraps");
+    /// @dev Unichain gets 240 slots (2x the 120 s window) instead of 100.
+    function test_fix_unichainDefaultOracleDepth() public view {
+        assertEq(uint256(hook.initialCardinality()), 240);
 
-        _tradeEvery(150, 1); // one swap per second, like a busy pool on Unichain
-
-        (, uint16 cardinality,) = hook.getOracleState(key);
-        assertEq(uint256(cardinality), 100);
-        assertFalse(hook.isOracleWarm(key, 120), "100 observations 1s apart cover less than 120s");
-
-        vm.expectRevert("TwapOracle: insufficient history for requested window");
-        hook.getTwapTick(key, 120);
-
-        // the vault is frozen: it cannot be valued
-        assertEq(vault.maxDeposit(alice), 0);
-        vm.prank(alice);
-        vm.expectRevert(CuratioRebalancer.TwapUnavailable.selector);
-        vault.withdraw(1e18, alice, alice);
-
-        // and the next swap runs on the cold-start fee instead of a TWAP-checked fee
-        _advance(1);
-        assertEq(uint256(_swapAndGetFee(true, -1e15)), uint256(MID_FEE), "cold-start fee while the oracle is not warm");
-
-        // a quiet period lets the history age: warm again, vault usable again
-        _advance(30);
-        assertTrue(hook.isOracleWarm(key, 120));
-        vm.prank(alice);
-        vault.withdraw(1e18, alice, alice);
+        (, uint16 cardinality, uint16 cardinalityNext) = hook.getOracleState(key);
+        assertEq(uint256(cardinality), 240);
+        assertEq(uint256(cardinalityNext), 240);
     }
 
-    /// @dev The same load with a bigger ring (grown BEFORE it wraps) stays warm, so the weakness is the
-    ///      initialCardinality default (100), not the TWAP design.
-    function test_finding_largerCardinalityBeforeWrap_keepsOracleWarm() public {
+    /// @dev Flipped from test_finding_busyPool_oracleNeverWarms_vaultFrozen_thenRecovers.
+    ///      One swap per second, 300 swaps (the 240-slot ring wraps): the oracle stays warm, the TWAP guard keeps
+    ///      working and the vault can always be valued.
+    function test_fix_busyPool_oracleStaysWarm_vaultKeepsWorking() public {
         _seedLp(1e20);
         _advance(130);
         vm.prank(alice);
         vault.deposit(100e18, alice);
 
-        _tradeEvery(30, 1);
-        vm.prank(makeAddr("anyone"));
-        hook.increaseObservationCardinality(key, 400); // permissionless
-        _tradeEvery(150, 1);
+        _tradeEvery(300, 1);
 
         (, uint16 cardinality,) = hook.getOracleState(key);
-        assertEq(uint256(cardinality), 400);
-        assertTrue(hook.isOracleWarm(key, 120));
+        assertEq(uint256(cardinality), 240);
+        assertTrue(hook.isOracleWarm(key, 120), "240 observations 1s apart cover more than 120s");
         hook.getTwapTick(key, 120); // must not revert
 
+        assertGt(vault.maxDeposit(alice), 0, "the vault can be valued");
         _advance(1);
-        assertEq(uint256(_swapAndGetFee(true, -1e15)), uint256(BASE_FEE), "TWAP-checked calm fee");
+        assertEq(
+            uint256(_swapAndGetFee(true, -1e15)), uint256(BASE_FEE), "TWAP-checked calm fee, not the cold-start fee"
+        );
 
         vm.prank(alice);
-        vault.withdraw(1e18, alice, alice); // the vault keeps working
+        vault.withdraw(1e18, alice, alice);
     }
 
-    /// @dev increaseObservationCardinality is permissionless and sets `cardinality = cardinalityNext` at once.
-    ///      If the ring has ALREADY wrapped and the oracle is warm (swaps ~2s apart), the buffer becomes
-    ///      [old part][empty gap][new part]. TwapOracle.binarySearch treats the gap as "too new", cannot bracket
-    ///      now-120s, and reverts. beforeSwap and the vault's valuation both call it => swaps and the vault halt.
-    ///      (A swap after 120+ quiet seconds takes the extrapolation path and works once, then it breaks again.)
-    function test_finding_growingOracleAfterWrap_bricksSwapsAndVault() public {
+    // ═════════════════════════════════════════════════════════════════════════
+    //  test_fix: FIX-B  cardinality growth is applied at the ring's end
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// @dev Flipped from test_finding_growingOracleAfterWrap_bricksSwapsAndVault. Same sequence, with the ring
+    ///      wrapped (index ~80) and warm when anyone grows it. Now the new size is only RECORDED; getTwapTick,
+    ///      swaps and the vault keep working, and the ring switches to the new size when it reaches its last slot.
+    function test_fix_growthAfterWrap_isDeferred_oracleStaysHealthy() public {
         _seedLp(1e20);
         _advance(130);
         vm.prank(alice);
         vault.deposit(100e18, alice);
 
-        _tradeEvery(180, 2); // observations 2s apart: the ring spans ~198s (warm) and has wrapped
+        _tradeEvery(320, 2); // 240-slot ring wrapped, write index ~80, observations 2s apart => warm
 
-        (uint16 index, uint16 cardinality,) = hook.getOracleState(key);
-        assertEq(uint256(cardinality), 100);
-        assertGt(uint256(index), 60, "ring wrapped far enough that now-120s is in the newest part");
+        (uint16 index, uint16 cardinality, uint16 cardinalityNext) = hook.getOracleState(key);
+        assertEq(uint256(cardinality), 240);
+        assertGt(uint256(index), 60, "now-120s lies in the newest part of the ring");
         assertTrue(hook.isOracleWarm(key, 120));
-        hook.getTwapTick(key, 120); // works today
 
-        // anyone grows the buffer
         vm.prank(makeAddr("attacker"));
-        hook.increaseObservationCardinality(key, 300);
-        _advance(2);
+        hook.increaseObservationCardinality(key, 400);
 
-        vm.expectRevert("TwapOracle: insufficient observation history");
+        // recorded, not applied
+        (, cardinality, cardinalityNext) = hook.getOracleState(key);
+        assertEq(uint256(cardinality), 240, "ring layout must be untouched");
+        assertEq(uint256(cardinalityNext), 400);
+
+        // exactly the calls that used to revert
+        _advance(2);
+        hook.getTwapTick(key, 120);
+        _swap(true, -1e15);
+        assertGt(vault.maxDeposit(alice), 0);
+        vault.totalAssets();
+
+        // keep trading until the write index reaches the end of the old ring: the new size takes effect there
+        _tradeEvery(160, 2);
+        (index, cardinality, cardinalityNext) = hook.getOracleState(key);
+        assertEq(uint256(cardinality), 400, "the new size is applied at the end of the old ring");
+        assertTrue(hook.isOracleWarm(key, 120));
         hook.getTwapTick(key, 120);
 
-        // PoolManager wraps hook reverts, so only check that the swap reverts
-        vm.expectRevert();
-        _swap(true, -1e15);
-
-        // the vault cannot be valued either
-        vm.expectRevert(CuratioRebalancer.TwapUnavailable.selector);
-        vault.totalAssets();
+        vm.prank(alice);
+        vault.withdraw(1e18, alice, alice);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  test_finding: the MEV penalty is cheap to trigger and lasts a whole decay window
+    //  test_fix: FIX-C  the sandwich penalty ends with the flagged block
     // ═════════════════════════════════════════════════════════════════════════
 
-    /// @dev Anyone with a few tokens can flag a "sandwich" with two opposite swaps in one block. It costs only
-    ///      the swap fees, and the 10% penalty then stays for blockDecayWindow blocks (300 on Unichain, ~5 min),
-    ///      which (see CuratioForkSwapPathTest) blocks withdrawals that must unwind the LP and keeper rebalances.
-    function test_finding_cheapSandwichFlagsPenaltyForAnyone() public {
+    /// @dev Flipped from test_finding_cheapSandwichFlagsPenaltyForAnyone. Anyone can still flag a block for the
+    ///      price of the swap fees, but the 10% penalty now ends with that block and is not stored.
+    function test_fix_penaltyEndsWithTheFlaggedBlock() public {
         _seedLp(1e20);
         _advance(130);
 
@@ -273,15 +254,24 @@ contract CuratioForkFindingsTest is CuratioForkTest {
         _swap(false, -2e18);
         vm.stopPrank();
 
-        assertEq(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE), "flagged by an arbitrary address");
-
         uint256 balAfter = token0.balanceOf(attacker) + token1.balanceOf(attacker);
-        assertLt(balBefore - balAfter, 1e17, "attack cost must be only swap fees (< 2.5% of the 4e18 volume)");
+        assertLt(balBefore - balAfter, 1e17, "the attack still costs only swap fees (< 2.5% of the volume)");
 
-        // the penalty lasts the whole decay window
-        _advance(uint256(hook.blockDecayWindow()) - 1);
+        // enforced for the rest of the flagged block...
         assertEq(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE));
+        assertEq(uint256(_swapAndGetFee(true, -1e15)), uint256(MEV_FEE), "rest of the flagged block pays the penalty");
+
+        // ...but never stored
+        (, uint24 storedFee,,,) = hook.getPoolState(key);
+        assertLt(uint256(storedFee), uint256(MEV_FEE), "the penalty must not be stored in the pool state");
+
+        // the very next block is back to a normal, non-penalty fee, and stays there while the pool keeps trading
         _advance(1);
-        assertEq(uint256(hook.getCurrentFee(key)), uint256(BASE_FEE));
+        assertLt(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE));
+        for (uint256 i = 0; i < 5; i++) {
+            uint24 fee = _swapAndGetFee(i % 2 == 0, -1e15);
+            assertLt(uint256(fee), uint256(MEV_FEE), "no sticky penalty after the flagged block");
+            _advance(1);
+        }
     }
 }

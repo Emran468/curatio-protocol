@@ -96,8 +96,9 @@ contract CardinalityGasDoSTest is Test, Deployers {
             if (cardinalityNextNew >= target) break;
         }
 
-        (, uint16 finalCardinality,) = hook.getOracleState(poolKey);
-        assertEq(finalCardinality, target, "oracle failed to reach incremental target");
+        (, uint16 finalCardinality, uint16 finalCardinalityNext) = hook.getOracleState(poolKey);
+        assertEq(finalCardinalityNext, target, "oracle failed to reach incremental target");
+        assertLe(finalCardinality, finalCardinalityNext, "the active ring never exceeds the recorded size");
     }
 
     /// @notice Setting `initialCardinality` to the allowed cap pre-warms safely

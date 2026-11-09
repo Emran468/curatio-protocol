@@ -38,8 +38,18 @@ contract CuratioHandler is CommonBase, StdUtils {
     // ── Swap ghosts ───────────────────────────────────────────────────────────
     uint256 public swapCount;
     uint256 public skippedSwaps;
+    /// @dev Swap reverts CAUSED BY THE HOOK: PoolManager wraps any hook revert in WrappedError(...).
     uint256 public unexpectedSwapReverts;
     bytes public lastSwapRevertData;
+    /// @dev Reverts that did NOT come from the hook (PoolManager / router at extreme prices, overflow of the
+    ///      swap maths, ...). Counted and kept for inspection, but not treated as a hook failure.
+    uint256 public otherSwapReverts;
+    bytes public lastOtherSwapRevertData;
+    // what the last failing swap looked like
+    int24 public lastFailedTickBefore;
+    bool public lastFailedZeroForOne;
+    int256 public lastFailedAmountSpecified;
+    bytes4 internal constant WRAPPED_ERROR_SELECTOR = bytes4(keccak256("WrappedError(address,bytes4,bytes,bytes)"));
 
     int24 public lastTickDelta;
     int24 public lastPostSwapTick;
@@ -139,10 +149,7 @@ contract CuratioHandler is CommonBase, StdUtils {
         liquidityRouter.modifyLiquidity(
             key,
             ModifyLiquidityParams({
-                tickLower: lo,
-                tickUpper: hi,
-                liquidityDelta: int256(uint256(SEED_LIQUIDITY)),
-                salt: bytes32(0)
+                tickLower: lo, tickUpper: hi, liquidityDelta: int256(uint256(SEED_LIQUIDITY)), salt: bytes32(0)
             }),
             ""
         );
@@ -169,13 +176,9 @@ contract CuratioHandler is CommonBase, StdUtils {
     //  Swaps
     // ═════════════════════════════════════════════════════════════════════════
 
-    function performSwap(
-        bool zeroForOne,
-        bool exactInput,
-        uint256 amountSeed,
-        uint256 blocksAhead,
-        uint256 secondsSeed
-    ) external {
+    function performSwap(bool zeroForOne, bool exactInput, uint256 amountSeed, uint256 blocksAhead, uint256 secondsSeed)
+        external
+    {
         _advance(blocksAhead, secondsSeed);
 
         (, int24 tickBefore,,) = manager.getSlot0(poolId);
@@ -203,8 +206,17 @@ contract CuratioHandler is CommonBase, StdUtils {
         try swapRouter.swap(key, params, PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "") {
             _recordSwap(tickBefore, amt, gasStart - gasleft());
         } catch (bytes memory reason) {
-            unexpectedSwapReverts++;
-            lastSwapRevertData = reason;
+            lastFailedTickBefore = tickBefore;
+            lastFailedZeroForOne = zeroForOne;
+            lastFailedAmountSpecified = params.amountSpecified;
+
+            if (reason.length >= 4 && bytes4(reason) == WRAPPED_ERROR_SELECTOR) {
+                unexpectedSwapReverts++;
+                lastSwapRevertData = reason;
+            } else {
+                otherSwapReverts++;
+                lastOtherSwapRevertData = reason;
+            }
         }
     }
 
@@ -242,10 +254,7 @@ contract CuratioHandler is CommonBase, StdUtils {
         try liquidityRouter.modifyLiquidity(
             key,
             ModifyLiquidityParams({
-                tickLower: lo,
-                tickUpper: hi,
-                liquidityDelta: int256(uint256(delta)),
-                salt: bytes32(0)
+                tickLower: lo, tickUpper: hi, liquidityDelta: int256(uint256(delta)), salt: bytes32(0)
             }),
             ""
         ) {
@@ -270,10 +279,7 @@ contract CuratioHandler is CommonBase, StdUtils {
         try liquidityRouter.modifyLiquidity(
             key,
             ModifyLiquidityParams({
-                tickLower: lo,
-                tickUpper: hi,
-                liquidityDelta: -int256(uint256(delta)),
-                salt: bytes32(0)
+                tickLower: lo, tickUpper: hi, liquidityDelta: -int256(uint256(delta)), salt: bytes32(0)
             }),
             ""
         ) {
@@ -353,7 +359,8 @@ contract CuratioHandler is CommonBase, StdUtils {
     function ownerSetMaxCardinality(uint256 seed) external {
         uint16 v = uint16(bound(seed, 1, hook.HARD_MAX_CARDINALITY_PER_CALL()));
         vm.prank(owner);
-        try hook.setMaxCardinalityPerCall(v) {} catch {
+        try hook.setMaxCardinalityPerCall(v) {}
+        catch {
             adminUnexpectedRevert = true;
         }
     }
@@ -361,7 +368,8 @@ contract CuratioHandler is CommonBase, StdUtils {
     function ownerSetInitialCardinality(uint256 seed) external {
         uint16 v = uint16(bound(seed, 1, hook.maxCardinalityPerCall()));
         vm.prank(owner);
-        try hook.setInitialCardinality(v) {} catch {
+        try hook.setInitialCardinality(v) {}
+        catch {
             adminUnexpectedRevert = true;
         }
     }

@@ -99,7 +99,7 @@ contract CuratioStrategistRegistryEchidnaTest {
         }
     }
 
-     function fuzz_bulkReassignPools(uint256 s1Seed, uint256 s2Seed) public {
+    function fuzz_bulkReassignPools(uint256 s1Seed, uint256 s2Seed) public {
         address s1 = strategistPool[s1Seed % strategistPool.length];
         address s2 = strategistPool[s2Seed % strategistPool.length];
         if (s1 != s2 && registry.isRegisteredStrategist(s1) && registry.isRegisteredStrategist(s2)) {
@@ -109,8 +109,7 @@ contract CuratioStrategistRegistryEchidnaTest {
 
     function fuzz_recordRebalance(uint256 seed) public {
         address s = strategistPool[seed % strategistPool.length];
-        (bool success,) =
-            address(registry).call(abi.encodeWithSelector(registry.recordRebalanceExecuted.selector, s));
+        (bool success,) = address(registry).call(abi.encodeWithSelector(registry.recordRebalanceExecuted.selector, s));
         // Deliberately unchecked: reverts (unregistered / inactive) are
         // expected and are exactly what the invariants below verify never
         // silently "succeed" instead.
@@ -119,9 +118,8 @@ contract CuratioStrategistRegistryEchidnaTest {
 
     function fuzz_recordFees(uint256 seed, uint256 amount) public {
         address s = strategistPool[seed % strategistPool.length];
-        (bool success,) = address(registry).call(
-            abi.encodeWithSelector(registry.recordFeesGenerated.selector, s, amount % 1e24)
-        );
+        (bool success,) =
+            address(registry).call(abi.encodeWithSelector(registry.recordFeesGenerated.selector, s, amount % 1e24));
         success;
     }
 
@@ -171,9 +169,8 @@ contract CuratioStrategistRegistryEchidnaTest {
             address(registry).call(abi.encodeWithSelector(registry.recordRebalanceExecuted.selector, neverUsed));
         assert(!successRebalance);
 
-        (bool successFees,) = address(registry).call(
-            abi.encodeWithSelector(registry.recordFeesGenerated.selector, neverUsed, amount % 1e24)
-        );
+        (bool successFees,) = address(registry)
+            .call(abi.encodeWithSelector(registry.recordFeesGenerated.selector, neverUsed, amount % 1e24));
         assert(!successFees);
 
         (bool successProfile,) =

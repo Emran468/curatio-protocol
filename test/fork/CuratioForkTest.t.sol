@@ -285,9 +285,10 @@ contract CuratioForkTest is Test {
         assertEq(int256(lastTick), 0);
         assertEq(uint256(fee), uint256(BASE_FEE));
 
+        // Unichain has 1-second timestamps, so the hook pre-warms 240 slots (2x the 120 s window), not 100
         (, uint16 cardinality, uint16 cardinalityNext) = hook.getOracleState(key);
-        assertEq(uint256(cardinality), 100);
-        assertEq(uint256(cardinalityNext), 100);
+        assertEq(uint256(cardinality), 240);
+        assertEq(uint256(cardinalityNext), 240);
         assertFalse(hook.isOracleWarm(key, 120), "oracle must start cold");
     }
 

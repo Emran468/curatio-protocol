@@ -10,7 +10,7 @@ interface Hevm {
 
 contract CuratioAccessEchidnaTest {
     CuratioAccess public access;
-    
+
     // Correct EIP-55 checksummed Hevm address
     Hevm public constant hevm = Hevm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
 

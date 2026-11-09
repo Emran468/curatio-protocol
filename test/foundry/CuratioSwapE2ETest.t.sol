@@ -202,8 +202,8 @@ contract CuratioSwapE2ETest is Test, Deployers {
         swap(poolKey, true, -int256(5 ether), "");
         swap(poolKey, false, -int256(5 ether), ""); // reversal + volume => sandwich flag for this block
 
-        (, uint24 fee,,,) = hook.getPoolState(poolKey);
-        assertEq(fee, hook.MEV_PENALTY_FEE(), "hook must have flagged the sandwich");
+        // the penalty lives only in the flagged block and is no longer stored in the pool state
+        assertEq(hook.getCurrentFee(poolKey), hook.MEV_PENALTY_FEE(), "hook must have flagged the sandwich");
 
         vm.prank(admin);
         vm.expectRevert(CuratioRebalancer.SwapPriceDeviation.selector);
