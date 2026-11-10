@@ -54,9 +54,9 @@ A Uniswap v4 hook with these permissions enabled: `afterInitialize`, `afterAddLi
 | `HIGH_VOLATILE_FEE` | 1.50% (15000) | Spot ≥ 200 ticks from TWAP, or large tick move |
 | `MEV_PENALTY_FEE` | 10.00% (100000) | Spot ≥ 500 ticks from TWAP, or sandwich detected in the current block |
 
-**TWAP oracle.** A Uniswap-v3-style `tickCumulative` ring buffer (`TwapOracle` library), written in `afterSwap`. Cardinality is pre-warmed at pool initialisation (`initialCardinality`, default 100) and can be grown by anyone via `increaseObservationCardinality`, clamped per call by `maxCardinalityPerCall` (hard ceiling 1000). `isOracleWarm` / `getTwapTick` expose the oracle; the default window is 120 s. While the oracle is cold the hook charges the conservative mid fee instead of assuming safety. See [Known limitations](#known-limitations) for how the default depth interacts with fast chains.
+**TWAP oracle.** A Uniswap-v3-style `tickCumulative` ring buffer (`TwapOracle` library), written in `afterSwap`. Cardinality is pre-warmed at pool initialisation (`initialCardinality`, chosen per chain by `ChainRegistry`: **240 slots on chains with ~1 s timestamps** such as Unichain and Arbitrum, 100 elsewhere, because at most one observation is written per second and the window is 120 s). Anyone can grow it via `increaseObservationCardinality`, clamped per call by `maxCardinalityPerCall` (hard ceiling 1000); like Uniswap v3, the new size is only recorded and is applied when the write index reaches the end of the current ring. `isOracleWarm` / `getTwapTick` expose the oracle; the default window is 120 s. While the oracle is cold the hook charges the conservative mid fee instead of assuming safety.
 
-**Sandwich detection (heuristic).** Within a block the hook tracks the first and last tick move and cumulative volume. A direction reversal with volume above `mevVolumeThreshold` flags the block, and all further swaps in that block pay `MEV_PENALTY_FEE`. This is a heuristic, not a classifier — legitimate opposing flow or arbitrage can trigger it.
+**Sandwich detection (heuristic).** Within a block the hook tracks the first and last tick move and the cumulative absolute tick move. A direction reversal, once the swaps of the block have moved the price by at least `sandwichTickThreshold` ticks (default 80) in total, flags the block, and all further swaps in that block pay `MEV_PENALTY_FEE`. The size gate is price impact in ticks, not a raw token amount, so it is independent of token decimals and scales with each pool's depth (`mevVolumeThreshold` is deprecated and no longer used). The penalty lives only in the flagged block: it is not written into the stored pool fee, and `getCurrentFee` reports it only inside that block. This is a heuristic, not a classifier — legitimate opposing flow or arbitrage can trigger it.
 
 **Transient storage (EIP-1153).** The hook uses `tstore` / `tload` to pass state from `beforeSwap` to `afterSwap` within the same swap, at no persistent-storage cost. Each value lives in a per-pool slot derived as `keccak256(abi.encodePacked(poolId, "flag"))` or `keccak256(abi.encodePacked(poolId, "tick"))`.
 
@@ -132,28 +132,27 @@ Registers strategists, assigns pools to them (inactive strategists cannot be ass
 
 ## Known limitations
 
-- Withdrawals that need the LP can revert while the hook charges MEV-penalty fees; `maxWithdraw` / `maxRedeem` do not reflect available liquidity.
+- Withdrawals that need the LP can revert inside a block in which the hook charges the MEV-penalty fee (a flagged sandwich block, or spot ≥ 500 ticks from the TWAP) and retry succeeds in the next block; `maxWithdraw` / `maxRedeem` do not reflect available liquidity.
 - Keeper range selection uses a fixed width.
 - Sandwich detection is heuristic and may produce false positives.
-- The `sandwichTickThreshold` parameter is stored and timelocked but is not currently used in the detection logic.
+- `mevVolumeThreshold` is kept for ABI and timelock compatibility but is **deprecated and no longer used**: sandwich detection now compares the cumulative tick move of the block with `sandwichTickThreshold`.
 - `followStrategist` stores a preference only; it has no on-chain effect on funds yet.
 - Switching the vault's rebalancer stops counting what the old one holds — move funds first.
 - Keeper rebalances are reported to the strategist registry under the automation registry's address, which is not a registered strategist, so they are not attributed to any strategist (the registry call is wrapped in `try/catch`).
-- `mevVolumeThreshold` is compared against the raw `amountSpecified` of each swap, so it is not normalised across token decimals (for example a USDC leg of a USDC/WETH pool counts in 6-decimal units). Not yet covered by a test.
+- The stored fee decays by inactivity, not by time: `lastBlock` is refreshed on every swap, so a stored `MID` or `HIGH` fee only steps back to `BASE` after a gap of `blockDecayWindow` blocks without swaps, or when a later swap moves the price by a tier-changing amount. (By reading the code; not covered by a test.)
 - Unaudited.
 
-### Weaknesses confirmed by the Unichain fork tests
+### Weaknesses found by the Unichain fork tests (fixed)
 
-The `test_finding_*` tests in `CuratioForkFindingsTest` and the `test_swapPath_*` tests in `CuratioForkSwapPathTest` assert the behaviour the code has **today**, so they pass while these weaknesses exist. After a fix, flip the assertions.
+Reading the oracle and fee code, then probing it on a Unichain fork, exposed four weaknesses. They are fixed in `CuratioHook`; the old `test_finding_*` tests were flipped into `test_fix_*` regression tests in `CuratioForkFindingsTest`, `CuratioForkSwapPathTest` and `CuratioForkDecimalsTest`.
 
-1. **Default oracle depth is too small for a 1-second chain.** `initialCardinality` defaults to 100 observations. On Unichain (1 s blocks) a pool that swaps every second only covers about 99 s of history, which is shorter than the 120 s TWAP window. `isOracleWarm` turns false, so the hook charges the cold-start fee and the TWAP guard is off. `getTwapTick` also reverts, so the vault's `totalAssets()` reverts and **deposits and withdrawals halt** until the pool is quiet for roughly 20–30 s. Growing the buffer before it wraps (for example to 400) keeps the oracle warm, so the problem is the default, not the TWAP design. Suggested fix: set the default high enough for the window (more observations than window ÷ seconds per write, with margin).
-   Tests: `test_finding_busyPool_oracleNeverWarms_vaultFrozen_thenRecovers`, `test_finding_largerCardinalityBeforeWrap_keepsOracleWarm`.
+1. **Default oracle depth too small for a 1-second chain (fixed).** With 100 observations and one write per second, a busy pool only covered about 99 s, shorter than the 120 s TWAP window. The oracle never warmed, the TWAP guard was off, and `getTwapTick` reverted, so the vault's `totalAssets()` reverted and deposits and withdrawals halted. *Fix:* `ChainRegistry.getInitialCardinality` gives 240 slots on Unichain, Unichain Sepolia, Arbitrum and Arbitrum Sepolia (cost: one cold SSTORE per slot at pool initialisation). *Tests:* `test_fix_unichainDefaultOracleDepth`, `test_fix_busyPool_oracleStaysWarm_vaultKeepsWorking`.
 
-2. **Anyone can break the oracle by growing it after the ring has wrapped.** `increaseObservationCardinality` is permissionless and sets `cardinality = cardinalityNext` immediately. If the ring has already wrapped while the oracle is warm, the buffer becomes `[old part][empty gap][new part]`, `TwapOracle.binarySearch` cannot bracket `now − 120 s` and reverts with `insufficient observation history`. `beforeSwap` and the vault's valuation both depend on it, so **swaps on the pool and the vault halt** (a swap after more than 120 s of quiet takes the extrapolation path and works once, then the problem returns). Suggested fix: apply the new cardinality only when the write index reaches the end of the old ring (as Uniswap v3 does), or make the function owner-only.
-   Test: `test_finding_growingOracleAfterWrap_bricksSwapsAndVault`.
+2. **Anyone could break the oracle by growing it after the ring wrapped (fixed).** `increaseObservationCardinality` is permissionless and applied the new size immediately. On a wrapped, warm ring this left an empty gap in the middle of the buffer, `TwapOracle.binarySearch` reverted, and both `beforeSwap` and the vault's valuation halted. *Fix:* Uniswap v3 rule in `TwapOracle.write`: the function only records `cardinalityNext`; the ring switches to it when the write index reaches the last slot of the current ring. *Test:* `test_fix_growthAfterWrap_isDeferred_oracleStaysHealthy`.
 
-3. **The MEV penalty is cheap to trigger and lasts a whole decay window.** Any address can flag a "sandwich" with two opposite swaps in one block above `mevVolumeThreshold`; the attack costs only swap fees (the test bounds it below 2.5% of the traded volume). The stored 10% fee then keeps applying to calm swaps for `blockDecayWindow` blocks (300 on Unichain, about 5 minutes). During that time the rebalancer's TWAP price check fails, so **withdrawals that must unwind the LP and keeper rebalances that need a swap revert** with `SwapPriceDeviation`. Withdrawals that the rebalancer's idle asset can cover are not affected. Possible mitigations: apply the penalty only in the flagged block, or let the vault fall back to a partial withdrawal when the swap would be rejected.
-   Tests: `test_finding_cheapSandwichFlagsPenaltyForAnyone`, `test_swapPath_withdrawNeedingSwap_revertsInSandwichBlock`, `test_swapPath_withdrawNeedingSwap_succeedsOnlyAfterDecayWindow`, `test_swapPath_withdrawWithinIdle_worksDuringPenalty`, `test_swapPath_keeperTwoSidedRange_revertsInSandwichBlock`.
+3. **A cheap sandwich blocked withdrawals for a whole decay window (fixed).** Any address could flag a block with two opposite swaps for the price of the swap fees. The 10% penalty was also stored as the pool's current fee and re-stored by every calm swap, so it kept applying for `blockDecayWindow` blocks (300 on Unichain) and made the rebalancer's TWAP price check reject LP-unwind withdrawals and keeper swaps. *Fix:* the penalty is enforced only for the rest of the flagged block through the per-block flag; it is no longer written into `poolStates.fee`. An attacker can still make a withdrawal that needs a swap fail inside the flagged block (the cost is the swap fees), but a retry in the next block succeeds. Withdrawals covered by the rebalancer's idle asset were never affected. *Tests:* `test_fix_penaltyEndsWithTheFlaggedBlock`, `test_swapPath_withdrawNeedingSwap_revertsInSandwichBlock`, `test_swapPath_withdrawNeedingSwap_succeedsOneBlockAfterSandwich`, `test_swapPath_withdrawWithinIdle_worksDuringPenalty`, `test_swapPath_keeperTwoSidedRange_revertsInSandwichBlock`.
+
+4. **Sandwich detection ignored token decimals (fixed).** The size gate compared the raw `amountSpecified` of each swap with one hook-wide `mevVolumeThreshold` (1 ether). On the real USDC (6 decimals) / WETH (18) pool a \$20k USDC sandwich was not detected, a ~\$12k sandwich with a WETH leg was, and a threshold tuned for USDC flagged a \$60 WETH round trip. *Fix:* the gate is now the cumulative absolute tick move of the block (`SandwichTracker.totalMove`, packed into previously unused bits, readable through `getBlockTickMove`) compared with `sandwichTickThreshold` (default 80 ticks). Ticks need no decimals and scale with the pool's depth. `mevVolumeThreshold` stays in the ABI but is deprecated. *Tests:* `test_decimals_usdcDenominatedSandwich_isDetected`, `test_decimals_wethDenominatedSandwich_isStillDetected`, `test_decimals_dustRoundTrips_areNotFlagged_inEitherDirection`, `test_decimals_sandwichTickThreshold_isTunableInTicks`.
 
 ---
 
@@ -187,7 +186,7 @@ forge test
 
 ## Testing
 
-The Foundry suite currently reports **490 passing tests across 18 suites, 0 failures**. In addition, **41 mainnet-fork tests across 5 suites** (see below) pass against Unichain.
+The Foundry suite currently reports **493 passing tests across 18 suites, 0 failures**. In addition, **45 mainnet-fork tests across 6 suites** pass against Unichain, and **25 stateful invariants** fuzz the hook (see below).
 
 ### Coverage
 
@@ -200,7 +199,7 @@ The Foundry suite currently reports **490 passing tests across 18 suites, 0 fail
 | `CuratioVault` | 89% |
 | `CuratioRebalancer` | 80% |
 
-Regenerate with `forge coverage`.
+These figures come from the last coverage run, taken before the hook changes described under [Known limitations](#weaknesses-found-by-the-unichain-fork-tests-fixed). Regenerate with `forge coverage`.
 
 ### Test suites
 
@@ -219,15 +218,16 @@ Regenerate with `forge coverage`.
 
 ### Mainnet-fork tests (Unichain)
 
-41 tests in 5 suites, all passing. They run against the **real Unichain PoolManager** (`0x1F98…0004`, chain id 130) with a freshly deployed Curatio stack and a new pool that uses the hook, so no existing Uniswap pool is touched. Fees are read from the PoolManager's own `Swap` event, so they show the fee actually charged. Block time on Unichain is 1 s, so the tests move blocks and seconds together.
+45 tests in 6 suites, all passing. They run against the **real Unichain PoolManager** (`0x1F98…0004`, chain id 130) with a freshly deployed Curatio stack and a new pool that uses the hook, so no existing Uniswap pool is touched. Fees are read from the PoolManager's own `Swap` event, so they show the fee actually charged. Block time on Unichain is 1 s, so the tests move blocks and seconds together.
 
 | Suite (`test/fork/`) | Tests | What it covers |
 |----------------------|------:|----------------|
 | `CuratioForkTest` | 16 | Chain guard and wrong-PoolManager revert, hook initialisation, fee tiers (cold 6000, calm 3000, escalation to 15000 and decay after 300 blocks), TWAP-based MEV penalty, sandwich detection, oracle observations, vault deposit/redeem, LP creation in the real PoolManager, partial and full unwind, harvest, `checkUpkeep` |
 | `CuratioForkKeeperTest` | 6 | `performUpkeep`: registry-only access, default caps of 0 revert with `SlippageExceeded`, position opened around the TWAP, "too soon" and "range unchanged" skips, no strategist attribution |
 | `CuratioForkRealTokensTest` | 7 | Real Unichain USDC (6 decimals) and WETH (18) in a ~\$3000 pool: 12-decimal shares, fee tiers at tick ~196k, TWAP valuation of idle WETH, single-sided USDC LP, partial withdraw and full redeem |
-| `CuratioForkSwapPathTest` | 6 | Paths that swap inside the unlock: withdrawals that unwind a two-sided LP and keeper rebalances into a range containing the price, including their failure during a MEV-penalty window |
-| `CuratioForkFindingsTest` | 6 | Two pools sharing one hook stay isolated, timelocked thresholds change real fees, and the weaknesses listed under [Known limitations](#weaknesses-confirmed-by-the-unichain-fork-tests) |
+| `CuratioForkSwapPathTest` | 6 | Paths that swap inside the unlock: withdrawals that unwind a two-sided LP and keeper rebalances into a range containing the price, including their failure inside a flagged sandwich block and recovery one block later |
+| `CuratioForkFindingsTest` | 6 | Two pools sharing one hook stay isolated, timelocked thresholds change real fees, and regression tests for the three fixes listed under [Known limitations](#weaknesses-found-by-the-unichain-fork-tests-fixed) |
+| `CuratioForkDecimalsTest` | 4 | Real USDC/WETH: sandwich detection is decimals-independent (a \$20k USDC sandwich and a ~\$12k WETH sandwich are both detected), \$60 dust round trips are not false positives in either direction, and `sandwichTickThreshold` is tunable through the timelock |
 
 **Setup.** Add a profile to `foundry.toml` (the default profile points `test` at `test/foundry`):
 
@@ -253,7 +253,8 @@ forge test --match-path test/fork/CuratioForkTest.t.sol -vv
 forge test --match-path test/fork/CuratioForkKeeperTest.t.sol   --match-test test_keeper -vv
 forge test --match-path test/fork/CuratioForkRealTokensTest.t.sol -vv
 forge test --match-path test/fork/CuratioForkSwapPathTest.t.sol --match-test test_swapPath -vv
-forge test --match-path test/fork/CuratioForkFindingsTest.t.sol --match-test "test_more|test_finding" -vv
+forge test --match-path test/fork/CuratioForkFindingsTest.t.sol --match-test "test_more|test_fix" -vv
+forge test --match-path test/fork/CuratioForkDecimalsTest.t.sol --match-test test_decimals -vv
 ```
 
 ```powershell
@@ -264,17 +265,58 @@ forge test --match-path test/fork/CuratioForkTest.t.sol -vv
 
 Clear the profile afterwards (`unset FOUNDRY_PROFILE` / `Remove-Item Env:FOUNDRY_PROFILE`) so a plain `forge test` goes back to `test/foundry`.
 
-**Not yet covered by fork tests:** USDC blacklist behaviour, and the decimals handling of `mevVolumeThreshold`.
+**Not yet covered by fork tests:** USDC blacklist behaviour.
+
+### Invariant tests (stateful fuzzing)
+
+25 Foundry invariants in `test/invariant/` (`CuratioHookInvariantTest` driven by `CuratioHandler`) fuzz the hook against a local PoolManager with real swap and liquidity routers. The handler performs random swaps (exact-in and exact-out, both directions, 0 to 30 blocks apart so that same-block sandwiches happen), liquidity adds and removes, oracle growth by an arbitrary caller, owner timelock actions and calls from non-owners. It mirrors every action in ghost variables, so the invariants compare the hook's state with what should have happened.
+
+| Area | What is checked |
+|------|-----------------|
+| Pool and fees | tick and price stay valid; the hook's `lastTick`, `lastBlock` and `lastTimestamp` match the pool and the last swap; stored and current fees are always one of the defined tiers; the fee decays to `BASE_FEE` after the decay window |
+| MEV penalty | the penalty is never stored in the pool state; `getCurrentFee` reports it only in a block that already had a swap; the tick move recorded for a block is 0 unless a swap happened in it |
+| Volume and tracker | per-block volume and the sandwich tracker match the handler's ghost values |
+| Liquidity | stored positions match the ghost accounting; active liquidity never exceeds what was added; the seed liquidity floor holds |
+| Oracle | `index < cardinality <= cardinalityNext`; cardinality never decreases; per-call growth cap holds; a warm oracle is always readable by `getTwapTick` (this is the invariant that would catch an oracle broken by growing it after the ring wrapped) |
+| Liveness and gas | no swap reverts inside the hook; swap gas stays bounded |
+| Governance | threshold ordering, the 2-day timelock, owner-only functions reject strangers, cardinality caps stay within the hard ceiling |
+
+Swap reverts are classified: PoolManager wraps every revert that comes from a hook in `WrappedError`, so those count as hook failures and fail `invariant_swapsNeverRevert` (with the failing swap and revert data logged). Reverts that come from the PoolManager or the router (for example the swap maths at extreme prices) are counted separately and reported by `afterInvariant` without failing the run.
+
+**Setup.** Add a profile to `foundry.toml` (the default profile's `[profile.default.invariant]` section sets `runs = 256`, `depth = 400`, `fail_on_revert = true`):
+
+```toml
+[profile.invariant]
+test = "test/invariant"
+```
+
+**Run.**
+
+```bash
+# bash
+FOUNDRY_PROFILE=invariant forge test --match-path test/invariant/CuratioHookInvariantTest.t.sol -vv
+```
+
+```powershell
+# PowerShell
+$env:FOUNDRY_PROFILE = "invariant"
+forge test --match-path test/invariant/CuratioHookInvariantTest.t.sol -vv
+```
+
+A full run is slow (25 invariants x 256 runs x 400 calls). For a quick pass set `FOUNDRY_INVARIANT_RUNS=32`. The output is long because `bound()` logs every call; redirect it to a file and search for `PASS` and `FAIL`.
+
+The `test/Echidna/` contracts are harnesses for Echidna and are not run by Foundry.
 
 ---
 
 ## Roadmap
 
 **Phase 1: Hardening (current)**
-- [x] Foundry unit, fuzz and end-to-end suite (490 tests, 18 suites)
-- [x] Unichain mainnet-fork suite (41 tests, 5 suites, including real USDC/WETH)
-- [ ] **Fix the three confirmed weaknesses** (default oracle depth, permissionless cardinality growth after wrap, penalty window blocking withdrawals) and flip the `test_finding_*` assertions
-- [ ] Make `mevVolumeThreshold` decimals-aware and cover it with a real-token fork test
+- [x] Foundry unit, fuzz and end-to-end suite (493 tests, 18 suites)
+- [x] Unichain mainnet-fork suite (45 tests, 6 suites, including real USDC/WETH)
+- [x] Stateful invariant suite for the hook (25 invariants, `depth = 400`)
+- [x] Fix the three weaknesses found by the fork tests (oracle depth, cardinality growth after wrap, block-scoped MEV penalty) and flip the finding tests into regression tests
+- [x] Make sandwich detection decimals-independent (cumulative tick move vs `sandwichTickThreshold`; regression tests in `CuratioForkDecimalsTest`)
 - [ ] **Echidna property-based fuzzing** of the core invariants:
   - Vault: user actions never change the high-water mark; `harvest()` never charges more than the fee rate × gain; a sole depositor's deposit/redeem round trip is exact.
   - Vault: no deposit or mint ever succeeds with zero shares.
