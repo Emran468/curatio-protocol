@@ -12,6 +12,30 @@ import {Position} from "@uniswap/v4-core/src/libraries/Position.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {CuratioRebalancer} from "../../src/CuratioRebalancer.sol";
 
+contract MockCuratioHook {
+    int24 public immutable twapTick;
+    int24 public immutable lastTick;
+    uint24 public immutable fee;
+
+    constructor(int24 _twap, int24 _last, uint24 _fee) {
+        twapTick = _twap;
+        lastTick = _last;
+        fee = _fee;
+    }
+
+    function getTwapTick(PoolKey calldata, uint32) external view returns (int24) {
+        return twapTick;
+    }
+
+    function getPoolState(PoolKey calldata) external view returns (int24, uint24, uint64, uint64, bool) {
+        return (lastTick, fee, uint64(block.number), uint64(block.timestamp), true);
+    }
+
+    function getCurrentFee(PoolKey calldata) external view returns (uint24) {
+        return fee;
+    }
+}
+
 /// @notice CuratioRebalancer against the REAL v4 PoolManager (no mocks).
 contract CuratioRebalancerRealPMTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
@@ -29,6 +53,8 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
     address automationRegistry = makeAddr("automationRegistry");
 
     function setUp() public {
+        vm.etch(hook, address(new MockCuratioHook(580, 600, 3000)).code);
+        assertGt(hook.code.length, 0, "hook must have code");
         deployFreshManagerAndRouters();
         (currency0, currency1) = deployMintAndApprove2Currencies();
 
@@ -173,6 +199,11 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
 
     function test_realPM_performUpkeep_negativeTick() public {
         _fundRebalancer(1000 ether);
+
+        // TWAP-কে referenceTick-এর সাথে মিলিয়ে দিন
+        vm.etch(hook, address(new MockCuratioHook(-70, -70, 3000)).code);
+        // ← assertEq(IcuratioHookView(...)...) এই লাইনটা বাদ
+
         vm.prank(admin);
         rebalancer.setKeeperMaxPay(MAX, MAX);
         vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
@@ -180,7 +211,6 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         vm.prank(automationRegistry);
         rebalancer.performUpkeep(abi.encode(int24(-70), false));
 
-        // floor(-70/60)*60 = -120 ; range = -120 +- 120
         assertEq(rebalancer.currentTickLower(), -240);
         assertEq(rebalancer.currentTickUpper(), 0);
         assertEq(_liq(-240, 0), 1000 ether);
@@ -188,28 +218,37 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
 
     function test_realPM_performUpkeep_revertsWithDefaultZeroCaps() public {
         _fundRebalancer(1000 ether);
+
+        // ⬇ TWAP-কে refTick-এর সাথে মিলিয়ে দিন (deviation=0, চেক active, তবে পাস করে)
+        vm.etch(hook, address(new MockCuratioHook(580, 580, 3000)).code);
+
+        // setKeeperMaxPay কল করবেন না — caps = 0 ডিফল্টে রাখুন
         vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
 
         vm.prank(automationRegistry);
         vm.expectRevert(CuratioRebalancer.SlippageExceeded.selector);
-        rebalancer.performUpkeep(abi.encode(int24(0), false));
+        rebalancer.performUpkeep(abi.encode(int24(580), false)); // refTick = 580 = TWAP
     }
 
     function test_realPM_performUpkeep_skipsWhenRangeUnchanged() public {
         _fundRebalancer(1000 ether);
+
+        // ধাপ ১: প্রাথমিক position তৈরি করুন এমন tick-এ যেটা পরের refTick-এর সাথে মিলে
+        vm.etch(hook, address(new MockCuratioHook(0, 0, 3000)).code);
         vm.prank(admin);
         rebalancer.setKeeperMaxPay(MAX, MAX);
         vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
 
         vm.prank(automationRegistry);
-        rebalancer.performUpkeep(abi.encode(int24(0), false));
-        uint256 firstBlock = rebalancer.lastRebalanceBlock();
+        rebalancer.performUpkeep(abi.encode(int24(0), false)); // range = [-120, 120]
 
+        // ধাপ ২: একই refTick দিয়ে আবার কল → range অপরিবর্তিত
         vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
         vm.prank(automationRegistry);
-        rebalancer.performUpkeep(abi.encode(int24(0), false)); // same range again
 
-        assertEq(rebalancer.lastRebalanceBlock(), firstBlock, "identical range must not re-execute");
+        vm.expectEmit(false, false, false, true);
+        emit CuratioRebalancer.RebalanceSkipped("Range unchanged");
+        rebalancer.performUpkeep(abi.encode(int24(0), false));
     }
 
     function test_realPM_performUpkeep_keepsExistingLiquiditySize() public {
@@ -225,5 +264,16 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         // keeper must reuse 100 ether, NOT the 1000 ether default
         assertEq(rebalancer.currentLiquidity(), 100 ether);
         assertEq(_liq(-120, 120), 0);
+    }
+
+    function test_realPM_performUpkeep_revertsOnExcessiveDeviation() public {
+        // ⬇ এই লাইনটা আগে ছিল না — এটাই মূল ফিক্স
+        vm.roll(block.number + rebalancer.minBlocksBetweenRebalances() + 1);
+
+        vm.prank(automationRegistry);
+        vm.expectRevert(
+            abi.encodeWithSelector(CuratioRebalancer.ReferenceTickDeviation.selector, int24(2000), int24(580))
+        );
+        rebalancer.performUpkeep(abi.encode(int24(2000), false));
     }
 }

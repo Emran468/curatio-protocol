@@ -21,11 +21,14 @@ import {CuratioHook, Ownable} from "../../src/CuratioHook.sol";
 import {MultiSwapRouter} from "./MultiSwapRouter.sol";
 import {MockERC20} from "@uniswap/v4-core/lib/solmate/src/test/utils/mocks/MockERC20.sol";
 import {FlashLoanAttacker} from "./FlashLoanAttacker.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 /// @dev Foundry test suite for CuratioHook.
 ///      Run with: forge test --match-contract CuratioHookTest -vvv
 contract CuratioHookTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
     CuratioHook internal hook;
     address internal owner = makeAddr("owner");
@@ -63,8 +66,8 @@ contract CuratioHookTest is Test, Deployers {
         MockERC20(Currency.unwrap(currency1)).approve(address(multiSwapRouter), type(uint256).max);
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
 
         bytes memory constructorArgs = abi.encode(manager, owner);
@@ -105,7 +108,7 @@ contract CuratioHookTest is Test, Deployers {
     function test_hookPermissions_areSetCorrectly() public view {
         Hooks.Permissions memory perms = hook.getHookPermissions();
 
-        assertTrue(perms.beforeInitialize == false, "beforeInitialize should be false-permission but callback exists");
+        assertTrue(perms.beforeInitialize, "beforeInitialize should be enabled");
         assertTrue(perms.afterInitialize, "afterInitialize should be enabled");
         assertFalse(perms.beforeAddLiquidity, "beforeAddLiquidity should be disabled");
         assertTrue(perms.afterAddLiquidity, "afterAddLiquidity should be enabled");
@@ -1210,42 +1213,45 @@ contract CuratioHookTest is Test, Deployers {
     ///         branches of pack/unpack within one sequence.
     function test_sandwichTracker_packUnpack_mixedSignsAcrossReversal() public {
         (int24 tickStart,,,,) = hook.getPoolState(poolKey);
-        _swap(false, 3 ether);
+
+        // 1. First swap: UP (false) -> Positive move.
+        _swapAs(alice, false, 3 ether);
         (int24 tickAfterFirst,,,,) = hook.getPoolState(poolKey);
         int24 expectedFirstMove = tickAfterFirst - tickStart;
-        assertGt(expectedFirstMove, 0, "setup invalid: first move must be positive");
 
-        _swap(true, 1 ether);
+        // Strict check to ensure we are actually testing positive values.
+        assertGt(expectedFirstMove, 0, "Setup invalid: first move must be positive (UP)");
+
+        // 2. Second swap: DOWN (true) -> Negative move (Reversal).
+        _swapAs(bob, true, 1 ether);
         (int24 tickAfterSecond,,,,) = hook.getPoolState(poolKey);
         int24 expectedLastMove = tickAfterSecond - tickAfterFirst;
-        assertLt(expectedLastMove, 0, "setup invalid: second move must be negative (reversal)");
+
+        // Strict check to ensure we actually triggered a reversal.
+        assertLt(expectedLastMove, 0, "Setup invalid: second move must be negative (DOWN)");
 
         (int24 firstMove, int24 lastMove,,,, bool initialized) = hook.getSandwichTracker(poolKey);
         uint24 currentFee = hook.getCurrentFee(poolKey);
 
-        assertTrue(initialized, "tracker must be initialized");
+        assertTrue(initialized, "Tracker must be initialized");
 
-        // The reversal must have triggered sandwich detection (confirmed
-        // empirically: fee escalates to MEV_PENALTY_FEE). Once triggered,
-        // afterSwap resets firstMove = currentMove, so firstMove now equals
-        // the negative lastMove rather than the original positive move.
-        assertEq(
-            currentFee,
-            MEV_PENALTY_FEE,
-            "setup invalid: reversal must trigger MEV penalty for this test to be meaningful"
-        );
+        // Ensure the reversal actually triggered the penalty (Sanity check).
+        assertEq(currentFee, MEV_PENALTY_FEE, "Setup invalid: reversal must trigger MEV penalty");
 
-        assertEq(lastMove, expectedLastMove, "lastMove failed negative round-trip after reversal");
+        // 3. Strict assertion for the FIX:
+        // The lastMove should be negative (DOWN).
+        assertEq(lastMove, expectedLastMove, "lastMove failed negative round-trip");
+
+        // The firstMove should REMAIN POSITIVE (UP) because we removed the tracker reset in afterSwap.
         assertEq(
             firstMove,
-            expectedLastMove,
-            "firstMove must be reset to currentMove (negative) after sandwich detection resets it"
+            expectedFirstMove,
+            "firstMove MUST NOT reset after sandwich detection. It should remain the block's first move."
         );
 
-        // Sanity: confirm we actually exercised the negative sign-extension
-        // branch on both fields, not the positive path.
-        assertLt(firstMove, 0);
-        assertLt(lastMove, 0);
+        // Final sanity checks for the signs to prevent silent passes.
+        assertGt(firstMove, 0, "firstMove must remain positive");
+        assertLt(lastMove, 0, "lastMove must be negative");
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1285,8 +1291,8 @@ contract CuratioHookTest is Test, Deployers {
         vm.chainId(1); // Ethereum mainnet
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
 
         // ইচ্ছাকৃতভাবে ভুল PoolManager address — Ethereum mainnet-এর জন্য
@@ -1305,8 +1311,8 @@ contract CuratioHookTest is Test, Deployers {
         vm.chainId(1); // Ethereum mainnet
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
 
         // ChainRegistry.getPoolManager(1)-এর exact expected address
@@ -1327,8 +1333,8 @@ contract CuratioHookTest is Test, Deployers {
         vm.chainId(8453); // Base mainnet
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
 
         address wrongManager = address(0xBEEF);
@@ -1345,8 +1351,8 @@ contract CuratioHookTest is Test, Deployers {
         vm.chainId(8453); // Base Mainnet
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
 
         address expectedManager = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
@@ -1366,8 +1372,8 @@ contract CuratioHookTest is Test, Deployers {
         vm.chainId(130); // Unichain
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
 
         address expectedManager = 0x1F98400000000000000000000000000000000004;
@@ -1387,8 +1393,8 @@ contract CuratioHookTest is Test, Deployers {
         vm.chainId(42161); // Arbitrum One
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
 
         address expectedManager = 0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32;
@@ -1408,8 +1414,8 @@ contract CuratioHookTest is Test, Deployers {
         vm.chainId(421614); // Arbitrum Sepolia
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
 
         address expectedManager = 0xFB3e0C6F74eB1a21CC1Da29aeC80D2Dfe6C9a317;
@@ -1428,8 +1434,8 @@ contract CuratioHookTest is Test, Deployers {
     function test_constructor_succeedsForOptimism() public {
         vm.chainId(10);
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         address expectedManager = 0x9a13F98Cb987694C9F086b1F5eB990EeA8264Ec3;
         bytes memory constructorArgs = abi.encode(expectedManager, owner);
@@ -1443,8 +1449,8 @@ contract CuratioHookTest is Test, Deployers {
     function test_constructor_succeedsForSepolia() public {
         vm.chainId(11155111);
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         address expectedManager = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
         bytes memory constructorArgs = abi.encode(expectedManager, owner);
@@ -1458,8 +1464,8 @@ contract CuratioHookTest is Test, Deployers {
     function test_constructor_succeedsForUnichainSepolia() public {
         vm.chainId(1301);
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         address expectedManager = 0x00B036B58a818B1BC34d502D3fE730Db729e62AC;
         bytes memory constructorArgs = abi.encode(expectedManager, owner);
@@ -1473,10 +1479,10 @@ contract CuratioHookTest is Test, Deployers {
     function test_constructor_succeedsForBaseSepolia() public {
         vm.chainId(84532);
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
-        address expectedManager = 0x00B036B58a818B1BC34d502D3fE730Db729e62AC;
+        address expectedManager = 0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408;
         bytes memory constructorArgs = abi.encode(expectedManager, owner);
         (address hookAddress, bytes32 salt) =
             HookMiner.find(address(this), flags, type(CuratioHook).creationCode, constructorArgs);
@@ -1489,8 +1495,8 @@ contract CuratioHookTest is Test, Deployers {
         vm.chainId(137); // Polygon — ChainRegistry-তে নেই
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
 
         address anyManager = address(0xBEEF);
@@ -1502,6 +1508,379 @@ contract CuratioHookTest is Test, Deployers {
         // তারপর CuratioHook constructor-এর ভেতরের chain-check revert করবে
         vm.expectRevert("ChainRegistry: unsupported chain");
         new CuratioHook{salt: salt}(IPoolManager(anyManager), owner);
+    }
+
+    function test_twapOracle_interpolation_math_is_exact() public {
+        // 1. Initial setup (Pool must have sufficient liquidity)
+        // Assume swapRouter is already approved in setUp()
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: -120,
+                tickUpper: 120,
+                liquidityDelta: int256(100e18), // Large liquidity to prevent extreme price impact
+                salt: bytes32(0)
+            }),
+            ""
+        );
+
+        // 2. First Swap at t = 1000
+        vm.warp(1000);
+        swapRouter.swap(
+            poolKey,
+            SwapParams({zeroForOne: true, amountSpecified: -1e15, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        (, int24 T1,,) = manager.getSlot0(poolId); // T1 = Tick after the first swap
+
+        // 3. Second Swap at t = 1100
+        vm.warp(1100);
+        swapRouter.swap(
+            poolKey,
+            SwapParams({zeroForOne: true, amountSpecified: -1e15, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        (, int24 T2,,) = manager.getSlot0(poolId); // T2 = Tick after the second swap
+
+        // 4. Now at t = 1150, and we request a twapWindow of 100 seconds
+        vm.warp(1150);
+
+        // 5. Call the TWAP function (This will trigger the interpolation logic)
+        // targetTime will be 1150 - 100 = 1050, which is exactly in the middle of 1000 and 1100
+        int24 twapTick = hook.getTwapTick(poolKey, 100);
+
+        // 6. Mathematical calculation:
+        // Since 1050 is exactly halfway between 1000 and 1100,
+        // the expected interpolated TWAP is the average of T1 and T2
+        int24 expectedTwap = (T1 + T2) / 2;
+
+        // 7. Strict assertion (Prevents silent passing)
+        // If your interpolation math is off by even 1 wei/tick, this will fail.
+        assertEq(twapTick, expectedTwap, "Interpolation math is incorrect!");
+    }
+
+    function test_afterInitialize_stateIsStrictlySet() public {
+        // 1. Create a NEW pool to trigger afterInitialize without reverting
+        // We use a different tickSpacing (10 instead of 60) to make it unique
+        PoolKey memory newPoolKey = PoolKey({
+            currency0: currency0, currency1: currency1, fee: LPFeeLibrary.DYNAMIC_FEE_FLAG, tickSpacing: 10, hooks: hook
+        });
+
+        // 2. Set specific block and timestamp to test against defaults
+        uint256 expectedBlock = 12345;
+        uint256 expectedTimestamp = 987654321;
+        vm.roll(expectedBlock);
+        vm.warp(expectedTimestamp);
+
+        // 3. Initialize the new pool (This triggers hook.afterInitialize)
+        manager.initialize(newPoolKey, SQRT_PRICE_1_1);
+
+        // 4. Fetch the state from the hook for the NEW pool
+        (int24 lastTick, uint24 fee, uint64 lastBlock, uint64 lastTimestamp, bool initialized) =
+            hook.getPoolState(newPoolKey);
+
+        // 5. Strict Assertions (Prevents silent passing)
+        assertEq(int256(lastTick), int256(0), "lastTick must be the initial pool tick");
+        assertEq(uint256(fee), uint256(hook.BASE_FEE()), "fee must default to BASE_FEE");
+        assertEq(uint256(lastBlock), expectedBlock, "lastBlock must equal the initialization block");
+        assertEq(uint256(lastTimestamp), expectedTimestamp, "lastTimestamp must equal the initialization timestamp");
+        assertTrue(initialized, "initialized must be true");
+    }
+
+    function test_afterSwap_trackerResetsOnNewBlock_and_tickDeltaIsAbsolute() public {
+        // 1. Setup: Add Liquidity to the pool so swaps can execute
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({tickLower: -120, tickUpper: 120, liquidityDelta: int256(100e18), salt: bytes32(0)}),
+            ""
+        );
+
+        // 2. Set a specific block number and perform the FIRST swap (zeroForOne = true, price goes down)
+        vm.roll(1000);
+        (, int24 preTick1,,) = manager.getSlot0(poolId);
+
+        swapRouter.swap(
+            poolKey,
+            SwapParams({zeroForOne: true, amountSpecified: -1e15, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        (, int24 postTick1,,) = manager.getSlot0(poolId);
+
+        // 3. Fetch the tracker state (This reads the state set by the red highlighted block)
+        (,,, uint256 startBlock1, uint256 swapCount1, bool init1) = hook.getSandwichTracker(poolKey);
+
+        // Strict assertions for the FIRST swap in block 1000
+        assertTrue(init1, "Tracker must be initialized");
+        assertEq(startBlock1, 1000, "Tracker startBlock must be the current block");
+        assertEq(swapCount1, 1, "Tracker swapCount must be incremented after the swap");
+
+        // Verify the absolute math: tickDelta = uint24(tickDeltaRaw >= 0 ? tickDeltaRaw : -tickDeltaRaw)
+        // Since it was zeroForOne, preTick1 > postTick1, so the absolute difference is preTick1 - postTick1
+        uint256 expectedTickMove = uint256(uint24(preTick1 - postTick1));
+        assertEq(hook.getBlockTickMove(poolKey), expectedTickMove, "tickDelta absolute value math failed");
+
+        // 4. Advance to a NEW block (1001) and perform a SECOND swap (zeroForOne = false, price goes up)
+        vm.roll(1001);
+        (, int24 preTick2,,) = manager.getSlot0(poolId);
+
+        swapRouter.swap(
+            poolKey,
+            SwapParams({zeroForOne: false, amountSpecified: -1e15, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        (, int24 postTick2,,) = manager.getSlot0(poolId);
+
+        // 5. Fetch the tracker state again
+        (,,, uint256 startBlock2, uint256 swapCount2, bool init2) = hook.getSandwichTracker(poolKey);
+
+        // Strict assertions for the NEW block
+        assertTrue(init2, "Tracker must be initialized");
+        assertEq(startBlock2, 1001, "Tracker startBlock must be updated to the new block");
+        assertEq(swapCount2, 1, "Tracker swapCount must be reset to 1 for the new block");
+
+        // Verify the absolute math again
+        // Since it was zeroForOne = false, postTick2 > preTick2, so the absolute difference is postTick2 - preTick2
+        uint256 expectedTickMove2 = uint256(uint24(postTick2 - preTick2));
+        assertEq(
+            hook.getBlockTickMove(poolKey), expectedTickMove2, "tickDelta absolute value math failed in second block"
+        );
+    }
+
+    function test_beforeInitialize_revertsOnStaticFeePool() public {
+        // স্ট্যাটিক ফি (3000) দিয়ে একটি পুল তৈরি করার চেষ্টা
+        PoolKey memory staticFeeKey = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: 3000, // Static Fee
+            tickSpacing: 60,
+            hooks: hook
+        });
+
+        // ⚠️ ফিক্স: manager.initialize() এর বদলে সরাসরি hook.beforeInitialize() কল করুন
+        vm.expectRevert(CuratioHook.PoolMustUseDynamicFee.selector);
+        hook.beforeInitialize(address(this), staticFeeKey, SQRT_PRICE_1_1);
+    }
+
+    function test_beforeSwap_reversalLogic_AttackerVsVictim() public {
+        // 1. Alice UP (false) -> Tracker firstMove becomes POSITIVE (UP)
+        _swapAs(alice, false, 10 ether);
+
+        // 2. Bob DOWN (true) -> Reversal, pays penalty.
+        // Because of the fix, tracker firstMove REMAINS POSITIVE (UP).
+        _swapAs(bob, true, 10 ether);
+
+        // 3. Attacker Test:
+        // Since the block's first move was UP, the attacker must go DOWN (true) to trigger the penalty.
+        SwapParams memory attackerParams = SwapParams({
+            zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        vm.prank(address(manager));
+        (,, uint24 attackerFee) = hook.beforeSwap(address(this), poolKey, attackerParams, "");
+
+        // Strict check: Ensure the fee parsing worked (not 0) and matches the expected penalty + override flag.
+        uint24 expectedAttackerFee = uint24(MEV_PENALTY_FEE) | LPFeeLibrary.OVERRIDE_FEE_FLAG;
+        assertGt(attackerFee, 0, "Silent fail: Attacker fee is 0, hook call failed.");
+        assertEq(attackerFee, expectedAttackerFee, "Attacker MUST get MEV penalty for reversing the first move.");
+
+        // Clean up transient storage to prevent "Dirty Transient Storage" on the next call.
+        vm.prank(address(manager));
+        hook.afterSwap(address(this), poolKey, attackerParams, BalanceDelta.wrap(0), "");
+
+        // 4. Victim Test:
+        // The victim swaps in the SAME direction as the block's first move (Alice's UP).
+        SwapParams memory victimParams = SwapParams({
+            zeroForOne: false, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        });
+
+        vm.prank(address(manager));
+        (,, uint24 victimFee) = hook.beforeSwap(address(this), poolKey, victimParams, "");
+
+        // Strict check: Ensure the victim does NOT get the penalty.
+        uint24 victimFeeWithoutFlag = victimFee & ~LPFeeLibrary.OVERRIDE_FEE_FLAG;
+        assertGt(victimFee, 0, "Silent fail: Victim fee is 0, hook call failed.");
+        assertTrue(victimFeeWithoutFlag != MEV_PENALTY_FEE, "Victim MUST NOT get MEV penalty (no reversal).");
+
+        // Clean up transient storage.
+        vm.prank(address(manager));
+        hook.afterSwap(address(this), poolKey, victimParams, BalanceDelta.wrap(0), "");
+    }
+
+    function _swapAsAndGetFee(address who, bool zeroForOne, uint256 amount) internal returns (uint24 fee) {
+        vm.recordLogs();
+        _swapAs(who, zeroForOne, amount);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter == address(manager) && logs[i].topics[0] == sig) {
+                (,,,,, fee) = abi.decode(logs[i].data, (int128, int128, uint160, uint128, int24, uint24));
+            }
+        }
+    }
+
+    function test_backRun_paysPenalty_frontRunAndVictimDoNot() public {
+        uint24 frontRunFee = _swapAsAndGetFee(alice, false, 10 ether); // attacker front-run: UP
+        uint24 victimFee = _swapAsAndGetFee(charlie, false, 1 ether); // victim, same direction
+        uint24 backRunFee = _swapAsAndGetFee(bob, true, 10 ether); // attacker back-run: reverses
+
+        assertLt(frontRunFee, MEV_PENALTY_FEE, "front-run pays a normal fee");
+        assertLt(victimFee, MEV_PENALTY_FEE, "victim must not pay the penalty");
+        assertEq(backRunFee, MEV_PENALTY_FEE, "back-run must pay the penalty");
+    }
+
+    function test_realPoolManager_reversalLogic() public {
+        // 1. Alice Swap UP (false) -> Base Fee
+        uint24 aliceFee = _swapAsAndGetFee(alice, false, 10 ether);
+        console2.log("Alice Fee (Expected Base 6000):", aliceFee);
+        assertGt(aliceFee, 0, "Silent fail: Fee is 0, event parsing failed.");
+        assertEq(aliceFee, 6000, "Alice should pay base fee of 6000");
+
+        // 2. Bob Swap DOWN (true) -> Reversal -> MEV Penalty
+        uint24 bobFee = _swapAsAndGetFee(bob, true, 10 ether);
+        console2.log("Bob Fee (Expected Penalty 100000):", bobFee);
+        assertEq(bobFee, MEV_PENALTY_FEE, "Bob (back-runner) MUST pay MEV penalty fee");
+
+        // 3. Charlie (Victim) Swap UP (false) -> Same direction as Alice -> Base Fee
+        // Note: The tracker's firstMove is still UP, so Charlie going UP is NOT a reversal.
+        uint24 victimFee = _swapAsAndGetFee(charlie, false, 1 ether);
+        console2.log("Charlie/Victim Fee (Expected Base 6000):", victimFee);
+        assertGt(victimFee, 0, "Silent fail: Fee is 0, event parsing failed.");
+        assertEq(victimFee, 6000, "Victim should pay normal base fee");
+    }
+
+    function test_eightUsers_mixedDirections_trackerDoesNotReset() public {
+        // 1. Create 5 new users and fund them
+        address dave = makeAddr("dave");
+        address eve = makeAddr("eve");
+        address frank = makeAddr("frank");
+        address grace = makeAddr("grace");
+        address heidi = makeAddr("heidi");
+
+        _setupUser(dave);
+        _setupUser(eve);
+        _setupUser(frank);
+        _setupUser(grace);
+        _setupUser(heidi);
+
+        // ─────────────────────────────────────────────────────────────
+        // Swap 1: Alice (UP) -> Base Fee.
+        // ─────────────────────────────────────────────────────────────
+        uint24 fee1 = _swapAsAndGetFee(alice, false, 10 ether);
+        console2.log("1. Alice (UP) Fee:", fee1);
+        assertGt(fee1, 0, "Silent fail: Fee is 0, event parsing failed");
+        assertLt(fee1, MEV_PENALTY_FEE, "Alice should pay Base Fee");
+
+        // ─────────────────────────────────────────────────────────────
+        // Swap 2: Charlie (UP) -> Base Fee.
+        // ─────────────────────────────────────────────────────────────
+        uint24 fee2 = _swapAsAndGetFee(charlie, false, 5 ether);
+        console2.log("2. Charlie (UP) Fee:", fee2);
+        assertGt(fee2, 0, "Silent fail: Fee is 0");
+        assertLt(fee2, MEV_PENALTY_FEE, "Charlie should pay Base Fee");
+
+        // ─────────────────────────────────────────────────────────────
+        // Swap 3: Bob (DOWN) -> MEV Penalty (Back-run of Alice's UP).
+        // ─────────────────────────────────────────────────────────────
+        uint24 fee3 = _swapAsAndGetFee(bob, true, 10 ether);
+        console2.log("3. Bob (DOWN) Fee:", fee3);
+        assertEq(fee3, MEV_PENALTY_FEE, "Bob MUST pay MEV Penalty");
+
+        // ─────────────────────────────────────────────────────────────
+        // Swap 4: Dave (DOWN) -> MEV Penalty.
+        // ─────────────────────────────────────────────────────────────
+        uint24 fee4 = _swapAsAndGetFee(dave, true, 5 ether);
+        console2.log("4. Dave (DOWN) Fee:", fee4);
+        assertEq(fee4, MEV_PENALTY_FEE, "Dave MUST pay MEV Penalty");
+
+        // ─────────────────────────────────────────────────────────────
+        // Swap 5: Eve (UP) -> Base Fee.
+        // 🎯 THE CRITICAL TEST: Tracker reset bug check.
+        // ─────────────────────────────────────────────────────────────
+        uint24 fee5 = _swapAsAndGetFee(eve, false, 2 ether);
+        console2.log("5. Eve (UP) Fee:", fee5);
+        assertGt(fee5, 0, "Silent fail: Fee is 0");
+        assertLt(fee5, MEV_PENALTY_FEE, "Eve MUST NOT pay penalty. Tracker reset bug is fixed!");
+
+        // ─────────────────────────────────────────────────────────────
+        // Swap 6: Frank (DOWN) -> MEV Penalty.
+        // ─────────────────────────────────────────────────────────────
+        uint24 fee6 = _swapAsAndGetFee(frank, true, 8 ether);
+        console2.log("6. Frank (DOWN) Fee:", fee6);
+        assertEq(fee6, MEV_PENALTY_FEE, "Frank MUST pay MEV Penalty");
+
+        // ─────────────────────────────────────────────────────────────
+        // Swap 7: Grace (DOWN) -> MEV Penalty.
+        // ─────────────────────────────────────────────────────────────
+        uint24 fee7 = _swapAsAndGetFee(grace, true, 3 ether);
+        console2.log("7. Grace (DOWN) Fee:", fee7);
+        assertEq(fee7, MEV_PENALTY_FEE, "Grace MUST pay MEV Penalty");
+
+        // ─────────────────────────────────────────────────────────────
+        // Swap 8: Heidi (UP) -> Base Fee.
+        // ─────────────────────────────────────────────────────────────
+        uint24 fee8 = _swapAsAndGetFee(heidi, false, 1 ether);
+        console2.log("8. Heidi (UP) Fee:", fee8);
+        assertGt(fee8, 0, "Silent fail: Fee is 0");
+        assertLt(fee8, MEV_PENALTY_FEE, "Heidi should pay Base Fee");
+
+        // ─────────────────────────────────────────────────────────────
+        // Final state check: Checks whether the tracker remembers the block's first move (Alice's UP).
+        // ─────────────────────────────────────────────────────────────
+        (int24 firstMove,,,,, bool initialized) = hook.getSandwichTracker(poolKey);
+
+        console2.log("Final Tracker firstMove:", firstMove);
+        assertTrue(initialized, "Tracker should be initialized");
+        assertGt(firstMove, 0, "Tracker firstMove should still be positive (UP) from Alice's swap");
+    }
+
+    function test_eightUsers_warmOracle_twapGuardCatchesVictim() public {
+        address dave = makeAddr("dave");
+        _setupUser(dave);
+
+        // 1. Warm up the oracle
+        vm.warp(block.timestamp + 130);
+        vm.roll(block.number + 1);
+
+        // 2. Alice UP (10 ether) -> Large price impact (tick divergence > 500)
+        uint24 fee1 = _swapAsAndGetFee(alice, false, 10 ether);
+        console2.log("Alice Fee (Expected ~15000 or 6000):", fee1);
+
+        // 3. Charlie UP (1 ether) - not a reversal, but the spot price is far from the TWAP.
+        // Therefore, the TWAP Guard can force them to pay a 100,000 fee!
+        uint24 fee2 = _swapAsAndGetFee(charlie, false, 1 ether);
+        console2.log("Charlie Fee (Victim):", fee2);
+    }
+
+    function test_warmOracle_realBackRun_getsPenalty() public {
+        // Warm up the oracle
+        vm.warp(block.timestamp + 130);
+        vm.roll(block.number + 1);
+
+        // ২. Alice UP (10 ether) -> Make impact for large price
+        uint24 aliceFee = _swapAsAndGetFee(alice, false, 10 ether);
+        console2.log("Alice Fee:", aliceFee);
+
+        // 3. Charlie UP (1 ether) -> Victim. Oracle is warm and price has diverged,
+        // so they will pay HIGH_VOLATILE_FEE (15000) due to the TWAP guard.
+        uint24 charlieFee = _swapAsAndGetFee(charlie, false, 1 ether);
+        console2.log("Charlie (Victim) Fee:", charlieFee);
+
+        // Strict Check: Verify if the victim is paying a 1.5% (15000) fee instead of 10%
+        assertEq(charlieFee, HIGH_VOLATILE_FEE, "Victim should pay capped TWAP guard fee (15000)");
+
+        // ৪. Bob DOWN (10 ether) -> Real Back-runner।
+        // Since it is moving in the opposite direction, it bypasses the TWAP guard and receives 10% (100000) via _isBackRun.
+        uint24 bobFee = _swapAsAndGetFee(bob, true, 10 ether);
+        console2.log("Bob (Back-runner) Fee:", bobFee);
+
+        // Strict Check: Back-runner ঠিক ১০% (১০০০০০) ফি দিচ্ছে কিনা
+        assertEq(bobFee, MEV_PENALTY_FEE, "Back-runner must pay 100000 even when TWAP is warm");
     }
 }
 

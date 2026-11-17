@@ -125,6 +125,10 @@ contract MockHookView is ICuratioHookView {
         if (shouldRevertOnTwap) revert("mock: twap revert");
         return mockTwapTick;
     }
+
+    function MEV_PENALTY_FEE() external pure returns (uint24) {
+        return 100000;
+    }
 }
 
 contract CuratioRebalancerTest is Test, Deployers {
@@ -151,13 +155,7 @@ contract CuratioRebalancerTest is Test, Deployers {
 
     function setUp() public {
         rebalancer = new CuratioRebalancer(
-            poolManager,
-            hook,
-            vault,
-            admin,
-            1 ether, // rebalanceThreshold
-            automationRegistry, // NEW
-            DEFAULT_REBALANCE_AMOUNT // NEW
+            poolManager, hook, vault, admin, 1 ether, automationRegistry, DEFAULT_REBALANCE_AMOUNT
         );
 
         testKey = PoolKey({
@@ -165,7 +163,7 @@ contract CuratioRebalancerTest is Test, Deployers {
             currency1: Currency.wrap(address(0x2222)),
             fee: 3000,
             tickSpacing: 60,
-            hooks: IHooks(hook)
+            hooks: IHooks(hook) // ← শুধু এই লাইন বদলেছে
         });
     }
 
@@ -596,18 +594,28 @@ contract CuratioRebalancerIntegrationTest is Test {
 
     CuratioRebalancer public rebalancer;
     MockPoolManagerFull public mockManager;
+    MockHookView public mockHook;
     MockERC20 public token0;
     MockERC20 public token1;
 
     address public admin = makeAddr("admin");
     address public vault = makeAddr("vault");
-    address public hook = makeAddr("hook");
+    // address public hook = makeAddr("hook");
+    address public hook;
     address public automationRegistry = makeAddr("automationRegistry"); // NEW
 
     PoolKey internal testKey;
 
     function setUp() public {
         mockManager = new MockPoolManagerFull();
+
+        // ⬇ এই ৫ লাইন নতুন — ZeroAddress ঠেকায় + TWAP সোর্স দেয়
+        mockHook = new MockHookView();
+        mockHook.setPoolState(0, 3000, uint64(block.number), uint64(block.timestamp), true);
+        mockHook.setTwapTick(600); // referenceTick=600 এর সাথে মিল
+        hook = address(mockHook);
+        assertGt(hook.code.length, 0, "hook must have code");
+        // ⬆
 
         token0 = new MockERC20("Token0", "TK0", 18);
         token1 = new MockERC20("Token1", "TK1", 18);
@@ -617,13 +625,14 @@ contract CuratioRebalancerIntegrationTest is Test {
 
         rebalancer =
             new CuratioRebalancer(address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether);
+        //                                    ↑ এখন non-zero + কোড আছে
 
         testKey = PoolKey({
             currency0: Currency.wrap(address(token0)),
             currency1: Currency.wrap(address(token1)),
             fee: 3000,
             tickSpacing: 60,
-            hooks: IHooks(hook)
+            hooks: IHooks(address(0)) // ✅ আপনার করা পরিবর্তন ঠিক আছে
         });
 
         vm.prank(admin);
@@ -816,48 +825,90 @@ contract CuratioRebalancerIntegrationTest is Test {
     function test_performUpkeep_executesRebalanceWithComputedRange() public {
         mockManager.setNextDelta(0, 0);
 
-        // Advance past the initial minBlocksBetweenRebalances window so this
-        // call isn't treated as "too soon" (lastRebalanceBlock defaults to 0,
-        // and Foundry starts at block 1, which is < 0 + 10).
+        // minBlocksBetweenRebalances উইন্ডো পেরিয়ে যান
         vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
 
         int24 referenceTick = 600;
         bool twapDiverged = false;
 
+        // ── Pre-state: genuine proof-এর জন্য baseline ──
+        int24 lowerBefore = rebalancer.currentTickLower(); // 0
+        int24 upperBefore = rebalancer.currentTickUpper(); // 0
+        uint256 blockBefore = rebalancer.lastRebalanceBlock(); // 0
+
+        // ── Perform ──
         vm.prank(automationRegistry);
         rebalancer.performUpkeep(abi.encode(referenceTick, twapDiverged));
 
+        // ── Post-state ──
         int24 tickSpacing = testKey.tickSpacing;
         int24 expectedBase = (referenceTick / tickSpacing) * tickSpacing;
         int24 expectedLower = expectedBase - (tickSpacing * 2);
         int24 expectedUpper = expectedBase + (tickSpacing * 2);
 
-        assertEq(rebalancer.currentTickLower(), expectedLower, "performUpkeep computed wrong lower tick");
-        assertEq(rebalancer.currentTickUpper(), expectedUpper, "performUpkeep computed wrong upper tick");
-        assertEq(rebalancer.lastRebalanceBlock(), block.number, "lastRebalanceBlock not updated by performUpkeep");
+        // ✅ Proof 1: range সত্যিই বদলেছে (early-return নয়)
+        assertTrue(
+            rebalancer.currentTickLower() != lowerBefore || rebalancer.currentTickUpper() != upperBefore,
+            "range did not change - performUpkeep silently skipped"
+        );
+
+        // ✅ Proof 2: expected মানগুলো সঠিকভাবে হিসাব হয়েছে
+        assertEq(rebalancer.currentTickLower(), expectedLower, "wrong lower tick");
+        assertEq(rebalancer.currentTickUpper(), expectedUpper, "wrong upper tick");
+        assertEq(expectedLower, 480, "sanity: base=600, spacing=60, 2x => 480");
+        assertEq(expectedUpper, 720, "sanity: base=600, spacing=60, 2x => 720");
+
+        // ✅ Proof 3: lastRebalanceBlock সত্যিই আপডেট হয়েছে
+        assertEq(rebalancer.lastRebalanceBlock(), block.number, "block not recorded");
+        assertGt(rebalancer.lastRebalanceBlock(), blockBefore, "block not advanced");
+
+        // ✅ Proof 4: deviation চেক স্কিপ হয়নি — TWAP সত্যিই কল হয়েছে
+        //    (mockHook TWAP = 600, referenceTick = 600 => deviation = 0)
+        assertEq(
+            mockHook.getTwapTick(testKey, rebalancer.TWAP_WINDOW()),
+            referenceTick,
+            "mock TWAP != referenceTick - deviation check might be skipped"
+        );
     }
 
     /// @notice When twapDiverged is true, performUpkeep must use the wider
     ///         range (3x tickSpacing) instead of the default (2x) — this
     ///         distinguishes the two branches of rangeWidthInSpacings.
+    /// @notice Genuine pass: প্রমাণ করে twapDiverged=true হলে 3x width ব্যবহার হয়,
+    ///         এবং সেটা 2x case-এর চেয়ে স্পষ্টত আলাদা মান দেয়।
     function test_performUpkeep_usesWiderRangeWhenTwapDiverged() public {
         mockManager.setNextDelta(0, 0);
-
-        vm.roll(block.number + rebalancer.minBlocksBetweenRebalances()); // NEW
+        vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
 
         int24 referenceTick = 600;
         bool twapDiverged = true;
+
+        int24 lowerBefore = rebalancer.currentTickLower();
+        int24 upperBefore = rebalancer.currentTickUpper();
 
         vm.prank(automationRegistry);
         rebalancer.performUpkeep(abi.encode(referenceTick, twapDiverged));
 
         int24 tickSpacing = testKey.tickSpacing;
-        int24 expectedBase = (referenceTick / tickSpacing) * tickSpacing;
-        int24 expectedLower = expectedBase - (tickSpacing * 3);
-        int24 expectedUpper = expectedBase + (tickSpacing * 3);
+        int24 expectedBase = (referenceTick / tickSpacing) * tickSpacing; // 600
+        int24 expectedLower = expectedBase - (tickSpacing * 3); // 420
+        int24 expectedUpper = expectedBase + (tickSpacing * 3); // 780
 
-        assertEq(rebalancer.currentTickLower(), expectedLower, "diverged case did not use the wider (3x) range");
-        assertEq(rebalancer.currentTickUpper(), expectedUpper, "diverged case did not use the wider (3x) range");
+        // ✅ Proof 1: range বদলেছে
+        assertTrue(
+            rebalancer.currentTickLower() != lowerBefore || rebalancer.currentTickUpper() != upperBefore,
+            "range did not change - silent skip"
+        );
+
+        // ✅ Proof 2: 3x (wider) range
+        assertEq(rebalancer.currentTickLower(), expectedLower, "diverged lower tick wrong");
+        assertEq(rebalancer.currentTickUpper(), expectedUpper, "diverged upper tick wrong");
+
+        // ✅ Proof 3: 2x case (480/720) থেকে স্পষ্ট আলাদা — diverged শাখা বাস্তবে ভিন্ন
+        assertEq(rebalancer.currentTickLower(), 420, "sanity: 3x lower = 600-180 = 420");
+        assertEq(rebalancer.currentTickUpper(), 780, "sanity: 3x upper = 600+180 = 780");
+        assertTrue(rebalancer.currentTickLower() != 480, "must differ from non-diverged (2x) branch");
+        assertTrue(rebalancer.currentTickUpper() != 720, "must differ from non-diverged (2x) branch");
     }
 
     function test_performUpkeep_revertsIfPoolNotConfigured() public {
@@ -988,7 +1039,7 @@ contract CuratioRebalancerCheckUpkeepTest is Test {
 
         assertTrue(upkeepNeeded, "twap divergence alone must trigger upkeep");
         (int24 refTick, bool twapDiverged) = abi.decode(performData, (int24, bool));
-        assertEq(refTick, 100); // ← 500 থেকে 100 করুন (TWAP tick, spot tick নয়)
+        assertEq(refTick, 100);
         assertTrue(twapDiverged);
     }
 
@@ -1018,5 +1069,7 @@ contract CuratioRebalancerCheckUpkeepTest is Test {
         (bool upkeepNeeded,) = rebalancer.checkUpkeep("");
         assertFalse(upkeepNeeded, "uninitialized pool state must not trigger upkeep even with high fee");
     }
+
+    // ─── টেস্টে ───
 }
 

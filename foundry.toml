@@ -1,5 +1,5 @@
-[profile.invariant]
-test = "test/invariant" 
+[profile.default]
+test = "test/foundry" 
 auto_detect_solc = true
 offline = false
 evm_version = "cancun"

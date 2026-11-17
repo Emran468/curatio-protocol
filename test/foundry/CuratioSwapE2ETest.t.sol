@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, console2} from "forge-std/Test.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
@@ -9,8 +9,10 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol"; // <-- যোগ করা হয়েছে
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {MockERC20} from "@uniswap/v4-core/lib/solmate/src/test/utils/mocks/MockERC20.sol";
 import {CuratioHook} from "../../src/CuratioHook.sol";
 import {CuratioRebalancer} from "../../src/CuratioRebalancer.sol";
 import {CuratioVault} from "../../src/CuratioVault.sol";
@@ -46,8 +48,8 @@ contract CuratioSwapE2ETest is Test, Deployers {
         other = IERC20(Currency.unwrap(currency1));
 
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         address hookAddr = address(flags ^ (uint160(0x4444) << 144));
         deployCodeTo("CuratioHook.sol:CuratioHook", abi.encode(manager, hookOwner), hookAddr);
@@ -194,20 +196,135 @@ contract CuratioSwapE2ETest is Test, Deployers {
     }
 
     /// While the hook charges its MEV penalty (10% fee) the rebalancer must not swap.
+
+    // function test_swap_refusesDuringMevPenalty() public {
+    //     _warmUp();
+    //     _depositAndDeploy(100 ether);
+
+    //     // ── Alice-কে উভয় টোকেন মিন্ট করুন (balance ঠিক করে) ──
+    //     MockERC20(Currency.unwrap(poolKey.currency0)).mint(alice, 100 ether);
+    //     MockERC20(Currency.unwrap(poolKey.currency1)).mint(alice, 100 ether);
+
+    //     // ── Alice-কে PoolSwapTest-এ approve করান (allowance ঠিক করে) ──
+    //     vm.startPrank(alice);
+    //     MockERC20(Currency.unwrap(poolKey.currency0)).approve(address(swapRouter), type(uint256).max);
+    //     MockERC20(Currency.unwrap(poolKey.currency1)).approve(address(swapRouter), type(uint256).max);
+    //     vm.stopPrank();
+
+    //     uint128 liq = rebalancer.quoteLiquidityForValue(-120, 120, 1 ether);
+
+    //     vm.prank(admin);
+    //     rebalancer.rebalanceLiquidity(-120, 120, liq, MAX, MAX);
+
+    //     assertLt(hook.getCurrentFee(poolKey), 100000, "Setup invalid: Fee should be normal before MEV trigger");
+
+    //     vm.startPrank(alice);
+    //     // Alice UP (false): pays currency1, gets currency0
+    //     swapRouter.swap(
+    //         poolKey,
+    //         SwapParams({
+    //             zeroForOne: false,
+    //             amountSpecified: -int256(10 ether),
+    //             sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+    //         }),
+    //         PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+    //         ""
+    //     );
+
+    //     // Alice DOWN (true) -> Reversal! This sets the MEV penalty flag.
+    //     swapRouter.swap(
+    //         poolKey,
+    //         SwapParams({
+    //             zeroForOne: true,
+    //             amountSpecified: -int256(10 ether),
+    //             sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+    //         }),
+    //         PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+    //         ""
+    //     );
+    //     vm.stopPrank();
+
+    //     uint24 currentFee = hook.getCurrentFee(poolKey);
+    //     console2.log("Current Hook Fee:", currentFee);
+    //     assertEq(currentFee, 100000, "Setup invalid: Hook did not enter MEV penalty mode");
+
+    //     vm.prank(admin);
+    //     vm.expectRevert(CuratioRebalancer.SwapPriceDeviation.selector);
+
+    //     rebalancer.rebalanceLiquidity(-120, 120, liq, MAX, MAX);
+    // }
+
     function test_swap_refusesDuringMevPenalty() public {
+        // 1. Setup & Warmup
         _warmUp();
         _depositAndDeploy(100 ether);
+        console2.log("--- Warmup and Deposit Completed ---");
+
+        // 2. Mint tokens to Alice
+        MockERC20(Currency.unwrap(poolKey.currency0)).mint(alice, 100 ether);
+        MockERC20(Currency.unwrap(poolKey.currency1)).mint(alice, 100 ether);
+        console2.log("Minted 100 ether tokens to Alice");
+
+        // 3. Approve swap router
+        vm.startPrank(alice);
+        MockERC20(Currency.unwrap(poolKey.currency0)).approve(address(swapRouter), type(uint256).max);
+        MockERC20(Currency.unwrap(poolKey.currency1)).approve(address(swapRouter), type(uint256).max);
+        vm.stopPrank();
+        console2.log("Swap router approved by Alice");
+
+        // 4. Initial Rebalance
         uint128 liq = rebalancer.quoteLiquidityForValue(-120, 120, 1 ether);
-
-        swap(poolKey, true, -int256(5 ether), "");
-        swap(poolKey, false, -int256(5 ether), ""); // reversal + volume => sandwich flag for this block
-
-        // the penalty lives only in the flagged block and is no longer stored in the pool state
-        assertEq(hook.getCurrentFee(poolKey), hook.MEV_PENALTY_FEE(), "hook must have flagged the sandwich");
-
         vm.prank(admin);
-        vm.expectRevert(CuratioRebalancer.SwapPriceDeviation.selector);
         rebalancer.rebalanceLiquidity(-120, 120, liq, MAX, MAX);
+        console2.log("Initial liquidity rebalanced with amount:", liq);
+
+        // Verify we start from base fee
+        uint24 initialFee = hook.getCurrentFee(poolKey);
+        console2.log("Initial Hook Fee:", initialFee);
+        assertEq(initialFee, 3000, "Initial fee should be BASE_FEE");
+
+        // 5. Execute two opposing swaps in the SAME block → trigger sandwich / MEV penalty
+        vm.startPrank(alice);
+        console2.log("Executing Swap 1 (zeroForOne: false)...");
+
+        // Swap 1
+        swapRouter.swap(
+            poolKey,
+            SwapParams({
+                zeroForOne: false, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        console2.log("Executing Swap 2 (direction reversal, zeroForOne: true)...");
+        // Swap 2 (direction reversal)
+        swapRouter.swap(
+            poolKey,
+            SwapParams({
+                zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        vm.stopPrank();
+
+        // 6. Confirm we are in MEV penalty mode
+        uint24 currentFee = hook.getCurrentFee(poolKey);
+        console2.log("Current Hook Fee after MEV trigger:", currentFee);
+        assertEq(currentFee, 100_000, "Hook should be in MEV penalty mode");
+
+        // Diagnostic information before expected revert
+        console2.log("--- Diagnostic Check Before Rebalance ---");
+        console2.log("Block number:", block.number);
+        console2.log("Block timestamp:", block.timestamp);
+
+        // 7. Force a range change so rebalancer must swap → should revert during MEV penalty
+        console2.log("Attempting rebalance liquidity during MEV penalty (expecting revert)...");
+        vm.expectRevert(abi.encodeWithSelector(CuratioRebalancer.MevPenaltyActive.selector, uint24(100_000)));
+        vm.prank(admin);
+        rebalancer.rebalanceLiquidity(-180, 60, liq, MAX, MAX);
     }
 
     function test_swap_slippageCapOnNetPaymentStillApplies() public {

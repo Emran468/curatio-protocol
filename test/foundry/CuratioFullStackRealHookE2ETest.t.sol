@@ -49,8 +49,8 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
 
         // Deploy the real hook at an address whose low bits equal its permission flags.
         uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         address hookAddr = address(flags ^ (uint160(0x4444) << 144));
         deployCodeTo("CuratioHook.sol:CuratioHook", abi.encode(manager, hookOwner), hookAddr);

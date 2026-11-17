@@ -130,7 +130,7 @@ contract CuratioForkTest is Test {
 
     function _hookFlags() internal pure returns (uint160) {
         return uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
                 | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
     }
@@ -336,21 +336,24 @@ contract CuratioForkTest is Test {
         assertEq(uint256(fee), uint256(MEV_FEE), "spot far from TWAP must pay the MEV penalty");
     }
 
-    function test_fork_sandwich_triggersPenaltyForRestOfBlock() public {
-        _seedLp(1e20);
-        _advance(130);
+   function test_fork_sandwich_triggersPenaltyForRestOfBlock() public {
+    _seedLp(1e20);
+    _advance(130);
 
-        _swap(true, -10e18); // front-run
+    _swap(true, -10e18); // front-run
 
-        vm.expectEmit(true, false, false, false, address(hook));
-        emit CuratioHook.SandwichDetected(poolId, 0, 0, 0, 0);
-        _swap(false, -10e18); // back-run, same block, opposite direction, volume > 1 ether
+    vm.expectEmit(true, false, false, false, address(hook));
+    emit CuratioHook.SandwichDetected(poolId, 0, 0, 0, 0);
+    _swap(false, -10e18); // back-run: reverses the first move
 
-        assertEq(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE));
+    assertEq(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE));
 
-        uint24 fee = _swapAndGetFee(true, -1e15); // any further swap in the same block
-        assertEq(uint256(fee), uint256(MEV_FEE), "rest of the block must pay the penalty");
-    }
+    // same direction as the front-run: not a back-run, normal fee
+    assertLt(uint256(_swapAndGetFee(true, -1e15)), uint256(MEV_FEE), "same direction: no penalty");
+
+    // another reversal in the same block pays the penalty
+    assertEq(uint256(_swapAndGetFee(false, -1e15)), uint256(MEV_FEE), "reversal pays the penalty");
+}
 
     function test_fork_oracleRecordsObservations_andTwapFollowsPrice() public {
         _seedLp(1e20);
@@ -447,6 +450,17 @@ contract CuratioForkTest is Test {
         assertEq(uint256(rebalancer.currentLiquidity()), 0, "LP fully unwound");
         assertEq(vault.balanceOf(alice), 0);
     }
+
+    function test_fork_spotDeviation_triggersTwapHighFee() public {
+    _seedLp(1e20);
+    _advance(130);
+
+    _swap(true, -10e18); // spot jumps ~ -1900 ticks, TWAP barely moves
+    _advance(12);
+
+    uint24 fee = _swapAndGetFee(false, -1e15);
+    assertEq(uint256(fee), uint256(HIGH_FEE), "spot far from TWAP must pay HIGH_VOLATILE_FEE");
+}
 
     function test_fork_harvest_chargesFeeOnDonation() public {
         _advance(130);

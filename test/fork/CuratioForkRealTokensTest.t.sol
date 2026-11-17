@@ -127,7 +127,7 @@ contract CuratioForkRealTokensTest is Test {
 
     function _hookFlags() internal pure returns (uint160) {
         return uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+             Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
                 | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
     }
@@ -375,4 +375,17 @@ contract CuratioForkRealTokensTest is Test {
         assertApproxEqAbs(out, 5_000e6, 50);
         assertEq(uint256(rebalancer.currentLiquidity()), 0, "LP fully unwound");
     }
+
+    // ───────── CuratioForkRealTokensTest.t.sol ─────────
+
+function test_real_spotDeviation_triggersTwapHighFee() public {
+    _seedLp(1e15);
+    _advance(130);
+
+    _swap(false, -5e18);
+    _advance(12);
+
+    uint24 fee = _swapAndGetFee(true, -1e6); // 1 USDC in, the other direction
+    assertEq(uint256(fee), uint256(HIGH_FEE), "spot far from TWAP must pay HIGH_VOLATILE_FEE");
+}
 }

@@ -55,7 +55,7 @@ library ChainRegistry {
         if (chainId == ARBITRUM_SEPOLIA) return 0xFB3e0C6F74eB1a21CC1Da29aeC80D2Dfe6C9a317;
         if (chainId == SEPOLIA) return 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
         if (chainId == UNICHAIN_SEPOLIA) return 0x00B036B58a818B1BC34d502D3fE730Db729e62AC;
-        if (chainId == BASE_SEPOLIA) return 0x00B036B58a818B1BC34d502D3fE730Db729e62AC;
+        if (chainId == BASE_SEPOLIA) return 0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408;
         revert("ChainRegistry: unsupported chain");
     }
 
@@ -286,23 +286,6 @@ library TwapOracle {
     ///      seconds of continuous history behind its oldest observation.
     ///      Callers should treat `false` as "cannot verify price integrity"
     ///      and apply a conservative fee, not a permissive one.
-    // function isWarm(mapping(uint16 => Observation) storage self, State storage state, uint32 window)
-    //     internal
-    //     view
-    //     returns (bool)
-    // {
-    //     if (state.cardinality == 0) return false;
-
-    //     uint16 oldestIndex = uint16((uint256(state.index) + 1) % state.cardinality);
-    //     Observation memory oldest = self[oldestIndex];
-    //     if (!oldest.initialized) {
-    //         oldest = self[0];
-    //     }
-    //     if (!oldest.initialized) return false;
-    //     if (block.timestamp < oldest.blockTimestamp) return false;
-
-    //     return (uint32(block.timestamp) - oldest.blockTimestamp) >= window;
-    // }
 
     function isWarm(mapping(uint16 => Observation) storage self, State storage state, uint32 window)
         internal
@@ -334,6 +317,7 @@ contract CuratioHook is BaseHook, Ownable {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
     using TwapOracle for mapping(uint16 => TwapOracle.Observation);
+    using LPFeeLibrary for uint24;
 
     // ── Structs ───────────────────────────────────────────────────────────────
 
@@ -461,6 +445,8 @@ contract CuratioHook is BaseHook, Ownable {
     event InitialCardinalityUpdated(uint16 oldValue, uint16 newValue);
     event MaxCardinalityPerCallUpdated(uint16 oldValue, uint16 newValue);
 
+    error PoolMustUseDynamicFee();
+
     // ── Reentrancy Guard ──────────────────────────────────────────────────────
     modifier nonReentrant() {
         require(!_entered, "ReentrancyGuard: reentrant call");
@@ -497,7 +483,7 @@ contract CuratioHook is BaseHook, Ownable {
     // ── Hook Permissions ──────────────────────────────────────────────────────
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
-            beforeInitialize: false,
+            beforeInitialize: true,
             afterInitialize: true,
             beforeAddLiquidity: false,
             afterAddLiquidity: true,
@@ -516,7 +502,10 @@ contract CuratioHook is BaseHook, Ownable {
 
     // ─── Initialize ───────────────────────────────────────────────────────────
 
-    function beforeInitialize(address, PoolKey calldata, uint160) external pure override returns (bytes4) {
+    function beforeInitialize(address, PoolKey calldata key, uint160) external pure override returns (bytes4) {
+        // check  is pool is dynamic fee Mentor
+        if (!key.fee.isDynamicFee()) revert PoolMustUseDynamicFee();
+
         return this.beforeInitialize.selector;
     }
 
@@ -560,26 +549,6 @@ contract CuratioHook is BaseHook, Ownable {
 
         return this.afterInitialize.selector;
     }
-
-    // ─── Liquidity ────────────────────────────────────────────────────────────
-    // function beforeRemoveLiquidity(address, PoolKey calldata key, ModifyLiquidityParams calldata params, bytes calldata)
-    //     external
-    //     view
-    //     override
-    //     onlyPoolManager
-    //     returns (bytes4)
-    // {
-    //     PoolId poolId = key.toId();
-    //     uint128 currentLiquidity = poolManager.getLiquidity(poolId);
-
-    //     uint256 requestedRemoval = params.liquidityDelta < 0 ? uint256(-int256(params.liquidityDelta)) : 0;
-
-    //     if (requestedRemoval > uint256(currentLiquidity)) {
-    //         revert("Insufficient liquidity");
-    //     }
-
-    //     return this.beforeRemoveLiquidity.selector;
-    // }
 
     /// @dev This hook is disabled in getHookPermissions() (beforeRemoveLiquidity:
     ///      false), so PoolManager never actually calls it — kept only to
@@ -690,11 +659,8 @@ contract CuratioHook is BaseHook, Ownable {
                 (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG);
         }
 
-        // ── MEV / Sandwich Block Level Check ─────────────────────────────────
-        // [FIX-C] The sandwich penalty is enforced HERE, for the rest of the flagged block only. It is not stored
-        // in poolStates.fee (see afterSwap), so it cannot leak into later blocks.
-        uint256 sandwichBlock = _sandwichFlags[poolId];
-        if (sandwichBlock == currentBlock) {
+        // ── MEV back-run check: charged to the swap that REVERSES the block's first move ──
+        if (_isBackRun(_unpackTracker(_packedTrackers[poolId]), currentBlock, params.zeroForOne)) {
             return (
                 this.beforeSwap.selector,
                 BeforeSwapDeltaLibrary.ZERO_DELTA,
@@ -702,10 +668,6 @@ contract CuratioHook is BaseHook, Ownable {
             );
         }
 
-        // ── [FIX-2] TWAP Protection & Dynamic Fee Calculation ────────────────
-        // Explicit warm check replaces try/catch-on-revert: cheaper (no
-        // external call + catch overhead) and cold start now defaults to a
-        // conservative fee rather than silently falling back to BASE_FEE.
         uint24 feeToApply;
 
         if (TwapOracle.isWarm(_observations[poolId], _observationStates[poolId], DEFAULT_TWAP_WINDOW)) {
@@ -714,9 +676,9 @@ contract CuratioHook is BaseHook, Ownable {
             uint24 tickDivergence = abs(tickDivergenceRaw);
 
             if (uint256(tickDivergence) >= tickThresholdHigh) {
-                feeToApply = MEV_PENALTY_FEE;
-            } else if (uint256(tickDivergence) >= tickThresholdMid) {
                 feeToApply = HIGH_VOLATILE_FEE;
+            } else if (uint256(tickDivergence) >= tickThresholdMid) {
+                feeToApply = MID_VOLATILE_FEE; // (6000)
             } else {
                 PackedPoolState storage state = poolStates[poolId];
                 uint256 blockDelta = currentBlock > state.lastBlock ? currentBlock - state.lastBlock : 0;
@@ -725,7 +687,7 @@ contract CuratioHook is BaseHook, Ownable {
         } else {
             // Cold start: we cannot verify spot price against a TWAP yet, so
             // we assume elevated risk rather than assuming safety.
-            feeToApply = MID_VOLATILE_FEE;
+            feeToApply = MID_VOLATILE_FEE; // (6000)
         }
 
         return
@@ -764,6 +726,7 @@ contract CuratioHook is BaseHook, Ownable {
         uint256 trackerPacked = _packedTrackers[poolId];
         SandwichTracker memory tracker = _unpackTracker(trackerPacked);
 
+        // FIX: Tracker Reset for New Block
         if (!tracker.initialized || tracker.startBlock != currentBlock) {
             tracker = SandwichTracker({
                 firstMove: 0,
@@ -778,6 +741,8 @@ contract CuratioHook is BaseHook, Ownable {
 
         int24 tickDeltaRaw = postSwapTick - preSwapTick;
         uint24 tickDelta = uint24(tickDeltaRaw >= 0 ? tickDeltaRaw : -tickDeltaRaw);
+
+        int24 currentMove = tickDeltaRaw; // (postSwapTick - preSwapTick)
 
         uint256 swapAmount =
             params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
@@ -794,8 +759,7 @@ contract CuratioHook is BaseHook, Ownable {
 
         uint24 feeToSave = _computeFee(tickDelta, blockDelta, state.fee);
 
-        int24 currentMove = postSwapTick - preSwapTick;
-
+        // ── FIX: Update Tracker (No Resets!) ──
         if (currentMove != 0) {
             tracker.swapCount++;
             tracker.lastMove = currentMove;
@@ -814,42 +778,15 @@ contract CuratioHook is BaseHook, Ownable {
             }
         }
 
-        // NOTE: sandwich detection below is a heuristic (direction-reversal +
-        // cumulative per-block TICK move, see sandwichTickThreshold), not a guaranteed classifier. It can
-        // produce false positives on legitimate opposing-direction trades or
-        // arbitrage correction in the same block. Tune thresholds carefully
-        // and treat MEV_PENALTY_FEE application here as "elevated suspicion",
-        // not "proven attack".
-        bool isSandwich = false;
+        // ── FIX: Shared Back-run Detection (Syncs with beforeSwap) ──
+        // decided with the PRE-swap tracker, exactly as beforeSwap decided for this same swap
+        bool wasBackRun = _isBackRun(tracker, currentBlock, params.zeroForOne);
 
-        // [FIX-D] The size gate is the price impact in TICKS, not the raw token amount: it is independent of token
-        // decimals and of how deep the pool is. (The old gate compared raw `amountSpecified` with one hook-wide number.)
-        if (tracker.swapCount >= 2 && tracker.firstMove != 0 && currentMove != 0) {
-            bool isReversal = (tracker.firstMove > 0 && currentMove < 0) || (tracker.firstMove < 0 && currentMove > 0);
-
-            if (isReversal && uint256(tracker.totalMove) >= sandwichTickThreshold) {
-                isSandwich = true;
-            }
-        }
-
-        if (_sandwichFlags[poolId] == currentBlock) {
-            isSandwich = true;
-        }
-
-        if (isSandwich) {
-            // [FIX-C] Flag the block: beforeSwap charges MEV_PENALTY_FEE for the rest of THIS block.
-            // The penalty is deliberately NOT written into `feeToSave` / poolStates.fee. A stored MEV fee used to be
-            // re-applied to every calm swap (and re-stored by _computeFee) for as long as the pool kept trading
-            // within blockDecayWindow of the previous swap, so a cheap two-swap "sandwich" by anyone could keep the
-            // 10% fee on the pool and make the rebalancer's TWAP price check reject withdrawals and keeper swaps.
-            _sandwichFlags[poolId] = currentBlock;
+        if (wasBackRun) {
+            _sandwichFlags[poolId] = currentBlock; // for getCurrentFee / monitoring only
+            feeToSave = HIGH_VOLATILE_FEE; //MEV_PENALTY_FEE;
 
             emit SandwichDetected(poolId, tracker.firstMove, currentMove, blockVolumeMap[poolId], MEV_PENALTY_FEE);
-
-            tracker.firstMove = currentMove;
-            tracker.swapCount = 1;
-            tracker.lastMove = currentMove;
-            tracker.totalMove = tickDelta;
         }
 
         _packedTrackers[poolId] = _packTracker(tracker);
@@ -869,6 +806,14 @@ contract CuratioHook is BaseHook, Ownable {
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────────
+
+    /// zeroForOne = true sells token0 => tick DOWN; false => tick UP.
+    function _isBackRun(SandwichTracker memory t, uint256 currentBlock, bool zeroForOne) internal view returns (bool) {
+        if (!t.initialized || t.startBlock != currentBlock) return false;
+        if (t.swapCount == 0 || t.firstMove == 0) return false;
+        if (uint256(t.totalMove) < sandwichTickThreshold) return false;
+        return (t.firstMove > 0 && zeroForOne) || (t.firstMove < 0 && !zeroForOne);
+    }
 
     function abs(int24 n) internal pure returns (uint24) {
         return uint24(n >= 0 ? n : -n);
@@ -1028,9 +973,6 @@ contract CuratioHook is BaseHook, Ownable {
         PoolId poolId = key.toId();
         (, int24 currentTick,,) = poolManager.getSlot0(poolId);
 
-        // ভুল check-টা সরিয়ে দিন। history পর্যাপ্ত কিনা সেটা যাচাই করার
-        // দায়িত্ব এমনিতেই TwapOracle.binarySearch-এর require-এর উপর ছেড়ে দিন,
-        // অথবা explicit ভাবে isWarm() ব্যবহার করুন:
         require(
             TwapOracle.isWarm(_observations[poolId], _observationStates[poolId], twapWindow),
             "TwapOracle: insufficient history for requested window"

@@ -22,6 +22,7 @@ import {CuratioStrategistRegistry} from "./CuratioStrategistRegistry.sol";
 ///      (keeper trigger) and as the TWAP price source for valuation.
 interface ICuratioHookView {
     function getCurrentFee(PoolKey calldata key) external view returns (uint24);
+    function MEV_PENALTY_FEE() external view returns (uint24);
     function getPoolState(PoolKey calldata key)
         external
         view
@@ -79,9 +80,16 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     uint256 public constant UNWIND_BUFFER_BPS = 100;
     /// @dev Headroom left by quoteLiquidityForValue for swap fee / price impact.
     uint256 public constant QUOTE_HEADROOM_BPS = 100;
+    /// @dev Default for `maxReferenceDeviationTicks`: the same size as the hook's MEV-penalty threshold.
+    uint256 public constant DEFAULT_MAX_REFERENCE_DEVIATION_TICKS = 500;
     /// @dev Max tolerated gap (incl. pool fee) between a swap's execution price and the TWAP price.
     ///      Above this the rebalancer refuses to swap, e.g. while the hook charges MEV penalty fees.
     uint256 public maxSwapSlippageBps = 300;
+
+    /// @dev [KEEPER-SANITY] performUpkeep reverts if its reference tick is farther than this from the CURRENT TWAP.
+    ///      checkUpkeep proposes the TWAP itself, so a gap means stale or bogus performData. 0 disables the check.
+
+    uint256 public maxReferenceDeviationTicks = DEFAULT_MAX_REFERENCE_DEVIATION_TICKS;
 
     address public pendingHook;
     address public automationRegistry;
@@ -153,6 +161,9 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     event MaxSwapSlippageUpdated(uint256 newBps);
     event HookProposed(address indexed newHook, uint256 eta);
     event HookProposalCancelled(address indexed cancelledHook);
+    event MaxReferenceDeviationUpdated(uint256 newTicks);
+    event NativeRescued(address indexed to, uint256 amount);
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
 
     // ── Errors ───────────────────────────────────────────────────────────────
     error ZeroAddress();
@@ -174,6 +185,11 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     error InvalidBps();
     error NoPendingHook();
     error HookTimelockActive(uint256 eta);
+    error ReferenceTickDeviation(int24 referenceTick, int24 twapTick);
+    error CannotRescueManagedToken(address token);
+    error NativeIsManaged();
+    error NativeTransferFailed();
+    error MevPenaltyActive(uint24 currentFee);
 
     modifier onlyVault() {
         if (msg.sender != vault) revert NotVault(msg.sender);
@@ -318,6 +334,7 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     /// @param newLiquidity liquidity units to hold in the NEW range (all old liquidity is removed)
     /// @param maxPay0 max net currency0 this call may pay to the pool (slippage cap)
     /// @param maxPay1 max net currency1 this call may pay to the pool (slippage cap)
+
     function rebalanceLiquidity(
         int24 newTickLower,
         int24 newTickUpper,
@@ -471,15 +488,20 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         bool feeHigh = fee >= FEE_ESCALATION_THRESHOLD;
 
         (bool twapSuccess, int24 twapTick) = _tryGetTwapTick();
-        bool twapDiverged = false;
-        if (twapSuccess) {
-            int24 divergence = lastTick - twapTick;
-            if (divergence < 0) divergence = -divergence;
-            twapDiverged = uint256(uint24(divergence)) > TICK_DIVERGENCE_THRESHOLD;
+
+        if (!twapSuccess) {
+            if (feeHigh) {
+                return (true, abi.encode(lastTick, false)); // lastTick = reference
+            }
+            return (false, "");
         }
 
+        int24 divergence = lastTick - twapTick;
+        if (divergence < 0) divergence = -divergence;
+        bool twapDiverged = uint256(uint24(divergence)) > TICK_DIVERGENCE_THRESHOLD;
+
         if (feeHigh || twapDiverged) {
-            return (true, abi.encode(twapSuccess ? twapTick : lastTick, twapDiverged));
+            return (true, abi.encode(twapTick, twapDiverged));
         }
         return (false, "");
     }
@@ -492,6 +514,26 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         }
 
         (int24 referenceTick, bool twapDiverged) = abi.decode(performData, (int24, bool));
+
+        uint256 maxDeviation = maxReferenceDeviationTicks;
+        if (maxDeviation != 0) {
+            (bool twapOk, int24 twapTick) = _tryGetTwapTick();
+
+            if (twapOk) {
+                int256 deviation = int256(referenceTick) - int256(twapTick);
+                if (deviation < 0) deviation = -deviation;
+                if (uint256(deviation) > maxDeviation) {
+                    revert ReferenceTickDeviation(referenceTick, twapTick);
+                }
+            } else {
+                // TWAP unavailable — skip the sanity check and proceed.
+                // referenceTick in this case comes from checkUpkeep's fee-high path,
+                // which uses lastTick (pool's actual tick). That is trustworthy
+                // without TWAP verification; freezing rebalances during a TWAP
+                // outage would be worse than proceeding with a fee-driven trigger.
+                emit RebalanceSkipped("TWAP unavailable - proceeding without deviation check");
+            }
+        }
 
         int24 tickSpacing = managedPool.tickSpacing;
 
@@ -573,7 +615,9 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     /// @dev Called inside unlock. `d0`/`d1` are the net deltas so far (negative = we owe the pool).
     ///      `req0`/`req1` are the minimum balances that must remain after settlement.
     ///      If one currency would end up short, it is bought with the other one (exact-output swap),
-    ///      after checking the execution price against the TWAP. Reverts if it cannot be covered.
+    ///      after checking for MEV penalties and verifying the execution price against the TWAP.
+    ///      Reverts if it cannot be covered.
+
     function _coverDeficits(PoolKey memory key, int256 d0, int256 d1, uint256 req0, uint256 req1)
         internal
         returns (int256, int256)
@@ -584,29 +628,56 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         int256 short0 = int256(req0) - (int256(_idleBalance(t0)) + d0);
         int256 short1 = int256(req1) - (int256(_idleBalance(t1)) + d1);
 
+        // No swap neeed and MEV check
         if (short0 <= 0 && short1 <= 0) return (d0, d1);
         if (short0 > 0 && short1 > 0) revert InsufficientFunds();
+
+        // Right before swapping: check if the hook charges an MEV penalty
+        _revertIfMevPenalty(key);
 
         uint160 sqrtP = TickMath.getSqrtPriceAtTick(_getTwapTickOrFail());
         BalanceDelta sd;
         if (short0 > 0) {
-            // need token0, pay token1
+            // Need token0, buy with token1
             sd = _swapExactOut(key, false, uint256(short0));
             _checkSwapPrice(uint256(int256(sd.amount0())), uint256(-int256(sd.amount1())), true, sqrtP);
         } else {
-            // need token1, pay token0
+            // Need  token1,  buy with token0
             sd = _swapExactOut(key, true, uint256(short1));
             _checkSwapPrice(uint256(int256(sd.amount1())), uint256(-int256(sd.amount0())), false, sqrtP);
         }
         d0 += int256(sd.amount0());
         d1 += int256(sd.amount1());
 
-        // final solvency check (a partially filled swap would leave us short)
+        //  At last check  solvency
         if (int256(req0) > int256(_idleBalance(t0)) + d0 || int256(req1) > int256(_idleBalance(t1)) + d1) {
             revert InsufficientFunds();
         }
 
         return (d0, d1);
+    }
+
+    /// @dev Reverts if the current fee of the hook indicates an MEV penalty.
+    /// Skips the check if there is no hook or if the call fails (to prevent bricking the core path).
+    function _revertIfMevPenalty(PoolKey memory key) internal view {
+        address hookAddr = address(key.hooks);
+        if (hookAddr.code.length == 0) return;
+
+        uint24 currentFee;
+        try ICuratioHookView(hookAddr).getCurrentFee(key) returns (uint24 f) {
+            currentFee = f;
+        } catch {
+            return;
+        }
+
+        uint24 penaltyFee;
+        try ICuratioHookView(hookAddr).MEV_PENALTY_FEE() returns (uint24 p) {
+            penaltyFee = p;
+        } catch {
+            penaltyFee = 100000; // fallback: hook-এর constant এর মান
+        }
+
+        if (currentFee >= penaltyFee) revert MevPenaltyActive(currentFee);
     }
 
     function _swapExactOut(PoolKey memory key, bool zeroForOne, uint256 amountOut) internal returns (BalanceDelta) {
@@ -619,14 +690,15 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     }
 
     /// @dev `got` is the amount received (token0 if gotIsToken0), `paid` the amount of the other
-    ///      token given up. Reverts if `paid` exceeds the TWAP-fair price by more than maxSwapSlippageBps.
+    /// token given up. Reverts if `paid` exceeds the TWAP-fair price by more than maxSwapSlippageBps.
     function _checkSwapPrice(uint256 got, uint256 paid, bool gotIsToken0, uint160 sqrtP) internal view {
         uint256 fairPaid = _convert(got, gotIsToken0, sqrtP);
         if (paid > FullMath.mulDiv(fairPaid, BPS + maxSwapSlippageBps, BPS)) revert SwapPriceDeviation();
     }
 
     /// @dev Frees up enough idle `asset` to pay `amount` out: removes the needed share of the LP
-    ///      position (plus a small buffer) and swaps the other token into the asset.
+
+    /// position (plus a small buffer) and swaps the other token into the asset.
     function _unwindForVault(uint256 amount, uint256 idleAsset) internal {
         PoolKey memory key = managedPool;
         bool assetIs0 = Currency.unwrap(key.currency0) == asset;
@@ -654,12 +726,15 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
             liquidityToRemove: toRemove,
             requiredAsset: amount
         });
-        poolManager.unlock(abi.encode(ActionType.UNWIND, abi.encode(u)));
 
+        // ★ FIX: state update + emit BEFORE unlock so the event order is:
+        //   LiquidityUnwound → ModifyLiquidity → Settle/Take
         if (toRemove > 0) {
             currentLiquidity = liq - toRemove;
             emit LiquidityUnwound(toRemove, liq - toRemove);
         }
+
+        poolManager.unlock(abi.encode(ActionType.UNWIND, abi.encode(u)));
     }
 
     function _executeUnwind(UnwindCallbackData memory d) internal {
@@ -796,6 +871,13 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         emit MaxSwapSlippageUpdated(newBps);
     }
 
+    ///@notice  maximum distance between performUpkeep's reference tick and the current TWAP.zere disables check
+
+    function setMaxReferenceDeviationTicks(uint256 newTicks) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        maxReferenceDeviationTicks = newTicks;
+        emit MaxReferenceDeviationUpdated(newTicks);
+    }
+
     function setAutomationRegistry(address _newRegistry) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_newRegistry == address(0)) revert ZeroAddress();
         automationRegistry = _newRegistry;
@@ -809,5 +891,39 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     function setStrategistRegistry(address _registry) external onlyRole(DEFAULT_ADMIN_ROLE) {
         // address(0) disables registry integration without redeploying.
         strategistRegistry = CuratioStrategistRegistry(_registry);
+    }
+
+    ///  Rescue Section
+
+    /// @notice   Recover ERC-20 token if sent by mistake
+
+    function rescueToken(address token, address to, uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        if (token == address(0) || to == address(0)) revert ZeroAddress();
+        if (_isManagedToken(token)) revert CannotRescueManagedToken(token);
+        IERC20(token).safeTransfer(to, amount);
+        emit TokenRescued(token, to, amount);
+    }
+
+    /// @notice ETH sent by mistake , it recover. Refuses no pool is yet set
+
+    function rescueNativeEth(address payable to, uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        if (to == address(0)) revert ZeroAddress();
+        if (
+            !poolConfigured || Currency.unwrap(managedPool.currency0) == address(0)
+                || Currency.unwrap(managedPool.currency1) == address(0)
+        ) {
+            revert NativeIsManaged();
+        }
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert NativeTransferFailed();
+        emit NativeRescued(to, amount);
+    }
+
+    // internal helper function
+
+    function _isManagedToken(address token) internal view returns (bool) {
+        if (!poolConfigured) return true;
+        return token == asset || token == Currency.unwrap(managedPool.currency0)
+            || token == Currency.unwrap(managedPool.currency1);
     }
 }

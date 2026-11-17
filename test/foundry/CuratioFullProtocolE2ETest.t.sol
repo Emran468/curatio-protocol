@@ -12,6 +12,7 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 
 import {CuratioHook} from "../../src/CuratioHook.sol";
 import {CuratioAccess} from "../../src/CuratioAccess.sol";
@@ -53,7 +54,7 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
 
         // ── 3. Deploy Hook via HookMiner ────────────────────────
         uint160 flags = uint160(
-            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_INITIALIZE_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_INITIALIZE_FLAG
                 | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
         );
 
@@ -99,7 +100,11 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
 
         // ── 7. Initialize pool with Hook ────────────────────────
         poolKey = PoolKey({
-            currency0: currency0, currency1: currency1, fee: 3000, tickSpacing: 60, hooks: IHooks(address(hook))
+            currency0: currency0,
+            currency1: currency1,
+            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
         });
         manager.initialize(poolKey, SQRT_1_1);
         poolId = poolKey.toId();
