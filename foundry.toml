@@ -1,5 +1,5 @@
-[profile.fork]
-test = "test/fork" 
+[profile.default]
+test = "test/foundry" 
 auto_detect_solc = true
 offline = false
 evm_version = "cancun"
