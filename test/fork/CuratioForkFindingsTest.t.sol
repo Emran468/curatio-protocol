@@ -247,6 +247,7 @@ contract CuratioForkFindingsTest is CuratioForkTest {
         token1.transfer(attacker, 10e18);
         uint256 balBefore = token0.balanceOf(attacker) + token1.balanceOf(attacker);
 
+        // front-run (zeroForOne = true, tick DOWN) then back-run (zeroForOne = false)
         vm.startPrank(attacker);
         token0.approve(address(swapRouter), type(uint256).max);
         token1.approve(address(swapRouter), type(uint256).max);
@@ -254,27 +255,44 @@ contract CuratioForkFindingsTest is CuratioForkTest {
         _swap(false, -2e18);
         vm.stopPrank();
 
+        // The back-run pays the 10% penalty on 2e18 (= 2e17), plus a normal fee on the front-run.
+        // So the cost must be clearly above plain swap fees (~1.2e16) and not far above 2e17.
         uint256 balAfter = token0.balanceOf(attacker) + token1.balanceOf(attacker);
-        assertLt(balBefore - balAfter, 1e17, "the attack still costs only swap fees (< 2.5% of the volume)");
+        assertGt(balBefore, balAfter, "attacker must have lost value");
+        uint256 cost = balBefore - balAfter;
+        assertGe(cost, 1.5e17, "the back-run must really have paid the 10% penalty");
+        assertLt(cost, 3e17, "the cost is still bounded by the penalty plus normal fees");
 
         // enforced for the rest of the flagged block...
-        assertEq(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE));
-        assertEq(uint256(_swapAndGetFee(true, -1e15)), uint256(MEV_FEE), "rest of the flagged block pays the penalty");
+        assertEq(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE), "block must be flagged");
 
-        // ...but never stored
+        // ...for another swap in the back-run direction (opposite to the block's first move)
+        assertEq(uint256(_swapAndGetFee(false, -1e15)), uint256(MEV_FEE), "another back-run pays the penalty");
+
+        // ...but not for a swap in the same direction as the block's first move
+        uint24 sameDirFee = _swapAndGetFee(true, -1e15);
+        assertGt(uint256(sameDirFee), 0, "helper must return a real fee");
+        assertLt(uint256(sameDirFee), uint256(MEV_FEE), "same-direction swap is not a back-run");
+
+        // ...and the penalty is never stored: the hook stores HIGH_VOLATILE_FEE after a back-run
         (, uint24 storedFee,,,) = hook.getPoolState(key);
-        assertLt(uint256(storedFee), uint256(MEV_FEE), "the penalty must not be stored in the pool state");
+        assertEq(uint256(storedFee), 15000, "stored fee must be HIGH_VOLATILE_FEE, not the penalty");
 
-        // the very next block is back to a normal, non-penalty fee, and stays there while the pool keeps trading
+        // the very next block: no penalty, and no sticky penalty while the pool keeps trading
         _advance(1);
-        assertLt(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE));
+        uint256 nextBlockFee = uint256(hook.getCurrentFee(key));
+        assertGe(nextBlockFee, 3000, "fee must be a real fee");
+        assertLt(nextBlockFee, uint256(MEV_FEE), "penalty must be gone in the next block");
+
         for (uint256 i = 0; i < 5; i++) {
             uint24 fee = _swapAndGetFee(i % 2 == 0, -1e15);
+            assertGe(uint256(fee), 3000, "fee must be a real fee, not 0");
             assertLt(uint256(fee), uint256(MEV_FEE), "no sticky penalty after the flagged block");
             _advance(1);
         }
+
+        // the elevated stored fee decays back to BASE_FEE after the decay window
+        _advance(300); // blockDecayWindow
+        assertEq(uint256(hook.getCurrentFee(key)), 3000, "fee must decay to BASE_FEE");
     }
-
-
-    
 }

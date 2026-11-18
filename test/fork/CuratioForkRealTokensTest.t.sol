@@ -127,8 +127,8 @@ contract CuratioForkRealTokensTest is Test {
 
     function _hookFlags() internal pure returns (uint160) {
         return uint160(
-             Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
     }
 
@@ -289,15 +289,31 @@ contract CuratioForkRealTokensTest is Test {
         assertEq(uint256(hook.getCurrentFee(key)), uint256(HIGH_FEE));
     }
 
-    function test_real_spotDeviation_triggersTwapMevPenalty() public {
+    function test_real_spotDeviation_triggersHighVolatileFee() public {
         _seedLp(1e15);
         _advance(130);
 
         _swap(false, -5e18);
         _advance(12);
 
+        // Precondition: spot must really be far from the TWAP. Without this the test could
+        // pass or fail for the wrong reason (e.g. a swap that moved the price too little).
+        (, int24 spotTick,,) = POOL_MANAGER.getSlot0(poolId);
+        int24 twapTick = hook.getTwapTick(key, 120);
+        int256 divergence = int256(spotTick) - int256(twapTick);
+        if (divergence < 0) divergence = -divergence;
+        assertGe(uint256(divergence), hook.tickThresholdHigh(), "setup: spot must be >= high threshold from TWAP");
+
+        // The new swap happens in a later block, so it cannot be treated as a sandwich back-run.
+        assertLt(uint256(hook.getCurrentFee(key)), uint256(MEV_FEE), "setup: block must not be flagged as a sandwich");
+
         uint24 fee = _swapAndGetFee(true, -1e6); // 1 USDC in, the other direction
-        assertEq(uint256(fee), uint256(MEV_FEE), "spot far from TWAP must pay the MEV penalty");
+
+        // A TWAP deviation charges HIGH_VOLATILE_FEE (1.5%). MEV_PENALTY_FEE (10%) is only
+        // for a same-block back-run, so it must NOT be what we see here.
+        assertEq(uint256(fee), 15000, "spot far from TWAP must pay HIGH_VOLATILE_FEE");
+        assertTrue(uint256(fee) != uint256(MEV_FEE), "TWAP deviation must not charge the sandwich penalty");
+        assertGt(uint256(fee), 3000, "fee must be above BASE_FEE");
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -378,14 +394,14 @@ contract CuratioForkRealTokensTest is Test {
 
     // ───────── CuratioForkRealTokensTest.t.sol ─────────
 
-function test_real_spotDeviation_triggersTwapHighFee() public {
-    _seedLp(1e15);
-    _advance(130);
+    function test_real_spotDeviation_triggersTwapHighFee() public {
+        _seedLp(1e15);
+        _advance(130);
 
-    _swap(false, -5e18);
-    _advance(12);
+        _swap(false, -5e18);
+        _advance(12);
 
-    uint24 fee = _swapAndGetFee(true, -1e6); // 1 USDC in, the other direction
-    assertEq(uint256(fee), uint256(HIGH_FEE), "spot far from TWAP must pay HIGH_VOLATILE_FEE");
-}
+        uint24 fee = _swapAndGetFee(true, -1e6); // 1 USDC in, the other direction
+        assertEq(uint256(fee), uint256(HIGH_FEE), "spot far from TWAP must pay HIGH_VOLATILE_FEE");
+    }
 }
