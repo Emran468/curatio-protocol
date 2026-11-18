@@ -496,10 +496,10 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
     }
 
     // ==========================================
-    // ✅ NEW: Copy-LP / Delegated Liquidity Management
+    //  Delegated Liquidity Management
     // ==========================================
     function followStrategist(address strategist) external nonReentrant {
-        _checkWhitelist(msg.sender); // ✅ এটি CuratioVault.NotWhitelisted এররটি নিক্ষেপ করবে
+        _checkWhitelist(msg.sender); 
 
         address registryAddr = rebalancer.strategistRegistry();
         CuratioStrategistRegistry registry = CuratioStrategistRegistry(registryAddr);

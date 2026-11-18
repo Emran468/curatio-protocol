@@ -96,7 +96,7 @@ contract CuratioStrategistRegistry is AccessControl {
 
     function assignPoolToStrategist(address strategist, PoolId poolId) external onlyRole(REGISTRAR_ROLE) {
         if (!isRegisteredStrategist[strategist]) revert NotRegistered(strategist);
-        if (!strategists[strategist].active) revert StrategistInactive(strategist); // ✅ FIXED
+        if (!strategists[strategist].active) revert StrategistInactive(strategist); 
         if (poolStrategist[poolId] != address(0)) revert PoolAlreadyAssigned(poolId);
 
         _strategistPools[strategist].push(poolId);
@@ -107,7 +107,7 @@ contract CuratioStrategistRegistry is AccessControl {
 
     function reassignPool(PoolId poolId, address newStrategist) external onlyRole(REGISTRAR_ROLE) {
         if (!isRegisteredStrategist[newStrategist]) revert NotRegistered(newStrategist);
-        if (!strategists[newStrategist].active) revert StrategistInactive(newStrategist); // ✅ FIXED
+        if (!strategists[newStrategist].active) revert StrategistInactive(newStrategist); 
 
         address oldStrategist = poolStrategist[poolId];
         if (oldStrategist != address(0)) {
@@ -123,7 +123,7 @@ contract CuratioStrategistRegistry is AccessControl {
 
     /// @notice Remove a pool from its current strategist without assigning a new one.
     function unassignPool(PoolId poolId) external onlyRole(REGISTRAR_ROLE) {
-        // ✅ NEW
+     
         address oldStrategist = poolStrategist[poolId];
         if (oldStrategist == address(0)) revert PoolNotAssigned(poolId);
 
@@ -140,7 +140,7 @@ contract CuratioStrategistRegistry is AccessControl {
         if (!isRegisteredStrategist[oldStrategist]) revert NotRegistered(oldStrategist);
         if (!isRegisteredStrategist[newStrategist]) revert NotRegistered(newStrategist);
         if (oldStrategist == newStrategist) revert SameStrategist();
-        if (!strategists[newStrategist].active) revert StrategistInactive(newStrategist); // ✅ FIXED
+        if (!strategists[newStrategist].active) revert StrategistInactive(newStrategist); 
 
         PoolId[] memory poolsToMigrate = _strategistPools[oldStrategist];
         uint256 count = poolsToMigrate.length < maxCount ? poolsToMigrate.length : maxCount;
@@ -176,7 +176,7 @@ contract CuratioStrategistRegistry is AccessControl {
         if (!strategists[strategist].active) revert StrategistInactive(strategist);
         StrategistProfile storage profile = strategists[strategist];
         profile.totalFeesGeneratedForVault += feeAmount;
-        profile.lastActiveBlock = block.number; // ✅ FIXED
+        profile.lastActiveBlock = block.number; 
 
         emit PerformanceRecorded(strategist, profile.totalRebalancesExecuted, profile.totalFeesGeneratedForVault);
     }
@@ -201,7 +201,7 @@ contract CuratioStrategistRegistry is AccessControl {
         return strategistList;
     }
 
-    /// @notice Return only currently active strategists.  // ✅ NEW
+    /// @notice Return only currently active strategists.  
     function getActiveStrategists() external view returns (address[] memory) {
         uint256 count = 0;
         uint256 len = strategistList.length;
