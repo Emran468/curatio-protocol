@@ -51,7 +51,7 @@ contract CuratioAccess is AccessControl {
         _grantRole(VAULT_MANAGER_ROLE, admin);
     }
 
-    // ─── Adding to whitelist (immediate) ─────────────────────────────────────
+    // --------------- Adding to whitelist (immediate) -----------------
 
     /// @notice Add (or re-add) a user to the whitelist immediately.
     ///         Removing is intentionally NOT immediate — see proposeRemoval.
@@ -76,7 +76,7 @@ contract CuratioAccess is AccessControl {
         }
     }
 
-    // ─── Removing from whitelist (2-day timelock) ────────────────────────────
+    // ========== Removing from whitelist (2-day timelock)====================
 
     /// @notice Step 1 of 2: propose removing a user. Takes effect after REMOVAL_TIMELOCK.
     function proposeRemoval(address user) external onlyRole(VAULT_MANAGER_ROLE) {
@@ -105,7 +105,7 @@ contract CuratioAccess is AccessControl {
         emit RemovalCancelled(user);
     }
 
-    // ─── Admin ────────────────────────────────────────────────────────────────
+    // --------------- Admin ---------------
 
     function toggleWhitelisting(bool status) external onlyRole(DEFAULT_ADMIN_ROLE) {
         isWhitelistingEnabled = status;

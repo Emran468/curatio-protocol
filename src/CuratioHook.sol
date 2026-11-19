@@ -12,7 +12,7 @@ import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 
-// ─── Ownable ──────────────────────────────────────────────────────────────────
+// ========== Ownable ===============================
 abstract contract Ownable {
     address public owner;
     error NotOwner();
@@ -99,7 +99,7 @@ library ChainRegistry {
     }
 }
 
-// ─── TWAP Oracle Library ──────────────────────────────────────────────────────
+// =========================TWAP Oracle Library  =======================
 // v3-style tickCumulative ring buffer. Kept as an internal library so the main
 // contract stays readable; all storage lives in CuratioHook itself (structs
 // are value types passed by storage pointer).
@@ -294,7 +294,7 @@ library TwapOracle {
     {
         if (state.cardinality == 0 || window == 0) return false;
 
-        // window যদি বর্তমান block.timestamp-এর চেয়ে বড় হয়, তবে underflow এড়াতে false
+        // Return false if window > block.timestamp to prevent underflow
         if (window > block.timestamp) return false;
 
         uint16 oldestIndex = uint16((uint256(state.index) + 1) % state.cardinality);
@@ -304,7 +304,7 @@ library TwapOracle {
         }
         if (!oldest.initialized) return false;
 
-        // timestamp underflow এড়ানোর চেক
+        // Check to prevent timestamp underflow
         if (block.timestamp < oldest.blockTimestamp) return false;
 
         uint32 target = uint32(block.timestamp) - window;
@@ -312,14 +312,14 @@ library TwapOracle {
     }
 }
 
-// ─── Main Hook ────────────────────────────────────────────────────────────────
+// -------------------- Main Hook ------------------------------
 contract CuratioHook is BaseHook, Ownable {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
     using TwapOracle for mapping(uint16 => TwapOracle.Observation);
     using LPFeeLibrary for uint24;
 
-    // ── Structs ───────────────────────────────────────────────────────────────
+    //------------------- Structs ----------------------
 
     struct PackedPoolState {
         int24 lastTick;
@@ -354,12 +354,12 @@ contract CuratioHook is BaseHook, Ownable {
         bool exists;
     }
 
-    // ── Chain Info ────────────────────────────────────────────────────────────
+    // ========== Chain Info ===================
     uint256 public immutable deployedChainId;
     uint64 public immutable blockDecayWindow;
     string public chainName;
 
-    // ── TWAP warm-up config [FIX-1] ───────────────────────────────────────────
+    // ----------------TWAP warm-up config [FIX-1] ---------------
     // Cardinality pre-warmed at pool init so TWAP protection is live from the
     // pool's first swaps instead of requiring a manual bootstrap call.
     // [FIX-A] The default now comes from ChainRegistry.getInitialCardinality(): 240 on chains with ~1 s
@@ -368,11 +368,11 @@ contract CuratioHook is BaseHook, Ownable {
     uint16 public initialCardinality;
     uint32 public constant DEFAULT_TWAP_WINDOW = 120;
 
-    // ── Timelock config [FIX-3] ───────────────────────────────────────────────
+    // --------------- Timelock config [FIX-3] ------------------
     uint256 public constant THRESHOLD_TIMELOCK_DELAY = 2 days;
     PendingThresholds public pendingThresholds;
 
-    // ── Storage ───────────────────────────────────────────────────────────────
+    // ------------- Storage -----------------------------
     mapping(PoolId => PackedPoolState) public poolStates;
     mapping(bytes32 => PositionInfo) public storedPositions;
 
@@ -387,24 +387,24 @@ contract CuratioHook is BaseHook, Ownable {
     mapping(PoolId => uint256) public blockVolumeMap;
     mapping(PoolId => uint256) public lastVolumeBlockMap;
 
-    // ── TWAP Oracle Storage ───────────────────────────────────────────────────
+    // --------------TWAP Oracle Storage ----------------
     mapping(PoolId => mapping(uint16 => TwapOracle.Observation)) private _observations;
     mapping(PoolId => TwapOracle.State) private _observationStates;
 
-    // ── Transient/Storage Prefix Keys ─────────────────────────────────────────
+    // ===============Transient/Storage Prefix Keys=======================
     bytes32 private constant PRE_SWAP_TICK_PREFIX = keccak256("hybrid.vol.preSwapTick");
     bytes32 private constant PRE_SWAP_TICK_FLAG = keccak256("hybrid.vol.flag");
     bytes32 private constant TRACKER_PREFIX = keccak256("hybrid.vol.tracker");
     bytes32 private constant SANDWICH_FLAG_PREFIX = keccak256("hybrid.vol.sandwichFlag");
     bytes32 public constant PRE_SWAP_TICK_SLOT = keccak256("curatio.preSwapTick");
 
-    // ── Fee Constants ─────────────────────────────────────────────────────────
+    // ================ Fee Constants =========================
     uint24 public constant BASE_FEE = 3000;
     uint24 public constant MID_VOLATILE_FEE = 6000;
     uint24 public constant HIGH_VOLATILE_FEE = 15000;
     uint24 public constant MEV_PENALTY_FEE = 100000;
 
-    // ── Configurable thresholds ───────────────────────────────────────────────
+    // =====================Configurable thresholds====================
     uint256 public tickThresholdHigh = 500;
     uint256 public tickThresholdMid = 200;
     /// @dev DEPRECATED, no longer used by the sandwich detection. It compared the RAW `amountSpecified` of swaps
@@ -421,7 +421,7 @@ contract CuratioHook is BaseHook, Ownable {
     uint16 public constant HARD_MAX_CARDINALITY_PER_CALL = 1000;
     uint16 public maxCardinalityPerCall = 500;
 
-    // ── Events ────────────────────────────────────────────────────────────────
+    // ----------------- Events---------------------------
     event LiquidityUpdated(
         address indexed sender,
         PoolId indexed poolId,
