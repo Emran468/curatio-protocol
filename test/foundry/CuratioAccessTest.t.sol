@@ -23,7 +23,7 @@ contract CuratioAccessTest is Test {
         access = new CuratioAccess(admin);
     }
 
-    // ── Constructor ──────────────────────────────────────────────
+    // -----------------------------Constructor -----------------------------------
 
     function test_constructor_revertsOnZeroAdmin() public {
         vm.expectRevert(CuratioAccess.ZeroAddress.selector);
@@ -40,7 +40,7 @@ contract CuratioAccessTest is Test {
         assertTrue(access.isWhitelistingEnabled());
     }
 
-    // ── isWhitelisted ─────────────────────────────────────────────
+    // ==================isWhitelisted ========================
 
     function test_isWhitelisted_falseByDefaultWhenEnabled() public view {
         assertFalse(access.isWhitelisted(alice));
@@ -83,7 +83,7 @@ contract CuratioAccessTest is Test {
         assertFalse(access.isWhitelisted(alice), "alice must be revoked after execute");
     }
 
-    // ── setWhitelistedUser ────────────────────────────────────────
+    // ---------------setWhitelistedUser --------------------------
 
     function test_setWhitelistedUser_onlyVaultManagerRole() public {
         vm.prank(attacker);
@@ -130,8 +130,7 @@ contract CuratioAccessTest is Test {
         assertTrue(access.isWhitelisted(alice), "no silent removal via setWhitelistedUser");
     }
 
-    // ── setWhitelistedUsersBatch ──────────────────────────────────
-
+    // ================== setWhitelistedUsersBatch ========================================
     function test_setWhitelistedUsersBatch_onlyVaultManagerRole() public {
         address[] memory users = new address[](1);
         users[0] = alice;
@@ -238,7 +237,7 @@ contract CuratioAccessTest is Test {
         assertTrue(access.isWhitelisted(bob), "no silent batch removal");
     }
 
-    // ── toggleWhitelisting ────────────────────────────────────────
+    // --------------------- toggleWhitelisting ---------------------------
 
     function test_toggleWhitelisting_onlyDefaultAdminRole() public {
         vm.prank(attacker);

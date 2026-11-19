@@ -59,7 +59,7 @@ contract CuratioRebalancerValuationTest is Test, Deployers {
         if (amt1 > 0) IERC20(t1).transfer(address(rebalancer), amt1);
     }
 
-    // ── setAsset ─────────────────────────────────────────────────────────
+    // ====== setAsset ========
 
     function test_setAsset_onlyAdmin() public {
         vm.prank(attacker);
@@ -95,7 +95,7 @@ contract CuratioRebalancerValuationTest is Test, Deployers {
         assertEq(rebalancer.asset(), address(0));
     }
 
-    // ── totalManagedAssets ───────────────────────────────────────────────
+    //  .....  talManagedAssets.........
 
     function test_totalManagedAssets_revertsIfAssetNotSet() public {
         vm.prank(admin);
@@ -173,7 +173,7 @@ contract CuratioRebalancerValuationTest is Test, Deployers {
         rebalancer.totalManagedAssets();
     }
 
-    // ── returnToVault ────────────────────────────────────────────────────
+    // ... returnToVault....
 
     function test_returnToVault_onlyVault() public {
         _fund(100 ether, 0);

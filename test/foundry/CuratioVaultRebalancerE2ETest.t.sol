@@ -91,7 +91,7 @@ contract CuratioVaultRebalancerE2ETest is Test, Deployers {
         return manager.getPositionLiquidity(poolKey.toId(), key);
     }
 
-    // ── share price & fund flow ──────────────────────────────────────────
+    //  share price & fund flow
 
     function test_e2e_deposit_totalAssetsEqualsDeposit() public {
         uint256 shares = _depositAlice(100 ether);
@@ -119,7 +119,7 @@ contract CuratioVaultRebalancerE2ETest is Test, Deployers {
         vault.deployToRebalancer(10 ether);
     }
 
-    // ── withdraw pulls from the rebalancer ───────────────────────────────
+    // ── withdraw pulls from the rebalancer
 
     function test_e2e_withdraw_pullsShortfallFromRebalancer() public {
         _depositAlice(100 ether);
@@ -147,7 +147,7 @@ contract CuratioVaultRebalancerE2ETest is Test, Deployers {
         assertEq(vault.totalSupply(), 0);
     }
 
-    // ── LP position is counted ───────────────────────────────────────────
+    // LP position is counted
 
     /// The "other" token is donated to the rebalancer so it holds both tokens.
     /// This only checks that moving funds into the LP does not change what the vault reports.
@@ -166,7 +166,7 @@ contract CuratioVaultRebalancerE2ETest is Test, Deployers {
         assertApproxEqAbs(vault.totalAssets(), before, 10, "moving into LP must not change reported assets");
     }
 
-    // ── withdraw unwinds the LP ──────────────────────────────────────────
+    // ── withdraw unwinds the LP
 
     /// A withdrawal larger than the idle asset must unwind part of the LP, swap the other
     /// token into the asset (priced against the TWAP) and pay the full amount.

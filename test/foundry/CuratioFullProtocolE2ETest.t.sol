@@ -45,14 +45,14 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
     uint160 constant SQRT_1_1 = 79228162514264337593543950336;
 
     function setUp() public {
-        // ── 1. Deploy Fresh Manager ─────────────────────────────
+        // ---------1. Deploy Fresh Manager--------------
         deployFreshManagerAndRouters();
         (currency0, currency1) = deployMintAndApprove2Currencies();
 
-        // ── 2. Deploy Access ────────────────────────────────────
+        // -------------2. Deploy Access -------------
         access = new CuratioAccess(admin);
 
-        // ── 3. Deploy Hook via HookMiner ────────────────────────
+        // ===========3. Deploy Hook via HookMiner==================
         uint160 flags = uint160(
             Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_INITIALIZE_FLAG
                 | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
@@ -65,21 +65,21 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
         hook = new CuratioHook{salt: salt}(IPoolManager(address(manager)), admin);
         require(address(hook) == hookAddress, "HookAddressNotValid");
 
-        // ── 4. Deploy Registry ──────────────────────────────────
+        // -------------- 4. Deploy Registry --------------
         registry = new CuratioStrategistRegistry(admin);
 
-        // ✅ FIX 1: feeModule — placeholder vault (admin)
+        // feeModule — placeholder vault (admin)
         feeModule = new CuratioDynamicFee(admin, admin, feeRecipient);
 
-        // ✅ FIX 2: rebalancer — placeholder vault (admin)
+        //  rebalancer — placeholder vault (admin)
         rebalancer = new CuratioRebalancer(
             address(manager), address(hook), admin, admin, 1 ether, automationRegistry, 1000 ether
         );
 
-        // ── 5. Deploy Vault ─────────────────────────────────────
+        // -------------- 5. Deploy Vault -----------------
         vault = new CuratioVault(IERC20(Currency.unwrap(currency0)), address(access), address(rebalancer), admin, 0);
 
-        // ── 6. Wire permissions ─────────────────────────────────
+        // ----------------6. Wire permissions =-------------
         vm.startPrank(admin);
 
         access.setWhitelistedUser(alice, true);
@@ -98,7 +98,7 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
 
         vm.stopPrank();
 
-        // ── 7. Initialize pool with Hook ────────────────────────
+        // ===============7. Initialize pool with Hook============
         poolKey = PoolKey({
             currency0: currency0,
             currency1: currency1,
@@ -109,13 +109,13 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
         manager.initialize(poolKey, SQRT_1_1);
         poolId = poolKey.toId();
 
-        // ── 8. Configure Rebalancer pool ────────────────────────
+        // =============8. Configure Rebalancer pool-==============
         vm.prank(admin);
         rebalancer.setManagedPool(poolKey);
         vm.prank(admin);
         rebalancer.setAsset(Currency.unwrap(currency0));
 
-        // ── 9. Fund users ───────────────────────────────────────
+        // ==========9. Fund users ================
         deal(Currency.unwrap(currency0), alice, 1000 ether);
         deal(Currency.unwrap(currency0), bob, 1000 ether);
 
@@ -124,25 +124,24 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
         vm.prank(bob);
         IERC20(Currency.unwrap(currency0)).approve(address(vault), type(uint256).max);
 
-        // ✅ FIX 3: TWAP WARMUP
-        // TWAP warm না হলে rebalancer.totalManagedAssets() revert করে
-        // → vault.totalAssets() revert → maxDeposit() = 0 → deposit revert
-        // Solution: swap করে TWAP observation তৈরি + 300s warp
+        // TWAP WARMUP
+        // If TWAP is not warmed up, rebalancer.totalManagedAssets() reverts
+        // → vault.totalAssets() reverts → maxDeposit() = 0 → deposit reverts
+        // Solution: perform a swap to create a TWAP observation + warp 300s
         _warmUpTwap();
     }
 
-    /// @dev Swap করে TWAP observation তৈরি করে + TWAP_WINDOW পার করে
+    /// @dev By executing a swap to record a TWAP observation + passing the TWAP_WINDOW
     function _warmUpTwap() internal {
-        // Pool-এ swap করুন TWAP observation তৈরি করতে
+        // Execute a swap in the pool to create a TWAP observation
         swap(poolKey, true, -int256(1 ether), "");
 
-        // TWAP_WINDOW (120s) + buffer পার করুন
+        // TWAP_WINDOW (120s) + buffer
         vm.warp(block.timestamp + 300);
     }
 
-    // ══════════════════════════════════════════════════════════════
     // FULL FLOW: Deposit → Deploy → Rebalance → Withdraw
-    // ══════════════════════════════════════════════════════════════
+    //=============================================================
 
     function test_fullProtocol_depositToWithdraw() public {
         vm.prank(alice);
@@ -179,12 +178,11 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
         );
     }
 
-    // ══════════════════════════════════════════════════════════════
     // MULTI-USER: Two users, share price consistency
-    // ══════════════════════════════════════════════════════════════
+    // -----------------------------------------------
 
     function test_fullProtocol_multiUser_sharePriceConsistent() public {
-        // ── 1. Deposits ─────────────────────────────────────────
+        // ------ 1. Deposits -------------
         vm.prank(alice);
         uint256 aliceShares = vault.deposit(100 ether, alice);
         assertGt(aliceShares, 0, "alice deposit must mint shares");
@@ -193,53 +191,52 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
         uint256 bobShares = vault.deposit(100 ether, bob);
         assertGt(bobShares, 0, "bob deposit must mint shares");
 
-        // ✅ Two deposits should be equal
+        // Two deposits should be equal
         assertEq(vault.balanceOf(alice), vault.balanceOf(bob), "equal shares");
 
-        // ✅ totalAssets should be 200
+        //totalAssets should be 200
         assertEq(vault.totalAssets(), 200 ether, "totalAssets = 200");
 
-        // ── 2. Deploy + Rebalance ───────────────────────────────
+        // --------- 2. Deploy + Rebalance ------------
         vm.prank(admin);
         vault.deployToRebalancer(200 ether);
 
-        // ✅ Verify rebalancer received funds
+        //  Verify rebalancer received funds
         assertEq(IERC20(Currency.unwrap(currency0)).balanceOf(address(rebalancer)), 200 ether, "rebalancer holds 200");
 
         vm.warp(block.timestamp + 300);
         vm.prank(strategist);
         rebalancer.rebalanceLiquidity(-120, 120, 200 ether, type(uint256).max, type(uint256).max);
 
-        // ✅ Verify rebalance succeeded
+        // Verify rebalance succeeded
         assertGt(rebalancer.currentLiquidity(), 0, "rebalancer has position");
 
-        // ── 3. Alice redeems ────────────────────────────────────
+        //-----------3. Alice redeems---------------
         uint256 aliceSharesToRedeem = vault.balanceOf(alice);
         vm.prank(alice);
         uint256 aliceOut = vault.redeem(aliceSharesToRedeem, alice, alice);
 
-        // ✅ Verify alice got > 0
+        // Verify alice got > 0
         assertGt(aliceOut, 0, "alice must withdraw > 0");
 
-        // ── 4. Bob redeems ──────────────────────────────────────
+        // ----------4. Bob redeems --------------
         uint256 bobSharesToRedeem = vault.balanceOf(bob);
         vm.prank(bob);
         uint256 bobOut = vault.redeem(bobSharesToRedeem, bob, bob);
 
-        // ✅ Verify bob got > 0
+        // Verify bob got > 0
         assertGt(bobOut, 0, "bob must withdraw > 0");
 
-        // ── 5. Assertion: equal withdrawals ────────────────────
+        // ===========5. Assertion: equal withdrawals==================
         assertApproxEqAbs(aliceOut, bobOut, 10, "equal withdrawals");
 
-        // ✅ Verify both are fully redeemed
+        // Verify both are fully redeemed
         assertEq(vault.balanceOf(alice), 0, "alice shares burned");
         assertEq(vault.balanceOf(bob), 0, "bob shares burned");
     }
 
-    // ══════════════════════════════════════════════════════════════
     // HARVEST: Performance fee flows through DynamicFee
-    // ══════════════════════════════════════════════════════════════
+    // ------------------------------------------------------
 
     function test_fullProtocol_harvestChargesFee() public {
         vm.prank(alice);
@@ -264,9 +261,8 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
         assertGt(feeModule.totalYieldProcessed(), 0, "yield processed");
     }
 
-    // ══════════════════════════════════════════════════════════════
     // WHITELIST: Non-whitelisted user cannot deposit
-    // ══════════════════════════════════════════════════════════════
+    //-------------------------------------------------
 
     function test_fullProtocol_whitelistEnforced() public {
         address nonWhitelisted = makeAddr("nonWhitelisted");
@@ -276,9 +272,9 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
         vault.deposit(100 ether, nonWhitelisted);
     }
 
-    // ══════════════════════════════════════════════════════════════
+    //=============================================================
     // ACCESS TIMELOCK: Removal pending → user can still withdraw
-    // ══════════════════════════════════════════════════════════════
+    //===================================================================
 
     function test_fullProtocol_whitelistRemovalTimelock() public {
         vm.prank(alice);
@@ -304,70 +300,68 @@ contract CuratioFullProtocolE2ETest is Test, Deployers {
         vault.redeem(remaining, alice, alice);
     }
 
-    // ══════════════════════════════════════════════════════════════
     // VAULT TIMELOCK: Rebalancer change doesn't affect valuation
-    // ══════════════════════════════════════════════════════════════
+    //--------------------------------------------------------------
 
     function test_fullProtocol_rebalancerTimelockProtectsValuation() public {
-        // ── 1. Alice deposits ───────────────────────────────────
+        //=============1. Alice deposits=================
         vm.prank(alice);
         uint256 shares = vault.deposit(100 ether, alice);
         assertGt(shares, 0, "deposit must mint shares");
 
-        // ── 2. Capture state before proposal ────────────────────
+        // --------------2. Capture state before proposal -------------
         address rebalancerBefore = address(vault.rebalancer());
         uint256 valuationBefore = vault.totalAssets();
         assertEq(valuationBefore, 100 ether, "valuation = 100 before proposal");
 
-        // ── 3. Admin proposes new rebalancer ───────────────────
+        // ---------- 3. Admin proposes new rebalancer --------------
         address newRebalancer = address(0xDEAD);
         vm.prank(admin);
         vault.proposeRebalancer(newRebalancer);
 
-        // ✅ Verify: pending proposal is set, but rebalancer is NOT yet changed
+        //  Verify: pending proposal is set, but rebalancer is NOT yet changed
         assertEq(address(vault.rebalancer()), rebalancerBefore, "rebalancer must NOT change immediately after propose");
 
-        // ── 4. During timelock: valuation unchanged ─────────────
+        // -------- 4. During timelock: valuation unchanged ---------------
         vm.warp(block.timestamp + 1 days);
 
-        // ✅ Verify: rebalancer still old
+        // Verify: rebalancer still old
         assertEq(address(vault.rebalancer()), rebalancerBefore, "rebalancer unchanged at +1 day");
 
-        // ✅ Verify: valuation unchanged (old rebalancer still used)
+        // Verify: valuation unchanged (old rebalancer still used)
         assertEq(vault.totalAssets(), valuationBefore, "valuation unchanged during delay");
 
-        // ── 5. During timelock: execute must revert ─────────────
+        // ============ 5. During timelock: execute must revert ===============
         vm.prank(admin);
         vm.expectRevert(); // timelock not elapsed yet
         vault.executeRebalancer();
 
-        // ✅ Verify: rebalancer still old after failed execute
+        //  Verify: rebalancer still old after failed execute
         assertEq(address(vault.rebalancer()), rebalancerBefore, "rebalancer unchanged after failed execute");
 
-        // ── 6. Warp past timelock ───────────────────────────────
-        // ✅ FIX: যথেষ্ট বেশি warp (eta-র চেয়ে বেশি)
+        // ------------------ 6. Warp past timelock-----------------
+
         vm.warp(block.timestamp + 5 days);
 
-        // ✅ Verify: valuation still unchanged (rebalancer not yet executed)
+        // Verify: valuation still unchanged (rebalancer not yet executed)
         assertEq(vault.totalAssets(), valuationBefore, "valuation still unchanged just before execute");
 
-        // ── 7. Execute succeeds after timelock ─────────────────
+        // ============ 7. Execute succeeds after timelock ========================
         vm.prank(admin);
         vault.executeRebalancer();
 
-        // ✅ Verify: rebalancer IS now the new one
+        // Verify: rebalancer IS now the new one
         assertEq(address(vault.rebalancer()), newRebalancer, "rebalancer changed after timelock execution");
 
-        // ✅ Verify: valuation may change (new rebalancer = 0xDEAD contract has no code)
+        // Verify: valuation may change (new rebalancer = 0xDEAD contract has no code)
         // Since 0xDEAD has no code, calling totalManagedAssets() will revert
         // So we expect the valuation call to revert OR return something different
         // We check that state was actually changed
         assertTrue(address(vault.rebalancer()) != rebalancerBefore, "rebalancer state must have changed");
     }
 
-    // ══════════════════════════════════════════════════════════════
     // REGISTRY: Performance tracking
-    // ══════════════════════════════════════════════════════════════
+    // ----------------------------------------------
 
     function test_fullProtocol_registryTracksPerformance() public {
         vm.prank(alice);

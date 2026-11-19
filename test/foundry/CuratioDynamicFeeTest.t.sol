@@ -22,7 +22,7 @@ contract CuratioDynamicFeeTest is Test {
         fee = new CuratioDynamicFee(admin, vault, feeRecipient);
     }
 
-    // ── Constructor ──────────────────────────────────────────────
+    // =====================Constructor ==================================================
 
     function test_constructor_revertsOnZeroAdmin() public {
         vm.expectRevert(CuratioDynamicFee.ZeroAddress.selector);
@@ -50,7 +50,7 @@ contract CuratioDynamicFeeTest is Test {
         assertTrue(fee.hasRole(fee.VAULT_ROLE(), vault));
     }
 
-    // ── calculatePerformanceFee ───────────────────────────────────
+    // -----------------calculatePerformanceFee---------------------------------------
 
     function test_calculatePerformanceFee_defaultTenPercent() public view {
         // 1000 bps == 10%
@@ -85,7 +85,7 @@ contract CuratioDynamicFeeTest is Test {
         assertEq(fee.calculatePerformanceFee(500 ether), 50 ether);
     }
 
-    // ── reportPerformanceFeeCharged ───────────────────────────────
+    // =============== reportPerformanceFeeCharged ===============
 
     function test_reportPerformanceFeeCharged_onlyVault() public {
         vm.prank(attacker);
@@ -119,7 +119,7 @@ contract CuratioDynamicFeeTest is Test {
         assertEq(fee.totalFeesCharged(), 0);
     }
 
-    // ── Admin: setPerformanceFeeBps ───────────────────────────────
+    // -------------- Admin: setPerformanceFeeBps ─-------------
 
     function test_setPerformanceFeeBps_onlyFeeAdminRole() public {
         bytes32 feeAdminRole = fee.FEE_ADMIN_ROLE(); // pre-fetch, outside prank
@@ -177,7 +177,7 @@ contract CuratioDynamicFeeTest is Test {
         assertEq(fee.performanceFeeBps(), 1200);
     }
 
-    // ── Admin: setFeeRecipient ────────────────────────────────────
+    //==============Admin: setFeeRecipient ===============
     function test_setFeeRecipient_onlyDefaultAdminRole() public {
         bytes32 defaultAdminRole = fee.DEFAULT_ADMIN_ROLE(); // pre-fetch, outside prank
 
@@ -220,7 +220,7 @@ contract CuratioDynamicFeeTest is Test {
         assertEq(fee.feeRecipient(), newRecipient);
     }
 
-    // ── Admin: setVault ────────────────────────────────────────────
+    // -------------- Admin: setVault ----------------------------------
 
     function test_setVault_onlyDefaultAdminRole() public {
         bytes32 defaultAdminRole = fee.DEFAULT_ADMIN_ROLE(); // pre-fetch, outside prank
@@ -279,7 +279,7 @@ contract CuratioDynamicFeeTest is Test {
         assertEq(fee.totalFeesCharged(), 10 ether);
     }
 
-    // ── reportPerformanceFeeCharged: fee must not exceed the calculated fee ──
+    // ============ reportPerformanceFeeCharged: fee must not exceed the calculated fee=====
 
     function test_report_revertsWhenFeeExceedsCalculated() public {
         vm.prank(vault);
@@ -344,7 +344,7 @@ contract CuratioDynamicFeeTest is Test {
         assertEq(fee.totalFeesCharged(), 100 ether);
     }
 
-    // ── Documents current behaviour: VAULT_ROLE does not gate reporting ──
+    // -------------- Documents current behaviour: VAULT_ROLE does not gate reporting -----------
 
     /// `onlyVault` compares msg.sender with the `vault` address and never looks at VAULT_ROLE.
     /// So granting the role to another address does NOT let it report. If the modifier is ever

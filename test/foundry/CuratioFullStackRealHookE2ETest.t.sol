@@ -95,7 +95,7 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
         asset.approve(address(vault), type(uint256).max);
     }
 
-    // ── helpers ──────────────────────────────────────────────────────────
+    // ------------------------helpers--------------------
 
     /// The hook's TWAP needs `DEFAULT_TWAP_WINDOW` seconds of history before it reports a price.
     function _warmUp() internal {
@@ -115,7 +115,7 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
         return liq;
     }
 
-    // ── cold start ───────────────────────────────────────────────────────
+    // =====================cold start =======================
 
     /// FINDING: right after a pool is initialised the hook has no TWAP history, so the strict
     /// valuation makes the vault refuse deposits (instead of mispricing shares).
@@ -142,7 +142,7 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
         assertEq(rebalancer.totalManagedAssets(), 0);
     }
 
-    // ── rebalance through the hook's liquidity callbacks ─────────────────
+    // ===========rebalance through the hook's liquidity callbacks ==============
 
     function test_realHook_rebalanceWorksAndHookTracksPosition() public {
         _warmUp();
@@ -161,7 +161,7 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
         assertApproxEqAbs(vault.totalAssets(), 200 ether, 20, "moving ranges must not change reported assets");
     }
 
-    // ── manipulation resistance with the REAL oracle ─────────────────────
+    // --------------manipulation resistance with the REAL oracle----------------
 
     /// A big same-block swap moves spot price a lot; the vault's reported assets must not move.
     function test_realHook_valuationIgnoresSameBlockSwap() public {
@@ -173,15 +173,14 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
 
         uint256 before = vault.totalAssets();
 
-        swap(poolKey, true, -int256(10 ether), ""); // ~20% price impact
+        swap(poolKey, true, -int256(10 ether), "");
 
         (,,,, bool init) = hook.getPoolState(poolKey);
         assertTrue(init);
         assertEq(vault.totalAssets(), before, "reported assets must follow the TWAP, not spot");
     }
 
-    // ── keeper path driven by the real hook's signals ────────────────────
-
+    // ================keeper path driven by the real hook's signals -----------
     function test_realHook_bigSwap_triggersUpkeep_andKeeperRebalances() public {
         _warmUp();
         other.transfer(address(rebalancer), 1000 ether);
@@ -193,7 +192,9 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
         (bool needed,) = rebalancer.checkUpkeep("");
         assertFalse(needed, "calm pool: no upkeep needed");
 
-        swap(poolKey, true, -int256(10 ether), ""); // spot tick jumps far from the TWAP
+        // spot tick jumps far from the TWAP
+
+        swap(poolKey, true, -int256(10 ether), "");
 
         bytes memory performData;
         (needed, performData) = rebalancer.checkUpkeep("");
@@ -211,7 +212,7 @@ contract CuratioFullStackRealHookE2ETest is Test, Deployers {
         assertEq(rebalancer.currentLiquidity(), 1000 ether);
     }
 
-    // ── hook MEV penalty vs the rebalancer ───────────────────────────────
+    // ================== hook MEV penalty vs the rebalancer==========
 
     /// A sandwich-looking pattern makes the hook charge MEV_PENALTY_FEE for swaps. Liquidity
     /// operations (the rebalancer's only pool interaction) must be unaffected.

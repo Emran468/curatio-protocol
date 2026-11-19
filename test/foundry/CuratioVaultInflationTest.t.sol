@@ -69,7 +69,7 @@ contract CuratioVaultInflationTest is Test {
         }
     }
 
-    // ── scaling ──────────────────────────────────────────────────────────
+    // ─scaling------
 
     function test_decimals_isAssetDecimalsPlusSix() public view {
         assertEq(uint256(vault.decimals()), 24);
@@ -96,7 +96,7 @@ contract CuratioVaultInflationTest is Test {
         assertEq(vault.totalAssets(), 0);
     }
 
-    // ── zero-amount guards ───────────────────────────────────────────────
+    // ==== zero-amount guards===
 
     /// A donation makes a tiny deposit round to 0 shares. It must revert and take nothing.
     function test_zeroShareDeposit_reverts_andTakesNoFunds() public {
@@ -131,7 +131,7 @@ contract CuratioVaultInflationTest is Test {
         assertEq(vault.balanceOf(alice), sharesBefore, "shares must not be burned");
     }
 
-    // ── the actual attack ────────────────────────────────────────────────
+    // == the actual attack ===
 
     /// Classic attack: deposit 1 wei, donate a lot, let the victim deposit.
     /// With the offset the victim loses a negligible amount and the attacker loses money.
@@ -156,7 +156,7 @@ contract CuratioVaultInflationTest is Test {
         assertLt(attackerOut, 10 ether + 1, "attacker must lose money overall");
     }
 
-    // ── fuzz ─────────────────────────────────────────────────────────────
+    // ---- fuzz -----
 
     /// A sole depositor can always get back exactly what they put in.
     function testFuzz_soleDepositor_roundTripIsExact(uint256 amt) public {

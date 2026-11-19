@@ -19,7 +19,7 @@ contract CuratioStrategistRegistryTest is Test {
     PoolId public poolId2 = PoolId.wrap(bytes32(uint256(2)));
     PoolId public poolId3 = PoolId.wrap(bytes32(uint256(3)));
 
-    // ─── Events ────────────────────────────────────────────────────────────────
+    // --------- Events---------------------
     event StrategistRegistered(address indexed strategist, string name);
     event StrategistDeactivated(address indexed strategist);
     event StrategistReactivated(address indexed strategist);
@@ -35,9 +35,8 @@ contract CuratioStrategistRegistryTest is Test {
         vm.stopPrank();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // ১. REGISTRATION TESTS
-    // ═══════════════════════════════════════════════════════════════════════
+    // 1 REGISTRATION TESTS
+    // -------------
 
     function test_registerStrategist() public {
         vm.startPrank(admin);
@@ -121,9 +120,8 @@ contract CuratioStrategistRegistryTest is Test {
         vm.stopPrank();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // ২. DEACTIVATION TESTS
-    // ═══════════════════════════════════════════════════════════════════════
+    //------------------------------
 
     function test_deactivateStrategist() public {
         vm.startPrank(admin);
@@ -194,9 +192,8 @@ contract CuratioStrategistRegistryTest is Test {
         vm.stopPrank();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // ৩. POOL ASSIGNMENT TESTS
-    // ═══════════════════════════════════════════════════════════════════════
+    // 3. POOL ASSIGNMENT TESTS
+    // ------------------------------
 
     function test_assignPoolToStrategist() public {
         vm.startPrank(admin);
@@ -270,9 +267,8 @@ contract CuratioStrategistRegistryTest is Test {
         vm.stopPrank();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // ৪. REASSIGN POOL TESTS
-    // ═══════════════════════════════════════════════════════════════════════
+    // 4 REASSIGN POOL TESTS
+    // ===========================
 
     function test_reassignPool() public {
         vm.startPrank(admin);
@@ -326,7 +322,6 @@ contract CuratioStrategistRegistryTest is Test {
         assertEq(registry.poolStrategist(poolId1), strategist1, "Pool should still be with strategist1");
     }
 
-    // ✅ ফিক্সড টেস্ট
     function test_reassignPool_removesFromOldList() public {
         vm.startPrank(admin);
         registry.registerStrategist(strategist1, "Strategist One");
@@ -396,7 +391,6 @@ contract CuratioStrategistRegistryTest is Test {
         registry.recordRebalanceExecuted(strategist1);
     }
 
-    // ✅ ফিক্সড টেস্ট
     function test_recordRebalanceExecuted_revertsIfStrategistInactive() public {
         vm.startPrank(admin);
         registry.registerStrategist(strategist1, "Strategist One");
@@ -404,12 +398,7 @@ contract CuratioStrategistRegistryTest is Test {
         registry.authorizeRebalancer(address(this));
         vm.stopPrank();
 
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                CuratioStrategistRegistry.StrategistInactive.selector, // ✅ সঠিক error
-                strategist1
-            )
-        );
+        vm.expectRevert(abi.encodeWithSelector(CuratioStrategistRegistry.StrategistInactive.selector, strategist1));
         registry.recordRebalanceExecuted(strategist1);
     }
 
@@ -482,7 +471,6 @@ contract CuratioStrategistRegistryTest is Test {
         assertEq(fees, 0, "Should have 0 fees");
     }
 
-    // ✅ ফিক্সড টেস্ট
     function test_performanceRecordingAfterDeactivation() public {
         vm.startPrank(admin);
         registry.registerStrategist(strategist1, "Strategist One");
@@ -490,18 +478,12 @@ contract CuratioStrategistRegistryTest is Test {
         registry.authorizeRebalancer(address(this));
         vm.stopPrank();
 
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                CuratioStrategistRegistry.StrategistInactive.selector, // ✅ সঠিক error
-                strategist1
-            )
-        );
+        vm.expectRevert(abi.encodeWithSelector(CuratioStrategistRegistry.StrategistInactive.selector, strategist1));
         registry.recordRebalanceExecuted(strategist1);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // ৬. AUTHORIZE REBALANCER TESTS
-    // ═══════════════════════════════════════════════════════════════════════
+    // 6 AUTHORIZE REBALANCER TESTS
+    //----------------------------------
 
     function test_authorizeRebalancer() public {
         vm.startPrank(admin);
@@ -571,9 +553,8 @@ contract CuratioStrategistRegistryTest is Test {
         assertTrue(hasRole, "Should still have role");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // ৭. VIEW FUNCTIONS TESTS
-    // ═══════════════════════════════════════════════════════════════════════
+    // 7 VIEW FUNCTIONS TESTS
+    // =========================
 
     function test_getAllStrategists() public {
         vm.startPrank(admin);
@@ -675,9 +656,8 @@ contract CuratioStrategistRegistryTest is Test {
         assertFalse(registry.isRegisteredStrategist(strategist2), "Should not be registered");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // ৮. EDGE CASE TESTS
-    // ═══════════════════════════════════════════════════════════════════════
+    //   8 EDGE CASE TESTS
+    //---------------------
 
     function test_deactivateAndReactivateWithPools() public {
         vm.startPrank(admin);
@@ -810,36 +790,29 @@ contract CuratioStrategistRegistryTest is Test {
         vm.prank(admin);
         registry.registerStrategist(strategist2, "Strategist Two");
 
-        bytes32 registrarRole = registry.REGISTRAR_ROLE(); // ✅ আগে cache করুন
+        bytes32 registrarRole = registry.REGISTRAR_ROLE();
 
         vm.prank(unauthorized);
         vm.expectRevert(
             abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector,
-                unauthorized,
-                registrarRole // ✅ cached ভ্যারিয়েবল ব্যবহার করুন
+                IAccessControl.AccessControlUnauthorizedAccount.selector, unauthorized, registrarRole
             )
         );
         registry.bulkReassignPools(strategist1, strategist2, type(uint256).max);
     }
 
-    // ==========================================
-    // ✅ NEW: Backtesting Tests
-    // ==========================================
+    // -----------------------------------------
+    // Backtesting Tests
+    // ---------------------------------------
 
     function test_backtestStrategy_returnsCorrectEstimates() public {
-        // ১. একটি স্ট্র্যাটেজিস্ট রেজিস্টার করুন
         vm.prank(admin);
         registry.registerStrategist(strategist, "Test Strategist");
-
-        // ২. স্ট্র্যাটেজিস্টের জন্য কিছু ফি রেকর্ড করুন (যেমন: 10 ether)
         vm.prank(rebalancer);
         registry.recordFeesGenerated(strategist, 10 ether);
 
-        // ৩. backtestStrategy কল করে ফলাফল চেক করুন
         (uint256 estimatedYield, uint256 estimatedFee) = registry.backtestStrategy(strategist);
 
-        // ৪. যাচাই করুন (ফলাফল: yield = 10 ether, fee = 10% of yield = 1 ether)
         assertEq(estimatedYield, 10 ether, "Estimated yield should match total fees generated");
         assertEq(estimatedFee, 1 ether, "Estimated fee should be 10% of the yield");
     }
@@ -847,7 +820,6 @@ contract CuratioStrategistRegistryTest is Test {
     function test_backtestStrategy_returnsZeroIfNotRegistered() public {
         address unknownStrategist = makeAddr("unknown");
 
-        // ✅ রেজিস্টার্ড না থাকলে (0, 0) রিটার্ন করবে
         (uint256 estimatedYield, uint256 estimatedFee) = registry.backtestStrategy(unknownStrategist);
 
         assertEq(estimatedYield, 0, "Yield should be 0 for unregistered strategist");

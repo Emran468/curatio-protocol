@@ -70,7 +70,7 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         rebalancer.setManagedPool(poolKey);
     }
 
-    // ── helpers ──────────────────────────────────────────────────────────
+    // ======================= helpers =========================
 
     /// Simulates "tokens arrived from the vault" (fund flow is not implemented yet).
     function _fundRebalancer(uint256 amt) internal {
@@ -88,7 +88,7 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         rebalancer.rebalanceLiquidity(lo, hi, liq, MAX, MAX);
     }
 
-    // ── fund flow ────────────────────────────────────────────────────────
+    //------------------------------fund flow -------------------
 
     function test_realPM_revertsWhenRebalancerHasNoTokens() public {
         vm.prank(admin);
@@ -104,7 +104,7 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         assertEq(_liq(-120, 120), 100 ether);
     }
 
-    // ── core behaviour ───────────────────────────────────────────────────
+    //   ===========core behaviour ==============
 
     function test_realPM_firstRebalance_addsRealLiquidity() public {
         _fundRebalancer(1000 ether);
@@ -145,7 +145,7 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         assertEq(rebalancer.currentLiquidity(), 150 ether);
     }
 
-    // ── validation (now enforced by the contract itself) ─────────────────
+    // ---------- validation (now enforced by the contract itself)
 
     function test_realPM_zeroLiquidityReverts() public {
         _fundRebalancer(1000 ether);
@@ -168,7 +168,7 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         rebalancer.rebalanceLiquidity(-887280, 120, 100 ether, MAX, MAX); // below usable MIN for spacing 60
     }
 
-    // ── slippage ─────────────────────────────────────────────────────────
+    // ---------------- slippage ---------------
 
     function test_realPM_slippageCapReverts() public {
         _fundRebalancer(1000 ether);
@@ -184,8 +184,7 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         assertEq(_liq(-120, 120), 100 ether);
     }
 
-    // ── setManagedPool guard ─────────────────────────────────────────────
-
+    // =================setManagedPool guard ----------------
     function test_realPM_setManagedPoolRevertsWhilePositionActive() public {
         _fundRebalancer(1000 ether);
         _rebalance(-120, 120, 100 ether);
@@ -195,14 +194,12 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         rebalancer.setManagedPool(poolKey);
     }
 
-    // ── keeper path ──────────────────────────────────────────────────────
+    // --------------- keeper path------------------
 
     function test_realPM_performUpkeep_negativeTick() public {
         _fundRebalancer(1000 ether);
 
-        // TWAP-কে referenceTick-এর সাথে মিলিয়ে দিন
         vm.etch(hook, address(new MockCuratioHook(-70, -70, 3000)).code);
-        // ← assertEq(IcuratioHookView(...)...) এই লাইনটা বাদ
 
         vm.prank(admin);
         rebalancer.setKeeperMaxPay(MAX, MAX);
@@ -219,10 +216,10 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
     function test_realPM_performUpkeep_revertsWithDefaultZeroCaps() public {
         _fundRebalancer(1000 ether);
 
-        // ⬇ TWAP-কে refTick-এর সাথে মিলিয়ে দিন (deviation=0, চেক active, তবে পাস করে)
+        // ⬇ Align TWAP with refTick (deviation=0, active check, but passes)
         vm.etch(hook, address(new MockCuratioHook(580, 580, 3000)).code);
 
-        // setKeeperMaxPay কল করবেন না — caps = 0 ডিফল্টে রাখুন
+        // Do not call setKeeperMaxPay — keep caps = 0 by default
         vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
 
         vm.prank(automationRegistry);
@@ -233,7 +230,7 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
     function test_realPM_performUpkeep_skipsWhenRangeUnchanged() public {
         _fundRebalancer(1000 ether);
 
-        // ধাপ ১: প্রাথমিক position তৈরি করুন এমন tick-এ যেটা পরের refTick-এর সাথে মিলে
+        // Step 1: Create an initial position at a tick that matches the next refTick
         vm.etch(hook, address(new MockCuratioHook(0, 0, 3000)).code);
         vm.prank(admin);
         rebalancer.setKeeperMaxPay(MAX, MAX);
@@ -242,7 +239,7 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
         vm.prank(automationRegistry);
         rebalancer.performUpkeep(abi.encode(int24(0), false)); // range = [-120, 120]
 
-        // ধাপ ২: একই refTick দিয়ে আবার কল → range অপরিবর্তিত
+        // Step 2: Call again with the same refTick → range remains unchanged
         vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
         vm.prank(automationRegistry);
 
@@ -267,7 +264,6 @@ contract CuratioRebalancerRealPMTest is Test, Deployers {
     }
 
     function test_realPM_performUpkeep_revertsOnExcessiveDeviation() public {
-        // ⬇ এই লাইনটা আগে ছিল না — এটাই মূল ফিক্স
         vm.roll(block.number + rebalancer.minBlocksBetweenRebalances() + 1);
 
         vm.prank(automationRegistry);

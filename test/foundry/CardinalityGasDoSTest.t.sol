@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/*//////////////////////////////////////////////////////////////////////////
+/*---------------------------------------------------------------------------
     CardinalityGasDoS.t.sol
 
     Foundry gas-bound & security assertion checks for oracle cardinality
     management, verifying protection against gas DoS and pool-bricking.
-//////////////////////////////////////////////////////////////////////////*/
+------------------------------------------------------------------------------*/
 
 import {Test} from "forge-std/Test.sol";
 
@@ -63,9 +63,8 @@ contract CardinalityGasDoSTest is Test, Deployers {
         );
     }
 
-    /*==========================================================================
-        BOUNDED GAS & CLAMP TESTS
-    ==========================================================================*/
+    //               BOUNDED GAS & CLAMP TESTS
+    // ==========================================================================
 
     /// @notice Requesting a massive target clamps growth to `maxCardinalityPerCall`
     ///         instead of reverting or running out of gas.
@@ -126,10 +125,6 @@ contract CardinalityGasDoSTest is Test, Deployers {
         (, uint16 cardinality,) = hook.getOracleState(freshKey);
         assertEq(cardinality, activeCap, "oracle should be pre-warmed to configured initialCardinality");
     }
-
-    /*==========================================================================
-        GOVERNANCE & PARAMETER SAFETY TESTS
-    ==========================================================================*/
 
     /// @notice Owner cannot set `maxCardinalityPerCall` above `HARD_MAX_CARDINALITY_PER_CALL`.
     function test_MaxCardinalityPerCall_CannotExceedHardCeiling() public {

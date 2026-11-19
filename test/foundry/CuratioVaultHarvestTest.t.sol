@@ -665,7 +665,7 @@ contract CuratioVaultHarvestTest is Test {
         assertApproxEqAbs(fee.totalFeesCharged(), 3 ether, 1e3);
     }
 
-    // ── max* never revert (ERC-4626) ─────────────────────────────────────
+    // ------max* never revert (ERC-4626) ------
 
     function test_max_returnZeroInsteadOfRevertingDuringTwapOutage() public {
         vm.prank(admin);
@@ -685,8 +685,7 @@ contract CuratioVaultHarvestTest is Test {
         assertEq(vault.maxDeposit(alice), type(uint256).max);
     }
 
-    // ── fuzz ─────────────────────────────────────────────────────────────
-
+    // ======= fuzz ==========
     /// Whatever the deposit, gain and rate: the fee never exceeds rate x gain, and holders never lose.
     function testFuzz_harvest_feeNeverExceedsRateTimesGain(uint256 dep, uint256 gain, uint256 bps) public {
         dep = bound(dep, 1e6, 1e27);

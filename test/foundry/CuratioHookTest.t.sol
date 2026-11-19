@@ -583,17 +583,13 @@ contract CuratioHookTest is Test, Deployers {
         }
         vm.stopPrank();
 
-        // ----------------------------------------------------------------// -------------------------------------------------------------------------
         // Step 4: Strict Assertions
-        // -------------------------------------------------------------------------
-        // ১. নিশ্চিত করুন অন্তত একটি সোয়াপ সফল হয়েছে (try/catch যেন ভুয়া পাস না করায়)
+
         assertGt(successfulSwaps, 0, "At least one swap must succeed to simulate stress");
 
-        // ২. এক্সট্রিম স্যান্ডউইচ/ভোলাটিলিটির কারণে ফি সর্বোচ্চ লেভেলে (MEV_PENALTY_FEE) পৌছেছে কি না
         uint24 currentFee = hook.getCurrentFee(poolKey);
         assertEq(currentFee, MEV_PENALTY_FEE, "Fee should hit max penalty fee under extreme volatility");
 
-        // ৩. সময় সামনে বাড়িয়ে সঠিক TWAP ডিফারেন্স টেস্ট করা
         vm.warp(block.timestamp + 600);
         int24 postShockTwap = hook.getTwapTick(poolKey, 120);
 
@@ -706,9 +702,7 @@ contract CuratioHookTest is Test, Deployers {
     function _max(int24 a, int24 b) internal pure returns (int24) {
         return a > b ? a : b;
     }
-    // ═══════════════════════════════════════════════════════════════════════
     // Helpers
-    // ═══════════════════════════════════════════════════════════════════════
 
     function _swapAs(address user, bool zeroForOne, uint256 amountIn) internal {
         vm.prank(user);
@@ -838,9 +832,7 @@ contract CuratioHookTest is Test, Deployers {
         assertApproxEqAbs(actualTwap, expectedTwap, 1, "TWAP failed exact mathematical weighted average check");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // setMaxCardinalityPerCall — completely untested in existing suite
-    // ═══════════════════════════════════════════════════════════════════════
 
     function test_setMaxCardinalityPerCall_onlyOwner() public {
         vm.prank(randomUser);
@@ -933,9 +925,7 @@ contract CuratioHookTest is Test, Deployers {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // isOracleWarm — untested edge-case branches
-    // ═══════════════════════════════════════════════════════════════════════
 
     function test_isOracleWarm_falseWhenWindowIsZero() public view {
         assertFalse(hook.isOracleWarm(poolKey, 0), "zero window must be treated as never warm");
@@ -947,9 +937,7 @@ contract CuratioHookTest is Test, Deployers {
         assertFalse(hook.isOracleWarm(poolKey, type(uint32).max), "window exceeding block.timestamp must be cold");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // View/getter functions — untested in existing suite
-    // ═══════════════════════════════════════════════════════════════════════
 
     function test_tickSlotMap_returnsNonZeroAfterInit() public view {
         assertNotEq(hook.tickSlotMap(poolId), bytes32(0));
@@ -1016,9 +1004,7 @@ contract CuratioHookTest is Test, Deployers {
         assertTrue(bytes(name).length > 0);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // abs() — direct branch coverage for both signs
-    // ═══════════════════════════════════════════════════════════════════════
 
     /// @notice Drives the tick negative and confirms downstream tick-delta
     ///         math (which relies on abs()) still produces a sane, bounded
@@ -1036,9 +1022,7 @@ contract CuratioHookTest is Test, Deployers {
         );
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // afterRemoveLiquidity — success path (only the revert path was tested before)
-    // ═══════════════════════════════════════════════════════════════════════
 
     function test_removeLiquidity_succeedsAndEmitsEvent() public {
         int24 tickLower = TickMath.minUsableTick(60);
@@ -1056,10 +1040,8 @@ contract CuratioHookTest is Test, Deployers {
         );
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // Sandwich tracker — negative-direction peak tracking (only positive
     // direction was implicitly exercised before)
-    // ═══════════════════════════════════════════════════════════════════════
 
     function test_sandwichTracker_tracksNegativeDirectionPeak() public {
         _swap(true, 3 ether);
@@ -1164,14 +1146,12 @@ contract CuratioHookTest is Test, Deployers {
         vm.stopPrank();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // _packTracker / _unpackTracker — negative-value sign-extension branches
     // These are internal, so we verify them indirectly through
     // getSandwichTracker(), which round-trips through pack/unpack on every
     // read. Driving firstMove, lastMove, and peakTick all negative exercises
     // the `rawX & 0x800000 != 0` sign-extension branch for each field,
     // instead of only ever hitting the positive/non-negative branch.
-    // ═══════════════════════════════════════════════════════════════════════
 
     /// @notice All three signed tracker fields (firstMove, lastMove, peakTick)
     ///         must round-trip correctly through pack/unpack when negative.
@@ -1254,13 +1234,11 @@ contract CuratioHookTest is Test, Deployers {
         assertLt(lastMove, 0, "lastMove must be negative");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // _computeFee — "fee persists" branch (neither escalate nor reset)
     // Exercises: tickDelta < mid threshold AND blockDelta < decayWindow AND
     // currentFee != 0 -> feeToSave = currentFee (the final `return currentFee`
     // branch in _computeFee, distinct from the BASE_FEE-reset branch already
     // covered by test_fee_decaysBackToBaseAfterDecayWindow).
-    // ═══════════════════════════════════════════════════════════════════════
 
     function test_computeFee_feePersists_withinDecayWindowAndBelowThreshold() public {
         // 1. First swap: large enough to escalate fee off BASE_FEE.
@@ -1653,7 +1631,6 @@ contract CuratioHookTest is Test, Deployers {
     }
 
     function test_beforeInitialize_revertsOnStaticFeePool() public {
-        // স্ট্যাটিক ফি (3000) দিয়ে একটি পুল তৈরি করার চেষ্টা
         PoolKey memory staticFeeKey = PoolKey({
             currency0: currency0,
             currency1: currency1,
@@ -1662,7 +1639,6 @@ contract CuratioHookTest is Test, Deployers {
             hooks: hook
         });
 
-        // ⚠️ ফিক্স: manager.initialize() এর বদলে সরাসরি hook.beforeInitialize() কল করুন
         vm.expectRevert(CuratioHook.PoolMustUseDynamicFee.selector);
         hook.beforeInitialize(address(this), staticFeeKey, SQRT_PRICE_1_1);
     }
@@ -1879,7 +1855,7 @@ contract CuratioHookTest is Test, Deployers {
         uint24 bobFee = _swapAsAndGetFee(bob, true, 10 ether);
         console2.log("Bob (Back-runner) Fee:", bobFee);
 
-        // Strict Check: Back-runner ঠিক ১০% (১০০০০০) ফি দিচ্ছে কিনা
+        // Strict Check: Back-runner
         assertEq(bobFee, MEV_PENALTY_FEE, "Back-runner must pay 100000 even when TWAP is warm");
     }
 }

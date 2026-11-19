@@ -13,58 +13,6 @@ import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol"
 ///      - valuation (`totalManagedAssets`) which is deliberately NOT affected by `shouldRevert`,
 ///        because Vault.totalAssets() depends on it; use `shouldRevertOnValuation` to test that
 ///      - `returnToVault`, which pays out of the mock's own token balance.
-// contract MockRebalancer {
-//     bool public shouldRevert;
-//     bool public shouldRevertOnValuation;
-//     uint256 public lastDepositNotified;
-//     uint256 public lastWithdrawNotified;
-//     uint256 public depositCallCount;
-//     uint256 public withdrawCallCount;
-
-//     uint256 public managedAssets;
-//     address public returnToken;
-//     uint256 public returnCallCount;
-//     uint256 public lastReturnRequested;
-
-//     function setShouldRevert(bool _shouldRevert) external {
-//         shouldRevert = _shouldRevert;
-//     }
-
-//     function setShouldRevertOnValuation(bool v) external {
-//         shouldRevertOnValuation = v;
-//     }
-
-//     function setManagedAssets(uint256 v) external {
-//         managedAssets = v;
-//     }
-
-//     function setReturnToken(address t) external {
-//         returnToken = t;
-//     }
-
-//     function notifyDeposit(uint256 assets) external {
-//         if (shouldRevert) revert("MockRebalancer: forced revert");
-//         lastDepositNotified = assets;
-//         depositCallCount++;
-//     }
-
-//     function notifyWithdraw(uint256 assets) external {
-//         if (shouldRevert) revert("MockRebalancer: forced revert");
-//         lastWithdrawNotified = assets;
-//         withdrawCallCount++;
-//     }
-
-//     function totalManagedAssets() external view returns (uint256) {
-//         if (shouldRevertOnValuation) revert("MockRebalancer: valuation unavailable");
-//         return managedAssets;
-//     }
-
-//     function returnToVault(uint256 amount) external {
-//         returnCallCount++;
-//         lastReturnRequested = amount;
-//         IERC20(returnToken).transfer(msg.sender, amount);
-//     }
-// }
 
 contract MockRebalancer {
     bool public shouldRevert;
@@ -79,10 +27,8 @@ contract MockRebalancer {
     uint256 public returnCallCount;
     uint256 public lastReturnRequested;
 
-    // ✅ নতুন ভেরিয়েবল (টেস্টের জন্য)
     address public strategistRegistry;
 
-    // ✅ নতুন ফাংশন (টেস্টের জন্য)
     function setStrategistRegistry(address r) external {
         strategistRegistry = r;
     }
@@ -174,7 +120,7 @@ contract CuratioVaultTest is Test {
         asset.approve(address(vault), type(uint256).max);
     }
 
-    // ── Constructor ──────────────────────────────────────────────
+    // ── Constructor
 
     function test_constructor_revertsOnZeroAccessControl() public {
         vm.expectRevert(CuratioVault.ZeroAddress.selector);
@@ -202,7 +148,7 @@ contract CuratioVaultTest is Test {
         assertEq(vault.symbol(), "cVAULT");
     }
 
-    // ── Deposit ──────────────────────────────────────────────────
+    // ── Deposit
 
     function test_deposit_revertsIfNotWhitelisted() public {
         vm.prank(attacker);
@@ -424,8 +370,7 @@ contract CuratioVaultTest is Test {
         assertGt(shares, 0);
     }
 
-    // ── Redeem ───────────────────────────────────────────────────
-
+    // ── Redeem
     function test_redeem_revertsIfNotWhitelisted() public {
         // 1. Alice deposits while whitelisted
         vm.prank(alice);
@@ -511,7 +456,7 @@ contract CuratioVaultTest is Test {
         vault.deposit(101 ether, alice);
     }
 
-    // ── ERC-4626 limits ──────────────────────────────────────────
+    // ERC-4626 limits
 
     function test_maxDeposit_reflectsCapAndExistingAssets() public {
         assertEq(vault.maxDeposit(alice), DEPOSIT_CAP);
@@ -627,7 +572,7 @@ contract CuratioVaultTest is Test {
         vault.withdraw(101 ether, alice, alice);
     }
 
-    // ── Admin: access-contract timelock ──────────────────────────────
+    //Admin: access-contract timelock
 
     function test_proposeAccessControl_onlyDefaultAdmin() public {
         vm.prank(attacker);
@@ -769,7 +714,7 @@ contract CuratioVaultTest is Test {
         assertTrue(vault.pendingAccessControl() != address(0), "attacker must not cancel");
     }
 
-    // ── Admin: rebalancer timelock ───────────────────────────────────
+    //  Admin: rebalancer timelock
 
     function test_proposeRebalancer_onlyDefaultAdmin() public {
         vm.prank(attacker);
@@ -929,7 +874,7 @@ contract CuratioVaultTest is Test {
         assertEq(vault.pendingRebalancer(), address(newRebalancer), "attacker must not cancel");
     }
 
-    // ── What the timelock protects ───────────────────────────────────
+    // What the timelock protects
 
     /// Valuation (and therefore the share price) cannot be changed by a proposal alone. After
     /// execution the OLD rebalancer's holdings stop being counted: documents why funds must be moved first.
@@ -1009,7 +954,7 @@ contract CuratioVaultTest is Test {
         assertEq(vault.depositCap(), 500 ether);
     }
 
-    // ── Admin: setDepositsPaused ──────────────────────────────────
+    // ── Admin: setDepositsPaused
 
     function test_setDepositsPaused_onlyVaultManagerRole() public {
         vm.prank(attacker);
@@ -1039,25 +984,23 @@ contract CuratioVaultTest is Test {
         assertGt(shares, 0);
     }
 
-    // ==========================================
-    // ✅ NEW: Copy-LP / Follow Strategist Tests
-    // ==========================================
+    //  Follow Strategist Tests
 
     function test_followStrategist_success() public {
         vm.prank(admin);
         access.setWhitelistedUser(alice, true);
 
-        // ✅ Mock the rebalancer's registry call
+        //Mock the rebalancer's registry call
         address mockRegistry = makeAddr("mockRegistry");
         vm.mockCall(address(rebalancer), abi.encodeWithSignature("strategistRegistry()"), abi.encode(mockRegistry));
 
-        // ✅ Mock the registry's checks to return true
+        //  Mock the registry's checks to return true
         vm.mockCall(
             mockRegistry, abi.encodeWithSignature("isRegisteredStrategist(address)", strategist), abi.encode(true)
         );
         vm.mockCall(mockRegistry, abi.encodeWithSignature("isActiveStrategist(address)", strategist), abi.encode(true));
 
-        // ✅ Now Alice can follow
+        // Now Alice can follow
         vm.prank(alice);
         vault.followStrategist(strategist);
 
@@ -1065,7 +1008,6 @@ contract CuratioVaultTest is Test {
     }
 
     function test_followStrategist_revertsIfNotWhitelisted() public {
-        // ✅ alice এর বদলে attacker ব্যবহার করা হলো
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(CuratioVault.NotWhitelisted.selector, attacker));
         vault.followStrategist(makeAddr("strategist"));

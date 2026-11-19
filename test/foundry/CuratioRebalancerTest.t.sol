@@ -167,7 +167,7 @@ contract CuratioRebalancerTest is Test, Deployers {
         });
     }
 
-    // ── Constructor Tests ──────────────────────────────────────────
+    // ====== Constructor Tests ========
 
     function test_constructor_setsInitialState() public view {
         assertEq(address(rebalancer.poolManager()), poolManager);
@@ -223,7 +223,7 @@ contract CuratioRebalancerTest is Test, Deployers {
         new CuratioRebalancer(poolManager, hook, vault, admin, 1 ether, automationRegistry, 0);
     }
 
-    // ── Vault Notifications Tests ─────────────────────────────────
+    //------- Vault Notifications Tests -----------
 
     function test_notifyDeposit_revertsIfNotVault() public {
         vm.prank(attacker);
@@ -302,7 +302,7 @@ contract CuratioRebalancerTest is Test, Deployers {
         rebalancer.notifyDeposit(2 ether);
     }
 
-    // ── Admin: setManagedPool Tests ───────────────────────────────
+    // ====== Admin: setManagedPool Tests ==========
 
     function test_setManagedPool_onlyAdmin() public {
         vm.prank(attacker);
@@ -328,9 +328,9 @@ contract CuratioRebalancerTest is Test, Deployers {
         return (key.currency0, key.currency1, key.fee, key.tickSpacing, key.hooks);
     }
 
-    // ── Admin: setHook / setVault Tests ───────────────────────────
+    // ==== Admin: setHook / setVault Tests=====-
 
-    // ── Admin: hook timelock (propose / execute / cancel) ─────────
+    //  Admin: hook timelock (propose / execute / cancel)
 
     function test_proposeHook_onlyAdmin() public {
         vm.prank(attacker);
@@ -514,7 +514,7 @@ contract CuratioRebalancerTest is Test, Deployers {
         rebalancer.setVault(address(0));
     }
 
-    // ── Admin: Thresholds Tests ───────────────────────────────────
+    // ------Admin: Thresholds Tests------
 
     function test_setRebalanceThreshold_onlyStrategist() public {
         vm.prank(attacker);
@@ -549,7 +549,7 @@ contract CuratioRebalancerTest is Test, Deployers {
         assertEq(rebalancer.minBlocksBetweenRebalances(), 50);
     }
 
-    // ── Rebalance Liquidity Validation Tests ──────────────────────
+    // =====Rebalance Liquidity Validation Tests============
 
     function test_rebalanceLiquidity_onlyStrategist() public {
         vm.prank(admin);
@@ -575,8 +575,7 @@ contract CuratioRebalancerTest is Test, Deployers {
         rebalancer.rebalanceLiquidity(120, -120, 1000, type(uint256).max, type(uint256).max);
     }
 
-    // ── Access Control Tests ──────────────────────────────────────
-
+    // ----- Access Control Tests -------
     function test_unlockCallback_revertsIfNotPoolManager() public {
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(CuratioRebalancer.NotPoolManager.selector, attacker));
@@ -609,10 +608,9 @@ contract CuratioRebalancerIntegrationTest is Test {
     function setUp() public {
         mockManager = new MockPoolManagerFull();
 
-        // ⬇ এই ৫ লাইন নতুন — ZeroAddress ঠেকায় + TWAP সোর্স দেয়
         mockHook = new MockHookView();
         mockHook.setPoolState(0, 3000, uint64(block.number), uint64(block.timestamp), true);
-        mockHook.setTwapTick(600); // referenceTick=600 এর সাথে মিল
+        mockHook.setTwapTick(600);
         hook = address(mockHook);
         assertGt(hook.code.length, 0, "hook must have code");
         // ⬆
@@ -625,14 +623,14 @@ contract CuratioRebalancerIntegrationTest is Test {
 
         rebalancer =
             new CuratioRebalancer(address(mockManager), hook, vault, admin, 1 ether, automationRegistry, 1000 ether);
-        //                                    ↑ এখন non-zero + কোড আছে
+        //
 
         testKey = PoolKey({
             currency0: Currency.wrap(address(token0)),
             currency1: Currency.wrap(address(token1)),
             fee: 3000,
             tickSpacing: 60,
-            hooks: IHooks(address(0)) // ✅ আপনার করা পরিবর্তন ঠিক আছে
+            hooks: IHooks(address(0))
         });
 
         vm.prank(admin);
@@ -695,11 +693,11 @@ contract CuratioRebalancerIntegrationTest is Test {
         assertEq(token1.balanceOf(address(rebalancer)), balBefore1 - 4 ether);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
+    // =====================================================
     // _settleCurrency — native ETH branch and zero-delta branch
     // Previously untested: every prior test used ERC20 currencies with
     // non-zero deltas only.
-    // ═══════════════════════════════════════════════════════════════════════
+    //===========================================================
 
     /// @notice Exercises the native-ETH settlement branch of _settleCurrency
     ///         (Currency.unwrap(currency) == address(0)), which every prior
@@ -764,17 +762,14 @@ contract CuratioRebalancerIntegrationTest is Test {
         vm.prank(admin);
         rebalancer.setManagedPool(testKey);
 
-        // 1 ether-এর নিচে ডিপোজিট করছি (যেমন: 0.5 ether)
         vm.prank(vault);
         rebalancer.notifyDeposit(0.5 ether);
 
-        // রিব্যালান্স ট্রিগার হয়নি তা নিশ্চিত হওয়া
         assertEq(rebalancer.lastRebalanceBlock(), 0);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // Chainlink Automation — checkUpkeep / performUpkeep
-    // ═══════════════════════════════════════════════════════════════════════
+    //====================================================
 
     function test_performUpkeep_onlyAutomationRegistry() public {
         vm.prank(makeAddr("randomCaller"));
@@ -825,7 +820,6 @@ contract CuratioRebalancerIntegrationTest is Test {
     function test_performUpkeep_executesRebalanceWithComputedRange() public {
         mockManager.setNextDelta(0, 0);
 
-        // minBlocksBetweenRebalances উইন্ডো পেরিয়ে যান
         vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
 
         int24 referenceTick = 600;
@@ -846,23 +840,23 @@ contract CuratioRebalancerIntegrationTest is Test {
         int24 expectedLower = expectedBase - (tickSpacing * 2);
         int24 expectedUpper = expectedBase + (tickSpacing * 2);
 
-        // ✅ Proof 1: range সত্যিই বদলেছে (early-return নয়)
+        //Proof 1: range has actually changed (not an early-return)
         assertTrue(
             rebalancer.currentTickLower() != lowerBefore || rebalancer.currentTickUpper() != upperBefore,
             "range did not change - performUpkeep silently skipped"
         );
 
-        // ✅ Proof 2: expected মানগুলো সঠিকভাবে হিসাব হয়েছে
+        // Proof 2: expected values were calculated correctly
         assertEq(rebalancer.currentTickLower(), expectedLower, "wrong lower tick");
         assertEq(rebalancer.currentTickUpper(), expectedUpper, "wrong upper tick");
         assertEq(expectedLower, 480, "sanity: base=600, spacing=60, 2x => 480");
         assertEq(expectedUpper, 720, "sanity: base=600, spacing=60, 2x => 720");
 
-        // ✅ Proof 3: lastRebalanceBlock সত্যিই আপডেট হয়েছে
+        // Proof 3: lastRebalanceBlock was actually updated
         assertEq(rebalancer.lastRebalanceBlock(), block.number, "block not recorded");
         assertGt(rebalancer.lastRebalanceBlock(), blockBefore, "block not advanced");
 
-        // ✅ Proof 4: deviation চেক স্কিপ হয়নি — TWAP সত্যিই কল হয়েছে
+        //Proof 4: Deviation check was not skipped — TWAP was actually called
         //    (mockHook TWAP = 600, referenceTick = 600 => deviation = 0)
         assertEq(
             mockHook.getTwapTick(testKey, rebalancer.TWAP_WINDOW()),
@@ -874,8 +868,8 @@ contract CuratioRebalancerIntegrationTest is Test {
     /// @notice When twapDiverged is true, performUpkeep must use the wider
     ///         range (3x tickSpacing) instead of the default (2x) — this
     ///         distinguishes the two branches of rangeWidthInSpacings.
-    /// @notice Genuine pass: প্রমাণ করে twapDiverged=true হলে 3x width ব্যবহার হয়,
-    ///         এবং সেটা 2x case-এর চেয়ে স্পষ্টত আলাদা মান দেয়।
+    /// @notice Genuine pass: Proves that when twapDiverged=true, a 3x width is used,
+    ///         and that it produces a clearly distinct value from the 2x case.
     function test_performUpkeep_usesWiderRangeWhenTwapDiverged() public {
         mockManager.setNextDelta(0, 0);
         vm.roll(block.number + rebalancer.minBlocksBetweenRebalances());
@@ -894,17 +888,17 @@ contract CuratioRebalancerIntegrationTest is Test {
         int24 expectedLower = expectedBase - (tickSpacing * 3); // 420
         int24 expectedUpper = expectedBase + (tickSpacing * 3); // 780
 
-        // ✅ Proof 1: range বদলেছে
+        //  Proof 1: range
         assertTrue(
             rebalancer.currentTickLower() != lowerBefore || rebalancer.currentTickUpper() != upperBefore,
             "range did not change - silent skip"
         );
 
-        // ✅ Proof 2: 3x (wider) range
+        // Proof 2: 3x (wider) range
         assertEq(rebalancer.currentTickLower(), expectedLower, "diverged lower tick wrong");
         assertEq(rebalancer.currentTickUpper(), expectedUpper, "diverged upper tick wrong");
 
-        // ✅ Proof 3: 2x case (480/720) থেকে স্পষ্ট আলাদা — diverged শাখা বাস্তবে ভিন্ন
+        //  Proof 3: Clearly distinct from the 2x case (480/720) — the diverged branch is actually different
         assertEq(rebalancer.currentTickLower(), 420, "sanity: 3x lower = 600-180 = 420");
         assertEq(rebalancer.currentTickUpper(), 780, "sanity: 3x upper = 600+180 = 780");
         assertTrue(rebalancer.currentTickLower() != 480, "must differ from non-diverged (2x) branch");
@@ -939,9 +933,7 @@ contract CuratioRebalancerIntegrationTest is Test {
         );
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // Admin: automation config
-    // ═══════════════════════════════════════════════════════════════════════
 
     function test_setAutomationRegistry_onlyAdmin() public {
         vm.prank(makeAddr("randomCaller"));
@@ -1069,7 +1061,5 @@ contract CuratioRebalancerCheckUpkeepTest is Test {
         (bool upkeepNeeded,) = rebalancer.checkUpkeep("");
         assertFalse(upkeepNeeded, "uninitialized pool state must not trigger upkeep even with high fee");
     }
-
-    // ─── টেস্টে ───
 }
 

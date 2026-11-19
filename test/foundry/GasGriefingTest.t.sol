@@ -108,9 +108,8 @@ contract GasGriefingTest is Test, Deployers {
         vm.stopPrank();
     }
 
-    // ============================================================
     // TEST 1: Attacker tries to grow oracle to max cardinality
-    // ============================================================
+
     function test_gasGriefing_maxCardinalityAttempt() public {
         (,, uint16 initialCardinalityNext) = hook.getOracleState(poolKey);
         uint16 maxCap = hook.maxCardinalityPerCall();
@@ -122,9 +121,8 @@ contract GasGriefingTest is Test, Deployers {
         assertEq(newCardinalityNext, initialCardinalityNext + maxCap, "Should clamp, not revert");
     }
 
-    // ============================================================
     // TEST 2: Repeated small growth attempts (griefing)
-    // ============================================================
+
     function test_gasGriefing_repeatedSmallGrowths() public {
         (,, uint16 initialCardinalityNext) = hook.getOracleState(poolKey);
 
@@ -159,9 +157,8 @@ contract GasGriefingTest is Test, Deployers {
         assertEq(finalCardinalityNext, expectedSize, "Cardinality should grow by 200");
     }
 
-    // ============================================================
     // TEST 3: Multiple attackers simultaneously griefing
-    // ============================================================
+
     function test_gasGriefing_multipleAttackers() public {
         (,, uint16 initialCardinalityNext) = hook.getOracleState(poolKey);
 
@@ -200,9 +197,8 @@ contract GasGriefingTest is Test, Deployers {
         assertGe(finalCardinalityNext, expectedSize, "Cardinality should grow by expected amount");
     }
 
-    // ============================================================
     // TEST 4: Gas griefing affects normal users
-    // ============================================================
+
     function test_gasGriefing_impactOnNormalUsers() public {
         vm.startPrank(owner);
         hook.increaseObservationCardinality(poolKey, 500);
@@ -224,9 +220,8 @@ contract GasGriefingTest is Test, Deployers {
         assertLe(gasUsed, 300000, "Gas cost should not exceed reasonable limit");
     }
 
-    // ============================================================
     // TEST 5: Owner can still function despite griefing
-    // ============================================================
+
     function test_gasGriefing_ownerFunctionsStillWork() public {
         vm.startPrank(attacker);
         for (uint256 i = 0; i < 10; i++) {
@@ -258,9 +253,8 @@ contract GasGriefingTest is Test, Deployers {
         assertEq(hook.initialCardinality(), 200, "Initial cardinality should update");
     }
 
-    // ============================================================
     // TEST 6: Handling invalid or no-op cardinality calls
-    // ============================================================
+
     function test_gasGriefing_invalidCardinalityReverts() public {
         (,, uint16 initialCardinalityNext) = hook.getOracleState(poolKey);
 
@@ -294,9 +288,8 @@ contract GasGriefingTest is Test, Deployers {
         vm.stopPrank();
     }
 
-    // ============================================================
     // TEST 7: Storage slot initialization cost
-    // ============================================================
+
     function test_gasGriefing_storageInitializationCost() public {
         (,, uint16 initialCardinalityNext) = hook.getOracleState(poolKey);
 
@@ -330,9 +323,8 @@ contract GasGriefingTest is Test, Deployers {
         }
     }
 
-    // ============================================================
     // TEST 8: Impact on swap gas costs
-    // ============================================================
+
     function test_gasGriefing_swapGasImpact() public {
         // Fixed: _executeSwap manages prank internally
         uint256 baselineGas = gasleft();
@@ -355,9 +347,8 @@ contract GasGriefingTest is Test, Deployers {
         assertLe(gasIncrease, baselineCost * 2, "Gas increase should be bounded");
     }
 
-    // ============================================================
     // TEST 9: Growth vs no-growth gas comparison
-    // ============================================================
+
     function test_gasGriefing_growthVsNoGrowth() public {
         uint160 flags = uint160(
             Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
@@ -419,9 +410,8 @@ contract GasGriefingTest is Test, Deployers {
         return gasUsed;
     }
 
-    // ============================================================
     // TEST 10: Event emissions on growth
-    // ============================================================
+
     function test_gasGriefing_eventEmissions() public {
         vm.recordLogs();
 
@@ -457,9 +447,8 @@ contract GasGriefingTest is Test, Deployers {
         }
     }
 
-    // ============================================================
     // TEST 11: Growth with insufficient gas
-    // ============================================================
+
     function test_gasGriefing_insufficientGas() public {
         uint256 gasLimit = 100000;
 
@@ -479,10 +468,8 @@ contract GasGriefingTest is Test, Deployers {
         vm.stopPrank();
     }
 
-    // ============================================================
-    // ============================================================
     // TEST 12a: Growing cardinality on the primary test pool
-    // ============================================================
+
     function test_gasGriefing_multiplePools_pool1() public {
         vm.startPrank(attacker);
         uint256 gasBefore = gasleft();
@@ -492,14 +479,10 @@ contract GasGriefingTest is Test, Deployers {
 
         console2.log("Pool 1 growth gas cost:", gasUsed1);
         assertGt(gasUsed1, 0, "Pool 1 should be griefable");
-
-        // Stash for the companion test to compare against, if needed elsewhere.
-        // (kept simple — no shared state required for the assertions below)
     }
 
-    // ============================================================
     // TEST 12b: Growing cardinality on a second, independently deployed pool
-    // ============================================================
+
     function test_gasGriefing_multiplePools_pool2() public {
         uint160 flags = uint160(
             Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
