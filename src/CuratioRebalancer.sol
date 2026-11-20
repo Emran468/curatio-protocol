@@ -70,7 +70,7 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     bytes32 public constant STRATEGIST_ROLE = keccak256("STRATEGIST_ROLE");
     bytes32 public constant VAULT_ROLE = keccak256("VAULT_ROLE");
 
-    // ── Automation / signal config ───────────────────────────────────────────
+    //------------------Automation / signal config ----------------------
     uint32 public constant TWAP_WINDOW = 120;
     uint24 public constant FEE_ESCALATION_THRESHOLD = 6000; // MID_VOLATILE_FEE, not BASE_FEE
     uint256 public constant TICK_DIVERGENCE_THRESHOLD = 200;
@@ -102,7 +102,7 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     uint256 public keeperMaxPay0;
     uint256 public keeperMaxPay1;
 
-    // ── Core state ───────────────────────────────────────────────────────────
+    // --------------- Core state ---------------------
     IPoolManager public immutable poolManager;
     ICuratioHookView public hook;
     address public vault;
@@ -145,7 +145,7 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         uint256 requiredAsset; // asset balance that must exist after settlement
     }
 
-    // ── Events ───────────────────────────────────────────────────────────────
+    // ================= Events =============================================
     event HookUpdated(address indexed oldHook, address indexed newHook);
     event VaultUpdated(address indexed oldVault, address indexed newVault);
     event ManagedPoolSet(PoolId indexed poolId);
@@ -165,7 +165,7 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     event NativeRescued(address indexed to, uint256 amount);
     event TokenRescued(address indexed token, address indexed to, uint256 amount);
 
-    // ── Errors ───────────────────────────────────────────────────────────────
+    // ================= Errors ========================
     error ZeroAddress();
     error NotVault(address caller);
     error NotPoolManager(address caller);
@@ -327,9 +327,9 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         return token == address(0) ? address(this).balance : IERC20(token).balanceOf(address(this));
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // Rebalancing
-    // ═════════════════════════════════════════════════════════════════════════
+    
+    //                    Rebalancing
+    //=============================================
 
     /// @param newLiquidity liquidity units to hold in the NEW range (all old liquidity is removed)
     /// @param maxPay0 max net currency0 this call may pay to the pool (slippage cap)
@@ -558,9 +558,9 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         _executeRebalanceLogic(newLower, newUpper, liq, keeperMaxPay0, keeperMaxPay1);
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
+ 
     // Swap support: cover shortfalls, unwind for withdrawals, sizing helper
-    // ═════════════════════════════════════════════════════════════════════════
+    // ----------------------------------------------------------------------
 
     /// @notice Largest liquidity whose total value (both tokens, TWAP price) fits in `valueInAsset`,
     ///         with QUOTE_HEADROOM_BPS left for swap fee and price impact. Use it to size a position
@@ -761,7 +761,7 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         _settleCurrency(d.key.currency1, d1);
     }
 
-    // ─── Hook read helpers ───────────────────────────────────────────────────
+    //--------------------------Hook read helpers -------------------------------------------------------
 
     function _tryGetPoolState() internal view returns (bool success, int24 lastTick, uint24 fee, bool initialized) {
         try hook.getPoolState(managedPool) returns (int24 _tick, uint24 _fee, uint64, uint64, bool _init) {
@@ -788,9 +788,9 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         }
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // Admin
-    // ═════════════════════════════════════════════════════════════════════════
+  
+    //                            Admin
+    //=============================================================
 
     function setManagedPool(PoolKey calldata key) external onlyRole(DEFAULT_ADMIN_ROLE) {
         // Changing pool while a position exists would orphan it.

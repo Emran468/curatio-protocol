@@ -480,7 +480,7 @@ contract CuratioHook is BaseHook, Ownable {
         emit DeployedOnChain(deployedChainId, chainName, blockDecayWindow);
     }
 
-    // ── Hook Permissions ──────────────────────────────────────────────────────
+    // ================ Hook Permissions =================================
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: true,
@@ -500,7 +500,7 @@ contract CuratioHook is BaseHook, Ownable {
         });
     }
 
-    // ─── Initialize ───────────────────────────────────────────────────────────
+    // ------------------ Initialize -----------------------------------------
 
     function beforeInitialize(address, PoolKey calldata key, uint160) external pure override returns (bytes4) {
         // check  is pool is dynamic fee Mentor
@@ -622,7 +622,7 @@ contract CuratioHook is BaseHook, Ownable {
         );
     }
 
-    // ─── Swap Hooks ───────────────────────────────────────────────────────────
+    // ====================== Swap Hooks =====================================
     function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
         override
@@ -633,7 +633,7 @@ contract CuratioHook is BaseHook, Ownable {
         uint256 currentBlock = block.number;
         (, int24 currentTick,,) = poolManager.getSlot0(poolId);
 
-        // ── Transient storage setup & verification ──────────────────────────
+        // -----------------Transient storage setup & verification ------------------------
         // NOTE: this flag assumes PoolManager always pairs beforeSwap with a
         // matching afterSwap for the same pool before any other beforeSwap on
         // that pool can run within the same unlock — this holds under v4's
@@ -653,7 +653,7 @@ contract CuratioHook is BaseHook, Ownable {
             tstore(tickSlot, currentTick)
         }
 
-        // ── Zero-amount swap guard ───────────────────────────────────────────
+        // ===================Zero-amount swap guard ==========================
         if (params.amountSpecified == 0) {
             return
                 (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, BASE_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG);
@@ -805,7 +805,7 @@ contract CuratioHook is BaseHook, Ownable {
         return (this.afterSwap.selector, 0);
     }
 
-    // ─── Internal helpers ─────────────────────────────────────────────────────
+    // --------------------- Internal helpers ----------------------------
 
     /// zeroForOne = true sells token0 => tick DOWN; false => tick UP.
     function _isBackRun(SandwichTracker memory t, uint256 currentBlock, bool zeroForOne) internal view returns (bool) {
@@ -844,7 +844,7 @@ contract CuratioHook is BaseHook, Ownable {
         return int24((currentCumulative - targetCumulative) / timeDelta);
     }
 
-    // ── Pack/Unpack tracker ────────────────────────────────────────────────
+    // =====================Pack/Unpack tracker =====================================
     function _packTracker(SandwichTracker memory t) internal pure returns (uint256) {
         uint24 rawFirst = uint24(uint32(int32(t.firstMove)));
         uint24 rawLast = uint24(uint32(int32(t.lastMove)));
@@ -870,7 +870,7 @@ contract CuratioHook is BaseHook, Ownable {
         t.initialized = (packed & 0x1) == 1;
     }
 
-    // ─── View/Getter functions ───────────────────────────────────────────────
+    // -----------------------View/Getter functions -------------------------------
 
     function tickSlotMap(PoolId poolId) external view returns (bytes32) {
         return _tickSlotMap[poolId];
@@ -960,8 +960,7 @@ contract CuratioHook is BaseHook, Ownable {
         );
     }
 
-    // ─── TWAP Oracle — public API ─────────────────────────────────────────────
-
+    // ======================== TWAP Oracle — public API ===================================
     /// @notice Time-weighted average tick over the last `twapWindow` seconds.
     /// @dev Reverts if the oracle doesn't yet have `twapWindow` seconds of history.
     ///      Kept as public API for off-chain callers / integrators; the hook's
@@ -1044,7 +1043,7 @@ contract CuratioHook is BaseHook, Ownable {
         return (cardinalityNextOld, cardinalityNextNew);
     }
 
-    // ─── Admin ────────────────────────────────────────────────────────────────
+    // ------------------------------ Admin ------------------------------------------
 
     /// @notice Sets the default oracle cardinality pre-warmed at pool init.
     ///         Only affects pools initialized after this call.

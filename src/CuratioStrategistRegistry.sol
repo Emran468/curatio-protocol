@@ -59,7 +59,7 @@ contract CuratioStrategistRegistry is AccessControl {
         _grantRole(REGISTRAR_ROLE, admin);
     }
 
-    // ─── Registration ─────────────────────────────────────────────────────
+    // ----------------- Registration --------------------------
 
     function registerStrategist(address strategist, string calldata name) external onlyRole(REGISTRAR_ROLE) {
         if (strategist == address(0)) revert ZeroAddress();
@@ -92,7 +92,7 @@ contract CuratioStrategistRegistry is AccessControl {
         emit StrategistReactivated(strategist);
     }
 
-    // ─── Pool assignment ────────────────────────────────────────────────────
+    // ---------------- Pool assignment ---------------------------
 
     function assignPoolToStrategist(address strategist, PoolId poolId) external onlyRole(REGISTRAR_ROLE) {
         if (!isRegisteredStrategist[strategist]) revert NotRegistered(strategist);
@@ -158,7 +158,7 @@ contract CuratioStrategistRegistry is AccessControl {
         emit BulkMigrationCompleted(oldStrategist, newStrategist, count);
     }
 
-    // ─── Performance recording ──────────────────────────────────────────────
+    // ============== Performance recording ========================
 
     function recordRebalanceExecuted(address strategist) external onlyRole(REBALANCER_ROLE) {
         if (!isRegisteredStrategist[strategist]) revert NotRegistered(strategist);
@@ -180,7 +180,7 @@ contract CuratioStrategistRegistry is AccessControl {
         emit PerformanceRecorded(strategist, profile.totalRebalancesExecuted, profile.totalFeesGeneratedForVault);
     }
 
-    // ─── Admin ─────────────────────────────────────────────────────────────
+    // ------------------ Admin ----------------------------
 
     function authorizeRebalancer(address rebalancerContract) external onlyRole(DEFAULT_ADMIN_ROLE) {
         _grantRole(REBALANCER_ROLE, rebalancerContract);
@@ -190,7 +190,7 @@ contract CuratioStrategistRegistry is AccessControl {
         _revokeRole(REBALANCER_ROLE, rebalancerContract);
     }
 
-    // ─── Views ──────────────────────────────────────────────────────────────
+    // =================== Views ====================
 
     function getStrategistPools(address strategist) external view returns (PoolId[] memory) {
         return _strategistPools[strategist];
@@ -222,7 +222,7 @@ contract CuratioStrategistRegistry is AccessControl {
         return strategists[strategist];
     }
 
-    // ─── Internal ─────────────────────────────────────────────────────────────
+    //------------------ Internal -------------------------
 
     function _removePoolFromStrategist(address strategist, PoolId poolId) internal {
         PoolId[] storage pools = _strategistPools[strategist];

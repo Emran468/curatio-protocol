@@ -166,7 +166,7 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
         _grantRole(VAULT_MANAGER_ROLE, _admin);
     }
 
-    // ─── Accounting ──────────────────────────────────────────────────────────
+    // ===================== Accounting ===============================
 
     /// @notice Idle asset in the vault plus everything the rebalancer controls (TWAP-priced, strict).
     function totalAssets() public view override returns (uint256) {
@@ -207,7 +207,7 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
         return convertToShares(maxAssets);
     }
 
-    // ─── Deposit / Mint overrides ────────────────────────────────────────────
+    // ---------------------- Deposit / Mint overrides -------------------------
 
     function deposit(uint256 assets, address receiver) public override nonReentrant returns (uint256) {
         _checkWhitelist(msg.sender);
@@ -233,7 +233,7 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
         return assets;
     }
 
-    // ─── Withdraw / Redeem overrides ─────────────────────────────────────────
+    // ================== Withdraw / Redeem overrides ======================
 
     function withdraw(uint256 assets, address receiver, address owner_) public override nonReentrant returns (uint256) {
         _checkWhitelist(msg.sender);
@@ -269,7 +269,7 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
         super._withdraw(caller, receiver, owner_, assets, shares);
     }
 
-    // ─── Performance fee ──────────────────────────────────────────────────────
+    // ------------------- Performance fee ----------------------------
 
     /// @notice Charge the performance fee on the share-price gain above the high-water mark.
     ///         Returns the fee shares minted (0 when there is nothing to charge).
@@ -324,7 +324,7 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
         emit Harvested(yieldAssets, feeAssets, feeShares, newPrice);
     }
 
-    // ─── Internal checks ──────────────────────────────────────────────────────
+    // =================Internal checks ====================
 
     function _checkWhitelist(address user) internal view {
         if (!accessControl.isWhitelisted(user)) revert NotWhitelisted(user);
@@ -360,7 +360,7 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
         }
     }
 
-    // ─── Manager: fund flow ───────────────────────────────────────────────────
+    // ======================== Manager: fund flow =========================
 
     /// @notice Move idle asset to the rebalancer. Share price is unchanged because the
     ///         rebalancer's holdings are counted in totalAssets().
@@ -370,7 +370,7 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
         emit FundsDeployed(amount);
     }
 
-    // ─── Admin: access contract (timelocked) ──────────────────────────────────
+    // =============== Admin: access contract (timelocked) ===================
 
     function proposeAccessControl(address _accessControl) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_accessControl == address(0)) revert ZeroAddress();
@@ -399,7 +399,7 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
         pendingAccessControlEta = 0;
     }
 
-    // ─── Admin: rebalancer (timelocked) ───────────────────────────────────────
+    // ----------------  Admin: rebalancer (timelocked) ------------------
 
     /// @dev The rebalancer prices every share. After execution the OLD rebalancer's holdings are no
     ///      longer counted, so move its funds back to the vault (or to the new rebalancer) first.
@@ -430,7 +430,7 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
         pendingRebalancerEta = 0;
     }
 
-    // ─── Admin: fee module (initial set immediate, every later change timelocked) ──
+    //  Admin: fee module (initial set immediate, every later change timelocked) 
 
     /// @notice One-time, immediate: sets the first fee module so deployment works (the module needs the
     ///         vault's address, so it cannot be a constructor argument). Reverts forever after any
@@ -483,7 +483,7 @@ contract CuratioVault is ERC4626, AccessControl, ReentrancyGuard {
         pendingFeeModuleEta = 0;
     }
 
-    // ─── Manager settings (immediate) ─────────────────────────────────────────
+    // ------------- Manager settings (immediate) ---------------------
 
     function setDepositCap(uint256 _cap) external onlyRole(VAULT_MANAGER_ROLE) {
         depositCap = _cap;
