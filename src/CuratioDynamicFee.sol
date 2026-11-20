@@ -69,7 +69,7 @@ contract CuratioDynamicFee is AccessControl {
         emit PerformanceFeeCharged(msg.sender, yieldAmount, feeAmount);
     }
 
-    // ─── Admin ────────────────────────────────────────────────────────────────
+    //------------------- Admin -----------------
 
     function setPerformanceFeeBps(uint256 newBps) external onlyRole(FEE_ADMIN_ROLE) {
         if (newBps > MAX_PERFORMANCE_FEE_BPS) revert FeeTooHigh(newBps, MAX_PERFORMANCE_FEE_BPS);

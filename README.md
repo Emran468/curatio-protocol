@@ -1,162 +1,478 @@
-# Curatio Protocol
+# Curatio
 
-A permissioned, KYC-gated ERC-4626 vault that deploys liquidity into a **Uniswap v4** pool and actively manages the position. Swap fees adapt to volatility and MEV through a custom v4 hook, and the position is re-ranged by Chainlink Automation or by registered strategists.
+A permissioned, KYC-gated ERC-4626 vault that deploys liquidity into a **Uniswap v4** pool and actively manages a single LP position. Swap fees adapt to volatility and MEV through a custom v4 hook, and the position is re-ranged by Chainlink Automation or by registered strategists. The vault prices its shares from the hook's TWAP, never from pool spot.
 
-> ⚠️ **Prototype. Unaudited.** Do not deploy with real funds. See [Trust assumptions](#trust-assumptions) and [Known limitations](#known-limitations).
-
----
-
-## Architecture
-
-```
-                     ┌────────────────────────┐
-   users ──────────► │  CuratioVault (L3)     │ ◄── CuratioAccess (L2)  whitelist / KYC
-                     │  ERC-4626, cVAULT      │ ◄── CuratioDynamicFee (L5)  performance fee
-                     └───────────┬────────────┘
-                                 │ deployToRebalancer / returnToVault / totalManagedAssets
-                     ┌───────────▼────────────┐        ┌──────────────────────────────┐
-  Chainlink ───────► │  CuratioRebalancer (L4)│ ─────► │ CuratioStrategistRegistry (L6)│
-  Automation /       │  one v4 LP position    │        └──────────────────────────────┘
-  strategist         └───────────┬────────────┘
-                                 │ unlock → modifyLiquidity / swap
-                     ┌───────────▼────────────┐
-                     │  Uniswap v4 PoolManager│
-                     └───────────┬────────────┘
-                                 │ beforeSwap / afterSwap / liquidity hooks
-                     ┌───────────▼────────────┐
-                     │  CuratioHook (L1)      │  dynamic fee · TWAP oracle · MEV detection
-                     └────────────────────────┘
-```
-
-| Layer | Contract | Responsibility |
-|------|----------|----------------|
-| 1 | `CuratioHook` | v4 hook: dynamic LP fee, on-chain TWAP oracle, sandwich/MEV detection, position tracking |
-| 2 | `CuratioAccess` | Role-based permissions and whitelist (token-gating) with a timelocked removal path |
-| 3 | `CuratioVault` | Whitelisted ERC-4626 vault, TWAP-priced share accounting, high-water-mark performance fee |
-| 4 | `CuratioRebalancer` | Moves a single LP position between tick ranges, unwinds for withdrawals, Chainlink Automation compatible |
-| 5 | `CuratioDynamicFee` | Performance-fee engine used by the vault at `harvest()` |
-| 6 | `CuratioStrategistRegistry` | Strategist registration, pool assignment, performance attribution |
+> **Status:** prototype, **unaudited**. Do not deploy with real funds. Solidity `^0.8.26`. See [Roles & trust assumptions](#5-roles--trust-assumptions) and [Known limitations](#6-known-limitations).
 
 ---
 
-## Contracts
+## Partner Integrations
 
-### Layer 1 — `CuratioHook`
+- **Chainlink Automation**: `CuratioRebalancer` implements `AutomationCompatibleInterface` (`checkUpkeep` / `performUpkeep`). A Chainlink keeper triggers rebalances when the hook's dynamic fee rises to the mid-volatility tier or the pool tick diverges from the TWAP. Only the registered `automationRegistry` can call `performUpkeep`. The integration is covered by unit and end-to-end tests that simulate the Automation registry (see Testing).
 
-A Uniswap v4 hook with these permissions enabled: `afterInitialize`, `afterAddLiquidity`, `afterRemoveLiquidity`, `beforeSwap`, `afterSwap`.
+No other partner integrations.
 
-**Dynamic fee** (returned from `beforeSwap` with the override flag):
+(Built on Uniswap v4 core and OpenZeppelin libraries as dependencies; these are the base platform, not partner integrations.)
 
-| Fee | Value | Applied when |
-|-----|-------|--------------|
-| `BASE_FEE` | 0.30% (3000) | Calm market / fee decayed |
-| `MID_VOLATILE_FEE` | 0.60% (6000) | Oracle cold (cannot verify price) or moderate tick move |
-| `HIGH_VOLATILE_FEE` | 1.50% (15000) | Spot ≥ 200 ticks from TWAP, or large tick move |
-| `MEV_PENALTY_FEE` | 10.00% (100000) | Spot ≥ 500 ticks from TWAP, or sandwich detected in the current block |
+---
 
-**TWAP oracle.** A Uniswap-v3-style `tickCumulative` ring buffer (`TwapOracle` library), written in `afterSwap`. Cardinality is pre-warmed at pool initialisation (`initialCardinality`, chosen per chain by `ChainRegistry`: **240 slots on chains with ~1 s timestamps** such as Unichain and Arbitrum, 100 elsewhere, because at most one observation is written per second and the window is 120 s). Anyone can grow it via `increaseObservationCardinality`, clamped per call by `maxCardinalityPerCall` (hard ceiling 1000); like Uniswap v3, the new size is only recorded and is applied when the write index reaches the end of the current ring. `isOracleWarm` / `getTwapTick` expose the oracle; the default window is 120 s. While the oracle is cold the hook charges the conservative mid fee instead of assuming safety.
+## 1. Architecture
 
-**Sandwich detection (heuristic).** Within a block the hook tracks the first and last tick move and the cumulative absolute tick move. A direction reversal, once the swaps of the block have moved the price by at least `sandwichTickThreshold` ticks (default 80) in total, flags the block, and all further swaps in that block pay `MEV_PENALTY_FEE`. The size gate is price impact in ticks, not a raw token amount, so it is independent of token decimals and scales with each pool's depth (`mevVolumeThreshold` is deprecated and no longer used). The penalty lives only in the flagged block: it is not written into the stored pool fee, and `getCurrentFee` reports it only inside that block. This is a heuristic, not a classifier — legitimate opposing flow or arbitrage can trigger it.
+| Layer | Contract | Role |
+|------:|----------|------|
+| 1 | `CuratioHook` | Uniswap v4 hook: dynamic swap fee, TWAP oracle, sandwich (MEV) detection |
+| 2 | `CuratioAccess` | Whitelist / KYC gating with a 2-day removal timelock |
+| 3 | `CuratioVault` | ERC-4626 vault (`cVAULT`), high-water-mark performance fee, delegated strategist following |
+| 4 | `CuratioRebalancer` | Holds the LP position, rebalances ranges, swaps to cover shortfalls, reports TWAP-priced assets |
+| 5 | `CuratioDynamicFee` | Performance-fee rate engine (swap fees live in the hook, not here) |
+| 6 | `CuratioStrategistRegistry` | Strategist registry, pool assignment, performance counters |
 
-**Transient storage (EIP-1153).** The hook uses `tstore` / `tload` to pass state from `beforeSwap` to `afterSwap` within the same swap, at no persistent-storage cost. Each value lives in a per-pool slot derived as `keccak256(abi.encodePacked(poolId, "flag"))` or `keccak256(abi.encodePacked(poolId, "tick"))`.
+```
+                    ┌──────────────────┐
+   User ──────────► │  CuratioVault    │ ◄── CuratioAccess (whitelist)
+                    │  (ERC-4626)      │ ◄── CuratioDynamicFee (perf. fee)
+                    └───────┬──────────┘
+        totalManagedAssets()│  ▲ deployToRebalancer / returnToVault
+                            ▼  │
+                    ┌──────────────────┐        ┌──────────────────────────┐
+                    │CuratioRebalancer │ ─────► │ StrategistRegistry (L6)  │
+                    └───────┬──────────┘        └──────────────────────────┘
+          unlock / modifyLiquidity / swap
+                            ▼
+                    ┌──────────────────┐
+                    │ Uniswap v4       │ ◄──► CuratioHook (L1)
+                    │ PoolManager      │      (fees + TWAP + MEV guard)
+                    └──────────────────┘
+```
+
+---
+
+## 2. Flows
+
+### 2.1 Swap flow (Hook, Layer 1)
+
+```
+User → PoolManager.swap()
+   │
+   ├─ beforeSwap()
+   │    1. transient-storage guard (flag set; reverts if already dirty)
+   │    2. zero-amount swap → BASE_FEE
+   │    3. back-run check → MEV_PENALTY_FEE?
+   │    4. TWAP warm? → divergence check → fee
+   │       (cold oracle → MID_VOLATILE_FEE)
+   │    5. return fee | OVERRIDE_FEE_FLAG
+   │
+   ├─ [Swap executes]
+   │
+   └─ afterSwap()
+        1. flag verify + reset
+        2. TwapOracle.write(preSwapTick)
+        3. tracker update (swapCount, tickDelta, totalMove, firstMove)
+        4. back-run? → flag THIS block only (monitoring)
+        5. _computeFee → save to poolStates.fee
+        6. emit FeeUpdated / HistoryUpdated (/ SandwichDetected)
+```
+
+### 2.2 Deposit → rebalance flow (Vault → Rebalancer → PoolManager)
+
+```
+User.deposit()  ──ERC20──►  Vault  ──deployToRebalancer──ERC20──►  Rebalancer
+                                                                        │
+                                                    rebalanceLiquidity() / performUpkeep()
+                                                                        │
+                                                        poolManager.unlock(REBALANCE)
+                                                                        │
+                                                        unlockCallback → _executeRebalance
+                                                                        │
+                       ┌────────────────────────────────────────────────┤
+                       │ 1. modifyLiquidity (remove ALL old liquidity)  │
+                       │ 2. modifyLiquidity (add new range)             │
+                       │ 3. _coverDeficits:                             │
+                       │      MEV-penalty check → TWAP price check      │
+                       │      → poolManager.swap() (exact-out)          │
+                       │         ├─ Hook.beforeSwap (fee)               │
+                       │         ├─ [AMM swap in pool]                  │
+                       │         └─ Hook.afterSwap  (writes TWAP)       │
+                       │ 4. slippage caps (maxPay0 / maxPay1)           │
+                       └────────────────────────────────────────────────┤
+                                                                        │
+                                                        _settleCurrency × 2
+                                                                        │
+                                                Rebalancer → PoolManager → Pool
+```
+
+The swap in step 3 happens **only if one currency is short** after the net remove/add deltas.
+
+### 2.3 Withdraw flow
+
+```
+User.withdraw()/redeem()
+   → whitelist check (caller, receiver, owner)
+   → Vault._withdraw: idle < assets ?
+        └─ Rebalancer.returnToVault(shortfall)
+              └─ idle short → _unwindForVault:
+                    remove needed share of LP (+1% buffer)
+                    → swap other token into asset (TWAP-checked)
+   → transfer assets to receiver
+   → notifyWithdraw (non-blocking)
+```
+
+### 2.4 Performance-fee flow (`harvest`)
+
+```
+VAULT_MANAGER.harvest()
+   price = (totalAssets + 1) * 1e36 / (supply + 1e6)
+   price <= HWM        → nothing
+   hwm == 0            → record baseline, no fee
+   yield = (price - HWM) * (supply + 1e6) / 1e36
+   fee   = DynamicFee.calculatePerformanceFee(yield)   (vault caps at 30%)
+   mint fee shares to feeRecipient (no asset moves)
+   HWM = post-dilution price
+```
+
+### 2.5 LP positions and imbalance
+
+**LP position.** A liquidity position is a deposit of both pool tokens that earns swap fees only while the pool price is inside its tick range. `CuratioRebalancer` tracks exactly one position as `currentTickLower`, `currentTickUpper` and `currentLiquidity`. A rebalance removes all of it and re-adds it in a new range, so the liquidity keeps earning fees as the price moves. Outside its range a position holds only one of the two tokens and earns nothing.
+
+**Imbalance.** A position in a given range at a given price needs a specific mix of token0 and token1. When the tokens the rebalancer holds do not match that mix, one token is short and the other is in surplus. That mismatch is the imbalance. It comes from three places:
+
+| Source | Example |
+|--------|---------|
+| Removing the old position | The price left the old range, so the old position returns only one token, but the new range needs both |
+| Single-token vault asset | Users deposit only the vault asset (say USDC), but any in-range position needs both tokens |
+| Withdrawals | The user wants the vault asset, but removing LP also returns the other token |
+
+**How the rebalancer resolves it** (`_coverDeficits`, called inside the PoolManager unlock):
+
+1. Net the removed and added amounts into `delta0` / `delta1` (negative = we owe the pool, positive = the pool owes us).
+2. For each token, compute the shortfall: what must be paid, minus the idle balance plus the delta.
+3. No shortfall: no swap.
+4. Shortfall in **both** tokens: revert (`InsufficientFunds`), because a swap cannot cover both.
+5. Shortfall in **one** token: buy it with the other token through an exact-output swap on the pool.
+6. Before swapping, refuse if the hook is charging the MEV penalty (`MevPenaltyActive`). After swapping, compare the execution price with the TWAP and revert above `maxSwapSlippageBps` (`SwapPriceDeviation`).
+7. Check the final net payment against the `maxPay0` / `maxPay1` caps, then settle.
+
+Illustrative example (the numbers are only for explanation): the vault asset is USDC, the rebalancer holds 800 USDC and no WETH, and the new range needs about 0.19 WETH and 400 USDC. WETH is short, so the rebalancer buys 0.19 WETH with USDC (the swap goes through the hook's `beforeSwap` / `afterSwap`), checks the price against the TWAP, and then adds the position. The leftover USDC stays idle.
+
+### 2.6 Where the funds actually are
+
+User funds never go into the hook, and the swap does not happen in the hook. The swap executes in the Uniswap v4 `PoolManager`, and the hook is only a callback.
+
+```
+User ──deposit──► Vault ──deployToRebalancer──► Rebalancer ──unlock/settle──► PoolManager ──► Pool (LP)
+                                                                                  │
+                                                       Hook.beforeSwap (sets fee) ┤
+                                                       Hook.afterSwap  (writes TWAP)
+```
+
+| Component | Holds user funds? | Role |
+|-----------|:-----------------:|------|
+| Vault | Idle asset only | Accounting, whitelist, share pricing |
+| Rebalancer | Idle balances of both tokens | Moves funds in and out of the pool |
+| PoolManager / Pool | Yes (LP reserves) | Executes the swap and holds liquidity |
+| CuratioHook | **No** | Sets the fee and records the TWAP and sandwich data. It never calls `transfer` or `transferFrom` |
+
+State at each step:
+
+1. `deposit`: the vault holds the idle asset. Nothing is swapped and the share price does not change.
+2. `deployToRebalancer`: a plain ERC-20 transfer from the vault to the rebalancer. This changes custody only, and the share price stays the same because `totalAssets()` counts the rebalancer's holdings.
+3. Rebalance (strategist call or Chainlink `performUpkeep`): the rebalancer calls `poolManager.unlock(...)`. Inside the callback it removes the old liquidity, adds the new, covers any shortfall with a swap, and settles the net amounts.
+4. A swap happens only when a token is short (see 2.5). Often the removed tokens plus the idle balance are enough and no swap is needed.
+
+---
+
+## 3. Contract notes
+
+### CuratioHook (L1)
+
+- **Permissions:** `beforeInitialize`, `afterInitialize`, `afterAddLiquidity`, `afterRemoveLiquidity`, `beforeSwap`, `afterSwap`.
+- **Pools must use dynamic fees** (`PoolMustUseDynamicFee`).
+- **Fees**
+
+  | Constant | Value | Meaning |
+  |----------|------:|---------|
+  | `BASE_FEE` | 3000 | 0.30% |
+  | `MID_VOLATILE_FEE` | 6000 | 0.60% (also cold-start fee) |
+  | `HIGH_VOLATILE_FEE` | 15000 | 1.50% |
+  | `MEV_PENALTY_FEE` | 100000 | 10% (charged to the swap that reverses the block's first move) |
+
+- **Fee logic:** if the oracle is warm, |spot − TWAP| ≥ `tickThresholdHigh` (500) → HIGH, ≥ `tickThresholdMid` (200) → MID, otherwise the last stored fee decays to BASE after `blockDecayWindow` blocks.
+- **TWAP oracle:** v3-style `tickCumulative` ring buffer, 120 s window, one observation per distinct timestamp. Pre-warmed at init (`getInitialCardinality`: 240 on ~1 s chains, 100 elsewhere). Cardinality growth is applied only when the write index reaches the last slot (v3 rule).
+- **Sandwich detection:** tracks per-block `firstMove`, `lastMove`, `totalMove` (sum of |tick move|). A swap in the opposite direction of the block's first move, after `totalMove ≥ sandwichTickThreshold` (80 ticks), is a back-run.
+- **Chain safety:** constructor checks the PoolManager address against `ChainRegistry` (skipped on chain 31337).
+- **Admin:** owner can propose/execute/cancel threshold changes with a **2-day timelock**; `setInitialCardinality`, `setMaxCardinalityPerCall`.
+- **Deprecated:** `mevVolumeThreshold` is kept for ABI compatibility only.
+
+### Hook details: transient storage (EIP-1153)
+
+The hook uses `tstore` / `tload` to pass state from `beforeSwap` to `afterSwap` within one swap, at no persistent-storage cost. Each value lives in a per-pool slot derived as `keccak256(abi.encodePacked(poolId, "flag"))` or `keccak256(abi.encodePacked(poolId, "tick"))`.
 
 | Transient slot | Written in | Read in | Purpose |
 |----------------|-----------|---------|---------|
 | `flag` | `beforeSwap` (set to 1) | `afterSwap` (checked, then reset to 0) | Marks that a swap is in flight for this pool |
 | `tick` | `beforeSwap` (current tick from `slot0`) | `afterSwap` | Pre-swap tick, used for the tick-delta fee, sandwich tracking and the oracle write |
 
-The flag acts as a composability guard:
+The flag is a composability guard:
 
-- If `beforeSwap` finds the flag already set, a second swap on the same pool started before the first one's `afterSwap`, and it reverts with `Transient storage dirty: composability violation`.
-- If `afterSwap` finds the flag unset, it was called without a matching `beforeSwap` and reverts with `Composability violation: unexpected state`.
+- If `beforeSwap` finds the flag already set, a second swap on the same pool started before the first one's `afterSwap`. It reverts with `Transient storage dirty: composability violation`.
+- If `afterSwap` finds the flag unset, it was called without a matching `beforeSwap`. It reverts with `Composability violation: unexpected state`.
 - The flag is set before the early-return paths in `beforeSwap` (zero-amount swap, sandwich-penalty block), so `afterSwap` always finds it and clears it.
-- Because transient storage is wiped at the end of each transaction, a stale flag can never carry over into a later transaction.
+- Transient storage is wiped at the end of each transaction, so a stale flag can never carry over into a later transaction.
 
-The design assumes PoolManager always pairs `beforeSwap` with `afterSwap` for a pool before another swap on that pool begins. This holds under v4's unlock/settle model, but should be re-audited if PoolManager behaviour ever changes.
+The design assumes PoolManager always pairs `beforeSwap` with `afterSwap` for a pool before another swap on that pool begins. This holds under v4's unlock/settle model, but should be re-audited if PoolManager behaviour ever changes. Transient opcodes need an EVM version with Cancun support (`evm_version = "cancun"` or later in `foundry.toml`), Solidity 0.8.24+, and a target chain that supports EIP-1153.
 
-Transient opcodes need an EVM version with Cancun support (`evm_version = "cancun"` or later in `foundry.toml`) and Solidity 0.8.24+. The project targets `^0.8.26`, and the target chain must support EIP-1153.
+### CuratioAccess (L2)
 
-**Chain safety.** `ChainRegistry` maps chain IDs to the canonical PoolManager and a per-chain `blockDecayWindow`. The constructor reverts if the supplied PoolManager does not match the chain (chain ID 31337 is exempt for local testing). Supported: Ethereum, Base, Optimism, Arbitrum, Unichain and their testnets.
+- Adding to the whitelist is **immediate**; removal is `proposeRemoval` → 2 days → `executeRemoval` (or `cancelRemoval`).
+- `isWhitelisted()` returns `true` for everyone when `isWhitelistingEnabled == false` (admin toggle).
+- Batch add is limited to 200 users per call.
 
-**Admin.** Owner can tune cardinality settings and change fee thresholds through **propose → wait 2 days → execute** (`proposeTickThresholds`, `executeTickThresholds`, `cancelTickThresholdsProposal`).
+### CuratioVault (L3)
 
-### Layer 2 — `CuratioAccess`
+- ERC-4626 with `_decimalsOffset() = 6` (inflation-attack protection); `ZeroShares` / `ZeroAssets` guards.
+- `totalAssets() = idle + rebalancer.totalManagedAssets()`. This is **strict**: if the TWAP is unavailable it reverts, pausing deposits/withdrawals instead of mispricing. `maxDeposit`/`maxMint` return 0 in that case.
+- Whitelist gates deposit, mint, withdraw and redeem. The deposit cap and the deposit pause are managed by `VAULT_MANAGER`; withdrawals still work while deposits are paused.
+- Admin changes (access contract, rebalancer, fee module) use **propose → 2 days → execute**. The only immediate action is the one-time `initializeFeeModule()`.
+- Performance fee is capped at 30% of the yield above the HWM (`MAX_PERFORMANCE_FEE_BPS`).
+- `followStrategist` / `unfollowStrategist` record a depositor's chosen strategist (registry-validated).
 
-- Roles: `DEFAULT_ADMIN_ROLE`, `VAULT_MANAGER_ROLE`, `STRATEGIST_ROLE`.
-- **Adding** to the whitelist is immediate (`setWhitelistedUser`, `setWhitelistedUsersBatch`, max 200 per batch).
-- **Removing** is a two-step flow with a `REMOVAL_TIMELOCK` of 2 days: `proposeRemoval` → `executeRemoval` (or `cancelRemoval`), so users have time to withdraw.
-- Admin can toggle whitelisting off entirely (`toggleWhitelisting(false)` makes `isWhitelisted` return true for everyone).
+### CuratioRebalancer (L4)
 
-### Layer 3 — `CuratioVault`
+- One position: `(managedPool, currentTickLower, currentTickUpper, salt 0)`. Every rebalance removes **all** liquidity and re-adds `newLiquidity`.
+- **Entry points:** `rebalanceLiquidity()` (`STRATEGIST_ROLE`) and Chainlink `performUpkeep()` (keeper).
+- **Keeper trigger** (`checkUpkeep`): hook fee ≥ 6000, or |lastTick − TWAP| > 200. The new range is ±2 tick spacings around the reference tick (±3 when the TWAP diverged).
+- **Keeper sanity:** reference tick must be within `maxReferenceDeviationTicks` (500) of the current TWAP. Keeper slippage caps `keeperMaxPay0/1` default to **0** (fail-safe).
+- **Swap protection:** reverts on `MevPenaltyActive` and when the execution price deviates more than `maxSwapSlippageBps` (3%) from TWAP (`SwapPriceDeviation`).
+- **Valuation:** `totalManagedAssets()` prices idle balances and the LP position at the TWAP; uncollected fees are not counted.
+- **Timelock:** only the hook address (`proposeHook` → 2 days → `executeHook`).
+- **Rescue:** `rescueToken` (non-managed tokens only), `rescueNativeEth` (only when no pool currency is native).
 
-ERC-4626 share token `cVAULT`.
+### CuratioDynamicFee (L5)
 
-- **Gating.** `deposit`, `mint`, `withdraw` and `redeem` check the whitelist for caller, receiver and (on exit) owner.
-- **Share pricing.** `totalAssets() = idle asset + rebalancer.totalManagedAssets()`. The second term is TWAP-priced and strict: if the TWAP is unavailable, `totalAssets()` reverts, which pauses deposits and withdrawals instead of mispricing shares. `maxDeposit` / `maxMint` return 0 in that case rather than reverting.
-- **Inflation-attack protection.** `_decimalsOffset() = 6`, plus `ZeroShares` / `ZeroAssets` reverts so nobody pays for nothing.
-- **Withdrawals.** If idle balance is short, the vault calls `rebalancer.returnToVault()`, which unwinds part of the LP and swaps into the asset (TWAP-checked).
-- **Controls (manager).** `setDepositCap`, `setDepositsPaused` (withdrawals keep working while paused), `deployToRebalancer`, `harvest`.
-- **Performance fee.** `harvest()` compares share price with a high-water mark and charges the fee module's rate on the gain above it, paid by minting shares to `feeRecipient`. First harvest after a fee-module change only records the baseline. Fee is capped at `MAX_PERFORMANCE_FEE_BPS` (30%) of yield regardless of the module.
-- **Timelocked admin changes (2 days).** Access contract, rebalancer and fee module each follow `propose… → execute… / cancel…`. The one immediate action is the one-time `initializeFeeModule()` at deployment.
-- **Copy-LP.** `followStrategist` / `unfollowStrategist` record a depositor's chosen strategist (currently an on-chain preference only).
+Performance-fee engine for the vault's harvested yield. It holds no funds: it calculates the fee, records what was charged, and names who receives it. Swap fees are not handled here; they live in the hook because the swap path is gas-critical.
 
-### Layer 4 — `CuratioRebalancer`
+- **Fee rate:** `performanceFeeBps` defaults to 1000 (10%) with a hard cap of 3000 (30%, a constant). Setting it to 0 is allowed.
+- **Calculation:** `calculatePerformanceFee(yield)` is a view: `yield * performanceFeeBps / 10_000` (flat rate, no tiers).
+- **Accounting:** `reportPerformanceFeeCharged(yield, fee)` is vault-only. It rejects a fee above `yield * performanceFeeBps / 10_000` (`FeeExceedsCalculated`), then adds to the cumulative counters `totalFeesCharged` and `totalYieldProcessed` and emits `PerformanceFeeCharged`. It moves no funds, because the vault has already minted the fee shares.
+- **Recipient:** the vault reads `feeRecipient()` and mints the fee shares to it, so the fee is paid in shares (dilution), not in assets.
+- **One vault per module:** the vault's `_checkFeeModule` requires `module.vault() == address(vault)`.
 
-Manages one LP position `(managedPool, tickLower, tickUpper, salt 0)`.
+| Role | Powers |
+|------|--------|
+| `DEFAULT_ADMIN_ROLE` | `setFeeRecipient`, `setVault`, role management |
+| `FEE_ADMIN_ROLE` | `setPerformanceFeeBps` |
+| `VAULT_ROLE` | `reportPerformanceFeeCharged` |
 
-- **Rebalance.** Removes *all* existing liquidity and adds `newLiquidity` in the new range inside a single `unlock`. Any token shortfall is covered by a TWAP-checked exact-output swap. Caps on the *net* tokens paid (`maxPay0`, `maxPay1`) apply to the final payment, swap cost included.
-- **Strategist path.** `rebalanceLiquidity(...)` (needs `STRATEGIST_ROLE`) with caller-chosen caps.
-- **Keeper path.** `checkUpkeep` triggers when the hook's fee is ≥ `MID_VOLATILE_FEE` or spot diverges from the TWAP by more than 200 ticks; `performUpkeep` (registry only) recentres the range (±2 tick spacings, ±3 if TWAP diverged) using admin-set `keeperMaxPay0/1`. **These default to 0, so keeper rebalances that must pay tokens revert until the admin sets caps.**
-- **Valuation.** `totalManagedAssets()` prices idle balances of both tokens and the LP position at the hook's TWAP, never at spot, and reverts if the TWAP is unavailable. Uncollected LP fees are not counted.
-- **Withdrawals.** `returnToVault` unwinds the needed share of the LP (plus a 1% buffer) and swaps into the asset. Swaps revert with `SwapPriceDeviation` if the execution price strays from the TWAP by more than `maxSwapSlippageBps` (default 3%), e.g. during MEV-penalty windows.
-- **Sizing helper.** `quoteLiquidityForValue` returns the liquidity that fits a given asset value for a range.
-- **Hook change** is timelocked (`proposeHook` → `executeHook`, 2 days).
+**Double cap.** The module caps the rate at 30%, and the vault independently reverts if a module quotes more than 30% of the yield, or more than total assets. A compromised or buggy module cannot make the vault charge more than 30% of the yield.
 
-### Layer 5 — `CuratioDynamicFee`
+**Trust assumptions specific to this module:**
 
-Performance-fee module for the vault: default 10% (`performanceFeeBps = 1000`), hard cap 30%. `calculatePerformanceFee` is a pure quote; `reportPerformanceFeeCharged` is vault-only and rejects any fee above the current rate × yield. Swap fees are *not* handled here (see the hook).
+- `setPerformanceFeeBps`, `setFeeRecipient` and `setVault` are immediate (no timelock). Use a multisig as admin.
+- A new rate applies to all gain since the last `harvest()`, because the high-water mark only moves when `harvest()` runs. Harvest before raising the rate if the old rate should apply to gain already earned.
+- A new `feeRecipient` receives future fee shares only. Shares already minted stay with the old recipient.
+- If `setVault` points the module at a different vault, the real vault's `harvest()` reverts, because `reportPerformanceFeeCharged` is vault-only. Keep the module's vault and the vault's fee module consistent.
+- There is no pause. To stop fees, propose `address(0)` as the fee module on the vault (`proposeFeeModule(0)`, effective after the 2-day timelock), or set the rate to 0.
+- The counters are cumulative totals with no snapshots. Rebuild history from the `PerformanceFeeCharged` and `Harvested` events.
 
-### Layer 6 — `CuratioStrategistRegistry`
+### CuratioStrategistRegistry (L6)
 
-Registers strategists, assigns pools to them (inactive strategists cannot be assigned), reassigns or bulk-migrates pools, and records rebalance counts and fees attributed to each strategist (written by the rebalancer, which holds `REBALANCER_ROLE`). `getActiveStrategists()` filters out deactivated ones.
+- Register, deactivate, reactivate; assign, reassign, unassign and bulk-reassign pools.
+- `REBALANCER_ROLE` (granted to the rebalancer) records rebalance counts and fees.
+- Inactive strategists keep their assignments but cannot record performance or receive new pools.
+- `backtestStrategy()` is a placeholder estimate (10% of recorded fees), not a real backtest.
 
 ---
 
-## Trust assumptions
+## 4. Testing
 
-- **Admin keys are powerful.** The admin controls the rebalancer (which prices every share), the access contract (which gates exits) and the fee module. Changes on the vault are timelocked so users can exit, but this only helps if the admin is a multisig or contract whose actions users can monitor.
-- **Rebalancer admin actions are not all timelocked.** `setVault()` is immediate and `returnToVault()` pays the current vault address; only the hook (TWAP source) change is timelocked.
-- **Whitelist gates exits.** Removing a user (after the 2-day delay) blocks their withdrawals until they are re-whitelisted. Disabling whitelisting lets anyone deposit.
-- **Strategists pick their own slippage caps** on the strategist path.
-- **Donations.** Anyone can donate the asset to the vault, which raises share price and, with a fee module set, counts as yield.
+The protocol ships with two Foundry test layers, both fully passing (Solc 0.8.26):
 
-## Known limitations
+- **Local suite:** 501 tests across 18 suites, 0 failed, 0 skipped (`forge test`).
+- **Fork suite:** 131 passing test runs across 7 suites (55 distinct tests), 0 failed, 0 skipped, run against a fork of Unichain mainnet (chain id 130) through `UNICHAIN_RPC`.
+- **Invariant suite:** 25 stateful invariants for the hook (see below).
 
-- Withdrawals that need the LP can revert inside a block in which the hook charges the MEV-penalty fee (a flagged sandwich block, or spot ≥ 500 ticks from the TWAP) and retry succeeds in the next block; `maxWithdraw` / `maxRedeem` do not reflect available liquidity.
+```bash
+forge test
+```
+
+Tests live in `test/foundry/`. Several suites run against the real Uniswap v4 `PoolManager` and the real `CuratioHook` (not mocks).
+
+| Area | Suite | Tests |
+|------|-------|------:|
+| Hook (L1) | `CuratioHookTest` | 93 |
+| Hook oracle growth / gas | `CardinalityGasDoSTest` | 6 |
+| Hook oracle growth / gas | `GasGriefingTest` | 13 |
+| Access (L2) | `CuratioAccessTest` | 34 |
+| Vault (L3) | `CuratioVaultTest` | 79 |
+| Vault harvest / fees | `CuratioVaultHarvestTest` | 41 |
+| Vault inflation attack | `CuratioVaultInflationTest` (incl. fuzz, 256 runs) | 9 |
+| Rebalancer (L4) | `CuratioRebalancerTest` | 43 |
+| Rebalancer integration | `CuratioRebalancerIntegrationTest` | 19 |
+| Rebalancer with real PoolManager | `CuratioRebalancerRealPMTest` | 17 |
+| Rebalancer valuation (TWAP) | `CuratioRebalancerValuationTest` | 18 |
+| Chainlink Automation (`checkUpkeep`) | `CuratioRebalancerCheckUpkeepTest` | 5 |
+| Swap / unwind / slippage | `CuratioSwapE2ETest` | 9 |
+| Dynamic fee (L5) | `CuratioDynamicFeeTest` | 37 |
+| Strategist registry (L6) | `CuratioStrategistRegistryTest` | 53 |
+| End-to-end, vault + rebalancer | `CuratioVaultRebalancerE2ETest` | 12 |
+| End-to-end, real hook | `CuratioFullStackRealHookE2ETest` | 6 |
+| End-to-end, full protocol | `CuratioFullProtocolE2ETest` | 7 |
+| **Total** | **18 suites** | **501** |
+
+What the tests cover:
+
+- **Hook:** dynamic fee tiers, TWAP warm-up and interpolation, sandwich/back-run penalty, transient-storage guard, chain and PoolManager checks (including Unichain Sepolia), timelocked thresholds.
+- **Vault:** whitelist gating, deposit cap and pause, TWAP-outage halt (no mispricing), withdrawal unwinding the LP, high-water-mark performance fee, inflation-attack resistance (fuzzed).
+- **Rebalancer:** range validation, slippage caps, MEV-penalty refusal, TWAP price check on swaps, same-block spot manipulation ignored in valuation.
+- **Chainlink Automation:** `checkUpkeep` (fee high, TWAP diverged, hook failure fallback) and `performUpkeep` (registry-only, range selection, skip rules) are tested by simulating the Automation registry. The fork suite also checks the keeper path against the real PoolManager (default keeper caps are zero so upkeep reverts, only the Automation registry can call it, a repeat call in the same range emits `Range unchanged`, a call that is too soon is skipped, and with caps set it opens a position around the TWAP).
+- **Access control and timelocks:** every admin action, role restriction and timelock boundary, including exact-ETA execution and replay protection.
+
+### Fork tests (real PoolManager and real tokens)
+
+The fork tests deploy a fresh Curatio stack and a new pool that uses the hook on top of the **real Unichain PoolManager** (`0x1F98...0004`, chain id 130), so no existing Uniswap pool is touched. Fees are read from the PoolManager's own `Swap` event, so they show the fee actually charged. Unichain blocks are 1 s, so the tests move blocks and seconds together.
+
+**Setup.** Add a profile to `foundry.toml` (the default profile points `test` at `test/foundry`):
+
+```toml
+[profile.fork]
+test = "test/fork"
+```
+
+Put the RPC URL in a `.env` file or export it. The public endpoint needs no account; if you hit rate limits, pin the block with `UNICHAIN_FORK_BLOCK` so Foundry caches the state. Without `UNICHAIN_RPC`, every fork test is skipped.
+
+```
+UNICHAIN_RPC=https://mainnet.unichain.org
+```
+
+**Run.** The keeper, swap-path, findings and mentor-fix suites inherit the fixture of `CuratioForkTest`, so filter by test name to run only their own tests:
+
+```bash
+export FOUNDRY_PROFILE=fork
+forge test --match-path test/fork/CuratioForkTest.t.sol -vv
+forge test --match-path test/fork/CuratioForkKeeperTest.t.sol --match-test test_keeper -vv
+forge test --match-path test/fork/CuratioForkRealTokensTest.t.sol -vv
+forge test --match-path test/fork/CuratioForkSwapPathTest.t.sol --match-test test_swapPath -vv
+forge test --match-path test/fork/CuratioForkFindingsTest.t.sol --match-test "test_more|test_fix" -vv
+forge test --match-path test/fork/CuratioForkDecimalsTest.t.sol --match-test test_decimals -vv
+```
+
+On PowerShell use `$env:FOUNDRY_PROFILE = "fork"`, and clear it afterwards (`unset FOUNDRY_PROFILE` / `Remove-Item Env:FOUNDRY_PROFILE`) so a plain `forge test` goes back to `test/foundry`. Not yet covered by fork tests: USDC blacklist behaviour.
+
+| Suite | Tests | Focus |
+|-------|------:|-------|
+| `CuratioForkTest` | 17 | Base scenarios: hook initialised on the real PoolManager, cold-start and warm fees, TWAP deviation, same-block reversal penalty, sandwich penalty, vault deposit/redeem, rebalancer deploying liquidity |
+| `CuratioForkFindingsTest` | 23 | Base + 6: busy pool keeps the oracle warm, deferred cardinality growth after wrap, penalty ends with the flagged block, Unichain default oracle depth, timelocked thresholds, two pools sharing one hook stay isolated |
+| `CuratioForkKeeperTest` | 23 | Base + 6 keeper tests (Chainlink Automation path, see above) |
+| `CuratioForkSwapPathTest` | 26 | Base + 9: keeper two-sided range covers deficits with a swap, reverts inside a sandwich block, succeeds one block later, slippage caps, withdrawals that need a swap, fee decay after a sandwich |
+| `CuratioForkMentorFixTest` | 22 | Base + 5: attacker back-run pays the penalty while victim and front-run do not, penalty does not carry into the next block, small reversals are not penalised, dynamic-fee pool accepted and static-fee pool rejected |
+| `CuratioForkRealTokensTest` | 8 | Real USDC and WETH tokens: pool setup, fee tiers, single-sided USDC position, vault values WETH at the TWAP, deposit/redeem round trips |
+| `CuratioForkDecimalsTest` | 12 | Real-token tests + 4 decimals tests: USDC- and WETH-denominated sandwiches are detected, dust round trips are not flagged, sandwich tick threshold is tunable in ticks |
+| **Total** | **131** | 7 suites |
+
+The extended suites re-run the base suite's scenarios, so the number of distinct tests is lower than 131.
+
+### Invariant tests (stateful fuzzing)
+
+25 Foundry invariants in `test/invariant/` (`CuratioHookInvariantTest`, driven by `CuratioHandler`) fuzz the hook against a local PoolManager with real swap and liquidity routers. The handler performs random swaps (exact-in and exact-out, both directions, 0 to 30 blocks apart so same-block sandwiches happen), liquidity adds and removes, oracle growth by an arbitrary caller, owner timelock actions and calls from non-owners. It mirrors every action in ghost variables, so each invariant compares the hook's state with what should have happened.
+
+| Area | What is checked |
+|------|-----------------|
+| Pool and fees | tick and price stay valid; `lastTick`, `lastBlock` and `lastTimestamp` match the pool and the last swap; stored and current fees are always a defined tier; the fee decays to `BASE_FEE` after the decay window |
+| MEV penalty | the penalty is never stored in the pool state; `getCurrentFee` reports it only in a block that already had a swap; the tick move recorded for a block is 0 unless a swap happened in it |
+| Volume and tracker | per-block volume and the sandwich tracker match the ghost values |
+| Liquidity | stored positions match the ghost accounting; active liquidity never exceeds what was added; the seed liquidity floor holds |
+| Oracle | `index < cardinality <= cardinalityNext`; cardinality never decreases; the per-call growth cap holds; a warm oracle is always readable by `getTwapTick` |
+| Liveness and gas | no swap reverts inside the hook; swap gas stays bounded |
+| Governance | threshold ordering, the 2-day timelock, owner-only functions reject strangers, cardinality caps stay within the hard ceiling |
+
+PoolManager wraps every revert that comes from a hook in `WrappedError`, so those count as hook failures and fail `invariant_swapsNeverRevert` (with the failing swap and revert data logged). Reverts that come from the PoolManager or router (for example swap maths at extreme prices) are counted separately and reported by `afterInvariant` without failing the run.
+
+The invariant settings come from the `[profile.default.invariant]` section of `foundry.toml` (`runs = 256`, `depth = 400`, `fail_on_revert = true`), so no extra profile is needed:
+
+```bash
+forge test --via-ir --match-path "test/invariant/*.sol"
+```
+
+`--via-ir` is only needed if `foundry.toml` does not already set `via_ir = true`. Add `-vv` only when debugging a failure: forge-std's `bound()` logs every call, so the output becomes very long.
+
+**Last full run:** 25 passed, 0 failed, 0 skipped. Each invariant ran 256 runs of depth 400 (102,400 calls) with 0 reverts, in about 222 seconds.
+
+A full run is slow (25 invariants x 256 runs x 400 calls). For a quick pass set `FOUNDRY_INVARIANT_RUNS=32`. The `test/Echidna/` contracts are harnesses for Echidna and are not run by Foundry.
+
+### Test coverage
+
+Per-file coverage of the contracts in `src/`, as reported by the coverage display in VS Code after running the test suite:
+
+| Contract | Coverage |
+|----------|---------:|
+| `CuratioAccess.sol` | 100% |
+| `CuratioDynamicFee.sol` | 100% |
+| `CuratioStrategistRegistry.sol` | 100% |
+| `CuratioHook.sol` | 96% |
+| `CuratioVault.sol` | 89% |
+| `CuratioRebalancer.sol` | 80% |
+
+To regenerate the numbers:
+
+```bash
+forge coverage --report summary
+```
+
+`CuratioRebalancer.sol` has the lowest coverage of the six contracts.
+
+---
+
+## 5. Roles & trust assumptions
+
+| Role | Contract(s) | Powers |
+|------|-------------|--------|
+| `DEFAULT_ADMIN` | all | Wires the system. Vault changes are timelocked. Rebalancer `setVault()` is **immediate**. |
+| `VAULT_MANAGER` | Access, Vault | Whitelist add (immediate) / remove (timelocked), `harvest`, deposit cap and pause, `deployToRebalancer` |
+| `STRATEGIST` | Rebalancer | `rebalanceLiquidity` with self-chosen slippage caps |
+| `REGISTRAR` | Registry | Strategist and pool management |
+| `FEE_ADMIN` | DynamicFee | Set `performanceFeeBps` (≤ 30%) |
+| Hook `owner` | Hook | Threshold proposals (2-day timelock), cardinality settings |
+
+The timelocks only protect users if the admin is a multisig or contract whose actions they can watch.
+
+---
+
+## 6. Known limitations
+
+- Disabling whitelisting lets anyone deposit and bypasses KYC; removed users cannot exit until re-whitelisted.
+- Withdrawals that need the LP can revert while the hook charges MEV penalty fees.
 - Keeper range selection uses a fixed width.
-- Sandwich detection is heuristic and may produce false positives.
-- `mevVolumeThreshold` is kept for ABI and timelock compatibility but is **deprecated and no longer used**: sandwich detection now compares the cumulative tick move of the block with `sandwichTickThreshold`.
+- Uncollected LP fees are not in valuation; they appear once the position is modified.
+- Direct donations to the vault raise the share price and count as yield for the fee.
+- Switching the vault's rebalancer stops counting funds still held by the old one, so move the funds first.
+- `maxWithdraw` / `maxRedeem` do not reflect actual liquidity.
+- The Rebalancer's `setVault()` and `setAutomationRegistry()` are not timelocked.
+- `CuratioDynamicFee` rate, recipient and vault changes are immediate, and a rate change applies to gain not yet harvested (see the DynamicFee notes).
+- Strategists choose their own slippage caps on the strategist path; only the keeper path has admin-set caps (`keeperMaxPay0/1`, default 0).
+- Sandwich detection is a heuristic and can produce false positives (legitimate opposing flow or arbitrage).
 - `followStrategist` stores a preference only; it has no on-chain effect on funds yet.
-- Switching the vault's rebalancer stops counting what the old one holds — move funds first.
-- Keeper rebalances are reported to the strategist registry under the automation registry's address, which is not a registered strategist, so they are not attributed to any strategist (the registry call is wrapped in `try/catch`).
-- The stored fee decays by inactivity, not by time: `lastBlock` is refreshed on every swap, so a stored `MID` or `HIGH` fee only steps back to `BASE` after a gap of `blockDecayWindow` blocks without swaps, or when a later swap moves the price by a tier-changing amount. (By reading the code; not covered by a test.)
-- Unaudited.
+- Keeper rebalances are reported to the strategist registry under the automation registry's address, which is not a registered strategist, so they are not attributed to any strategist. The registry call is wrapped in `try/catch`.
+- The stored fee decays by inactivity, not by time: `lastBlock` is refreshed on every swap, so a stored MID or HIGH fee steps back to BASE only after `blockDecayWindow` blocks without swaps, or when a later swap moves the price by a tier-changing amount.
+- **The code is unaudited. Do not use it with real funds.**
 
 ### Weaknesses found by the Unichain fork tests (fixed)
 
-Reading the oracle and fee code, then probing it on a Unichain fork, exposed four weaknesses. They are fixed in `CuratioHook`; the old `test_finding_*` tests were flipped into `test_fix_*` regression tests in `CuratioForkFindingsTest`, `CuratioForkSwapPathTest` and `CuratioForkDecimalsTest`.
+Reading the oracle and fee code, then probing it on a Unichain fork, exposed four weaknesses. They are fixed in `CuratioHook`, and the old `test_finding_*` tests were flipped into `test_fix_*` regression tests.
 
-1. **Default oracle depth too small for a 1-second chain (fixed).** With 100 observations and one write per second, a busy pool only covered about 99 s, shorter than the 120 s TWAP window. The oracle never warmed, the TWAP guard was off, and `getTwapTick` reverted, so the vault's `totalAssets()` reverted and deposits and withdrawals halted. *Fix:* `ChainRegistry.getInitialCardinality` gives 240 slots on Unichain, Unichain Sepolia, Arbitrum and Arbitrum Sepolia (cost: one cold SSTORE per slot at pool initialisation). *Tests:* `test_fix_unichainDefaultOracleDepth`, `test_fix_busyPool_oracleStaysWarm_vaultKeepsWorking`.
-
-2. **Anyone could break the oracle by growing it after the ring wrapped (fixed).** `increaseObservationCardinality` is permissionless and applied the new size immediately. On a wrapped, warm ring this left an empty gap in the middle of the buffer, `TwapOracle.binarySearch` reverted, and both `beforeSwap` and the vault's valuation halted. *Fix:* Uniswap v3 rule in `TwapOracle.write`: the function only records `cardinalityNext`; the ring switches to it when the write index reaches the last slot of the current ring. *Test:* `test_fix_growthAfterWrap_isDeferred_oracleStaysHealthy`.
-
-3. **A cheap sandwich blocked withdrawals for a whole decay window (fixed).** Any address could flag a block with two opposite swaps for the price of the swap fees. The 10% penalty was also stored as the pool's current fee and re-stored by every calm swap, so it kept applying for `blockDecayWindow` blocks (300 on Unichain) and made the rebalancer's TWAP price check reject LP-unwind withdrawals and keeper swaps. *Fix:* the penalty is enforced only for the rest of the flagged block through the per-block flag; it is no longer written into `poolStates.fee`. An attacker can still make a withdrawal that needs a swap fail inside the flagged block (the cost is the swap fees), but a retry in the next block succeeds. Withdrawals covered by the rebalancer's idle asset were never affected. *Tests:* `test_fix_penaltyEndsWithTheFlaggedBlock`, `test_swapPath_withdrawNeedingSwap_revertsInSandwichBlock`, `test_swapPath_withdrawNeedingSwap_succeedsOneBlockAfterSandwich`, `test_swapPath_withdrawWithinIdle_worksDuringPenalty`, `test_swapPath_keeperTwoSidedRange_revertsInSandwichBlock`.
-
-4. **Sandwich detection ignored token decimals (fixed).** The size gate compared the raw `amountSpecified` of each swap with one hook-wide `mevVolumeThreshold` (1 ether). On the real USDC (6 decimals) / WETH (18) pool a \$20k USDC sandwich was not detected, a ~\$12k sandwich with a WETH leg was, and a threshold tuned for USDC flagged a \$60 WETH round trip. *Fix:* the gate is now the cumulative absolute tick move of the block (`SandwichTracker.totalMove`, packed into previously unused bits, readable through `getBlockTickMove`) compared with `sandwichTickThreshold` (default 80 ticks). Ticks need no decimals and scale with the pool's depth. `mevVolumeThreshold` stays in the ABI but is deprecated. *Tests:* `test_decimals_usdcDenominatedSandwich_isDetected`, `test_decimals_wethDenominatedSandwich_isStillDetected`, `test_decimals_dustRoundTrips_areNotFlagged_inEitherDirection`, `test_decimals_sandwichTickThreshold_isTunableInTicks`.
+1. **Default oracle depth too small for a 1-second chain.** With 100 observations and one write per second, a busy pool covered about 99 s, shorter than the 120 s TWAP window. The oracle never warmed, the TWAP guard was off, `getTwapTick` reverted, and the vault's `totalAssets()` reverted, halting deposits and withdrawals. *Fix:* `ChainRegistry.getInitialCardinality` gives 240 slots on Unichain, Unichain Sepolia, Arbitrum and Arbitrum Sepolia (cost: one cold SSTORE per slot at pool initialisation). *Tests:* `test_fix_unichainDefaultOracleDepth`, `test_fix_busyPool_oracleStaysWarm_vaultKeepsWorking`.
+2. **Anyone could break the oracle by growing it after the ring wrapped.** `increaseObservationCardinality` is permissionless and applied the new size immediately. On a wrapped, warm ring this left an empty gap, `TwapOracle.binarySearch` reverted, and both `beforeSwap` and the vault's valuation halted. *Fix:* the Uniswap v3 rule in `TwapOracle.write`: the function only records `cardinalityNext`, and the ring switches to it when the write index reaches the last slot. *Test:* `test_fix_growthAfterWrap_isDeferred_oracleStaysHealthy`.
+3. **A cheap sandwich blocked withdrawals for a whole decay window.** Any address could flag a block with two opposite swaps. The 10% penalty was also stored as the pool's current fee, so it kept applying for `blockDecayWindow` blocks (300 on Unichain) and made the rebalancer's TWAP price check reject LP-unwind withdrawals and keeper swaps. *Fix:* the penalty is enforced only for the rest of the flagged block through the per-block flag and is no longer written into `poolStates.fee`. An attacker can still make a withdrawal that needs a swap fail inside the flagged block (the cost is the swap fees), but a retry in the next block succeeds. Withdrawals covered by the rebalancer's idle asset were never affected. *Tests:* `test_fix_penaltyEndsWithTheFlaggedBlock`, `test_swapPath_withdrawNeedingSwap_revertsInSandwichBlock`, `test_swapPath_withdrawNeedingSwap_succeedsOneBlockAfterSandwich`, `test_swapPath_withdrawWithinIdle_worksDuringPenalty`, `test_swapPath_keeperTwoSidedRange_revertsInSandwichBlock`.
+4. **Sandwich detection ignored token decimals.** The size gate compared the raw `amountSpecified` of each swap with one hook-wide `mevVolumeThreshold` (1 ether). On the real USDC (6 decimals) / WETH (18) pool a 20k USD USDC sandwich was not detected, a roughly 12k USD sandwich with a WETH leg was, and a threshold tuned for USDC flagged a 60 USD WETH round trip. *Fix:* the gate is now the cumulative absolute tick move of the block (`SandwichTracker.totalMove`, readable through `getBlockTickMove`) compared with `sandwichTickThreshold` (default 80 ticks). Ticks need no decimals and scale with the pool's depth. `mevVolumeThreshold` stays in the ABI but is deprecated. *Tests:* `test_decimals_usdcDenominatedSandwich_isDetected`, `test_decimals_wethDenominatedSandwich_isStillDetected`, `test_decimals_dustRoundTrips_areNotFlagged_inEitherDirection`, `test_decimals_sandwichTickThreshold_isTunableInTicks`.
 
 ---
 
-## Getting started
+## 7. Supported chains
+
+Ethereum, Base, Optimism, Arbitrum, Unichain and their testnets (Sepolia, Base Sepolia, Arbitrum Sepolia, Unichain Sepolia). The hook deploys only against the canonical PoolManager for each chain (or on chain 31337 for local testing).
+
+---
+
+## 8. Getting started
 
 Requirements: [Foundry](https://book.getfoundry.sh/), Solidity `^0.8.26`, and the OpenZeppelin, Uniswap v4-core and Chainlink contract dependencies.
 
@@ -173,153 +489,27 @@ forge test
 1. `CuratioAccess(admin)`
 2. `CuratioStrategistRegistry(admin)`
 3. `CuratioHook(poolManager, owner)`, deployed to an address whose low bits match the hook permissions (CREATE2 / address mining, as required by Uniswap v4)
-4. `CuratioRebalancer(...)` and `CuratioVault(asset, access, rebalancer, admin, depositCap)`. Each takes the other's address, so deploy the rebalancer first with a placeholder vault and call `setVault()` afterwards. (The fork tests instead predict the vault address from the deployer nonce and deploy the rebalancer and vault back to back.)
+4. `CuratioRebalancer(...)` and `CuratioVault(asset, access, rebalancer, admin, depositCap)`. Each needs the other's address, so deploy the rebalancer first with a placeholder vault and call `setVault()` afterwards. (The fork tests instead predict the vault address from the deployer nonce and deploy the rebalancer and vault back to back.)
 5. `CuratioDynamicFee(admin, vault, feeRecipient)`, then `vault.initializeFeeModule(feeModule)`
 6. Configure:
    - `rebalancer.setManagedPool(key)` then `rebalancer.setAsset(asset)`
    - `rebalancer.setKeeperMaxPay(max0, max1)` and `setAutomationRegistry(...)`
    - `registry.authorizeRebalancer(rebalancer)` and `rebalancer.setStrategistRegistry(registry)`
-   - Initialise the pool with the hook and allow the TWAP to warm up before accepting deposits
+   - Initialise the pool with the hook and wait at least 120 seconds for the TWAP to warm up before accepting deposits (until then `totalAssets()` reverts)
    - Whitelist users via `CuratioAccess.setWhitelistedUser`
 
 ---
 
-## Testing
-
-The Foundry suite currently reports **493 passing tests across 18 suites, 0 failures**. In addition, **45 mainnet-fork tests across 6 suites** pass against Unichain, and **25 stateful invariants** fuzz the hook (see below).
-
-### Coverage
-
-| Contract | Coverage |
-|----------|---------:|
-| `CuratioAccess` | 100% |
-| `CuratioDynamicFee` | 100% |
-| `CuratioStrategistRegistry` | 100% |
-| `CuratioHook` | 96% |
-| `CuratioVault` | 89% |
-| `CuratioRebalancer` | 80% |
-
-These figures come from the last coverage run, taken before the hook changes described under [Known limitations](#weaknesses-found-by-the-unichain-fork-tests-fixed). Regenerate with `forge coverage`.
-
-### Test suites
-
-| Area | Suite(s) |
-|------|----------|
-| Hook (fees, oracle, sandwich, chains, transient guard) | `CuratioHookTest`, `CardinalityGasDoSTest`, `GasGriefingTest` |
-| Access / whitelist | `CuratioAccessTest` |
-| Vault (gating, caps, pause, timelocks) | `CuratioVaultTest` |
-| Inflation attack and share maths (incl. fuzz) | `CuratioVaultInflationTest` |
-| Harvest / high-water mark (incl. fuzz) | `CuratioVaultHarvestTest` |
-| Rebalancer (unit, upkeep, valuation, real PoolManager) | `CuratioRebalancerTest`, `CuratioRebalancerValuationTest`, `CuratioRebalancerRealPMTest` |
-| Swap / unwind paths | `CuratioSwapE2ETest` |
-| Performance-fee module | `CuratioDynamicFeeTest` |
-| Registry | `CuratioStrategistRegistryTest` |
-| End-to-end | `CuratioVaultRebalancerE2ETest`, `CuratioFullStackRealHookE2ETest`, `CuratioFullProtocolE2ETest` |
-
-### Mainnet-fork tests (Unichain)
-
-45 tests in 6 suites, all passing. They run against the **real Unichain PoolManager** (`0x1F98…0004`, chain id 130) with a freshly deployed Curatio stack and a new pool that uses the hook, so no existing Uniswap pool is touched. Fees are read from the PoolManager's own `Swap` event, so they show the fee actually charged. Block time on Unichain is 1 s, so the tests move blocks and seconds together.
-
-| Suite (`test/fork/`) | Tests | What it covers |
-|----------------------|------:|----------------|
-| `CuratioForkTest` | 16 | Chain guard and wrong-PoolManager revert, hook initialisation, fee tiers (cold 6000, calm 3000, escalation to 15000 and decay after 300 blocks), TWAP-based MEV penalty, sandwich detection, oracle observations, vault deposit/redeem, LP creation in the real PoolManager, partial and full unwind, harvest, `checkUpkeep` |
-| `CuratioForkKeeperTest` | 6 | `performUpkeep`: registry-only access, default caps of 0 revert with `SlippageExceeded`, position opened around the TWAP, "too soon" and "range unchanged" skips, no strategist attribution |
-| `CuratioForkRealTokensTest` | 7 | Real Unichain USDC (6 decimals) and WETH (18) in a ~\$3000 pool: 12-decimal shares, fee tiers at tick ~196k, TWAP valuation of idle WETH, single-sided USDC LP, partial withdraw and full redeem |
-| `CuratioForkSwapPathTest` | 6 | Paths that swap inside the unlock: withdrawals that unwind a two-sided LP and keeper rebalances into a range containing the price, including their failure inside a flagged sandwich block and recovery one block later |
-| `CuratioForkFindingsTest` | 6 | Two pools sharing one hook stay isolated, timelocked thresholds change real fees, and regression tests for the three fixes listed under [Known limitations](#weaknesses-found-by-the-unichain-fork-tests-fixed) |
-| `CuratioForkDecimalsTest` | 4 | Real USDC/WETH: sandwich detection is decimals-independent (a \$20k USDC sandwich and a ~\$12k WETH sandwich are both detected), \$60 dust round trips are not false positives in either direction, and `sandwichTickThreshold` is tunable through the timelock |
-
-**Setup.** Add a profile to `foundry.toml` (the default profile points `test` at `test/foundry`):
-
-```toml
-[profile.fork]
-test = "test/fork"
-```
-
-Put the RPC URL in a `.env` file (or export it). The public endpoint needs no account; if you hit rate limits, pin the block with `UNICHAIN_FORK_BLOCK` so Foundry caches the state.
-
-```
-UNICHAIN_RPC=https://mainnet.unichain.org
-```
-
-Without `UNICHAIN_RPC` every fork test is skipped.
-
-**Run.** `CuratioForkKeeperTest`, `CuratioForkSwapPathTest` and `CuratioForkFindingsTest` inherit the fixture of `CuratioForkTest`, so filter by test name to run only their own tests:
-
-```bash
-# bash
-export FOUNDRY_PROFILE=fork
-forge test --match-path test/fork/CuratioForkTest.t.sol -vv
-forge test --match-path test/fork/CuratioForkKeeperTest.t.sol   --match-test test_keeper -vv
-forge test --match-path test/fork/CuratioForkRealTokensTest.t.sol -vv
-forge test --match-path test/fork/CuratioForkSwapPathTest.t.sol --match-test test_swapPath -vv
-forge test --match-path test/fork/CuratioForkFindingsTest.t.sol --match-test "test_more|test_fix" -vv
-forge test --match-path test/fork/CuratioForkDecimalsTest.t.sol --match-test test_decimals -vv
-```
-
-```powershell
-# PowerShell
-$env:FOUNDRY_PROFILE = "fork"
-forge test --match-path test/fork/CuratioForkTest.t.sol -vv
-```
-
-Clear the profile afterwards (`unset FOUNDRY_PROFILE` / `Remove-Item Env:FOUNDRY_PROFILE`) so a plain `forge test` goes back to `test/foundry`.
-
-**Not yet covered by fork tests:** USDC blacklist behaviour.
-
-### Invariant tests (stateful fuzzing)
-
-25 Foundry invariants in `test/invariant/` (`CuratioHookInvariantTest` driven by `CuratioHandler`) fuzz the hook against a local PoolManager with real swap and liquidity routers. The handler performs random swaps (exact-in and exact-out, both directions, 0 to 30 blocks apart so that same-block sandwiches happen), liquidity adds and removes, oracle growth by an arbitrary caller, owner timelock actions and calls from non-owners. It mirrors every action in ghost variables, so the invariants compare the hook's state with what should have happened.
-
-| Area | What is checked |
-|------|-----------------|
-| Pool and fees | tick and price stay valid; the hook's `lastTick`, `lastBlock` and `lastTimestamp` match the pool and the last swap; stored and current fees are always one of the defined tiers; the fee decays to `BASE_FEE` after the decay window |
-| MEV penalty | the penalty is never stored in the pool state; `getCurrentFee` reports it only in a block that already had a swap; the tick move recorded for a block is 0 unless a swap happened in it |
-| Volume and tracker | per-block volume and the sandwich tracker match the handler's ghost values |
-| Liquidity | stored positions match the ghost accounting; active liquidity never exceeds what was added; the seed liquidity floor holds |
-| Oracle | `index < cardinality <= cardinalityNext`; cardinality never decreases; per-call growth cap holds; a warm oracle is always readable by `getTwapTick` (this is the invariant that would catch an oracle broken by growing it after the ring wrapped) |
-| Liveness and gas | no swap reverts inside the hook; swap gas stays bounded |
-| Governance | threshold ordering, the 2-day timelock, owner-only functions reject strangers, cardinality caps stay within the hard ceiling |
-
-Swap reverts are classified: PoolManager wraps every revert that comes from a hook in `WrappedError`, so those count as hook failures and fail `invariant_swapsNeverRevert` (with the failing swap and revert data logged). Reverts that come from the PoolManager or the router (for example the swap maths at extreme prices) are counted separately and reported by `afterInvariant` without failing the run.
-
-**Setup.** Add a profile to `foundry.toml` (the default profile's `[profile.default.invariant]` section sets `runs = 256`, `depth = 400`, `fail_on_revert = true`):
-
-```toml
-[profile.invariant]
-test = "test/invariant"
-```
-
-**Run.**
-
-```bash
-# bash
-FOUNDRY_PROFILE=invariant forge test --match-path test/invariant/CuratioHookInvariantTest.t.sol -vv
-```
-
-```powershell
-# PowerShell
-$env:FOUNDRY_PROFILE = "invariant"
-forge test --match-path test/invariant/CuratioHookInvariantTest.t.sol -vv
-```
-
-A full run is slow (25 invariants x 256 runs x 400 calls). For a quick pass set `FOUNDRY_INVARIANT_RUNS=32`. The output is long because `bound()` logs every call; redirect it to a file and search for `PASS` and `FAIL`.
-
-The `test/Echidna/` contracts are harnesses for Echidna and are not run by Foundry.
-
----
-
-## Roadmap
+## 9. Roadmap
 
 **Phase 1: Hardening (current)**
-- [x] Foundry unit, fuzz and end-to-end suite (493 tests, 18 suites)
-- [x] Unichain mainnet-fork suite (45 tests, 6 suites, including real USDC/WETH)
+- [x] Foundry unit, fuzz and end-to-end suite (501 tests, 18 suites)
+- [x] Unichain mainnet-fork suite (55 distinct tests, 131 runs across 7 suites, including real USDC/WETH)
 - [x] Stateful invariant suite for the hook (25 invariants, `depth = 400`)
-- [x] Fix the three weaknesses found by the fork tests (oracle depth, cardinality growth after wrap, block-scoped MEV penalty) and flip the finding tests into regression tests
-- [x] Make sandwich detection decimals-independent (cumulative tick move vs `sandwichTickThreshold`; regression tests in `CuratioForkDecimalsTest`)
+- [x] Fix the weaknesses found by the fork tests (oracle depth, cardinality growth after wrap, block-scoped MEV penalty) and flip the finding tests into regression tests
+- [x] Make sandwich detection decimals-independent (cumulative tick move vs `sandwichTickThreshold`)
 - [ ] **Echidna property-based fuzzing** of the core invariants:
-  - Vault: user actions never change the high-water mark; `harvest()` never charges more than the fee rate × gain; a sole depositor's deposit/redeem round trip is exact.
-  - Vault: no deposit or mint ever succeeds with zero shares.
+  - Vault: user actions never change the high-water mark; `harvest()` never charges more than the fee rate x gain; a sole depositor's deposit/redeem round trip is exact; no deposit or mint ever succeeds with zero shares.
   - Rebalancer: `totalManagedAssets()` is unaffected by same-block spot-price manipulation; `currentLiquidity` always matches the position held in the PoolManager.
   - Hook: the transient flag is always cleared after a completed swap; the fee is always one of the defined tiers; the oracle index never leaves `[0, cardinality)`.
   - Access: a pending removal never takes effect before its ETA.
