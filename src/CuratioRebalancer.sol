@@ -239,9 +239,9 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
     /// @dev Needed only if a pool currency is native ETH (PoolManager.take sends ETH here).
     receive() external payable {}
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // Vault interface
-    // ═════════════════════════════════════════════════════════════════════════
+  
+    //                   Vault interface
+    // ==================================================
 
     function notifyDeposit(uint256 assets) external onlyVault {
         emit DepositNotified(assets, block.number);
@@ -399,7 +399,7 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         try strategistRegistry.recordRebalanceExecuted(msg.sender) {} catch {}
     }
 
-    // ─── IUnlockCallback ─────────────────────────────────────────────────────
+    // ------------------- IUnlockCallback ---------------------
 
     function unlockCallback(bytes calldata rawData) external override onlyPoolManager returns (bytes memory) {
         (ActionType actionType, bytes memory payload) = abi.decode(rawData, (ActionType, bytes));
@@ -474,9 +474,9 @@ contract CuratioRebalancer is AccessControl, ReentrancyGuard, IUnlockCallback, A
         }
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // Chainlink Automation
-    // ═════════════════════════════════════════════════════════════════════════
+   
+    //                         Chainlink Automation
+    // ======================================================================
 
     function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory performData) {
         if (!poolConfigured) return (false, "");
