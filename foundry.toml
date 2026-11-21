@@ -1,10 +1,11 @@
 [profile.default]
-test = "test/foundry" 
+test = "test" 
 auto_detect_solc = true
 offline = false
 evm_version = "cancun"
 ffi = true
-fs_permissions = [{access = "read-write", path = ".forge-snapshots/"}]
+fs_permissions = [{access = "read-write", path = ".forge-snapshots/"},
+{ access = "read", path = "./test" },]
 libs = ["lib"]
 out = "out"
 solc = "0.8.26"
