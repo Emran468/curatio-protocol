@@ -1,7 +1,0 @@
-testMode: assertion
-testLimit: 500            # কমিয়ে দিন
-coverage: false           # আপাতত বন্ধ রাখুন, এটি অনেক স্লো করে দেয়
-corpusDir: echidna-corpus-hook
-maxTimeDelay: 120         # ৬০০ থেকে কমিয়ে ১২০ করুন
-maxBlockDelay: 10
-workers: 1
