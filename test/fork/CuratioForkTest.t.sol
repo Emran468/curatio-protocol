@@ -95,7 +95,7 @@ contract CuratioForkTest is Test {
     //  Setup
     // ═════════════════════════════════════════════════════════════════════════
 
-    function setUp() public {
+       function setUp() public virtual {
         string memory rpc = vm.envOr("UNICHAIN_RPC", string(""));
         if (bytes(rpc).length == 0) vm.skip(true);
 
